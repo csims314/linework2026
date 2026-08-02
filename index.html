@@ -1,0 +1,1057 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Moebius Lines — face-ID edge renderer</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  html, body { margin:0; height:100%; overflow:hidden; background:#f4f1e8; font-family: ui-monospace, 'Cascadia Code', Menlo, Consolas, monospace; }
+  #app { position:fixed; inset:0; }
+  canvas { display:block; }
+  #panel {
+    position:fixed; top:10px; right:10px; width:270px; max-height:calc(100% - 20px);
+    overflow-y:auto; background:rgba(20,22,26,.92); color:#cfd3da; border-radius:8px;
+    padding:10px 12px 14px; font-size:11px; user-select:none; backdrop-filter:blur(4px);
+  }
+  #panel h1 { font-size:12px; margin:2px 0 8px; color:#fff; letter-spacing:.06em; }
+  #panel h2 { font-size:10px; margin:12px 0 4px; color:#8fa3bf; text-transform:uppercase; letter-spacing:.12em; border-bottom:1px solid #333a45; padding-bottom:3px;}
+  .row { display:flex; align-items:center; gap:6px; margin:3px 0; }
+  .row label { flex:0 0 108px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .row input[type=range] { flex:1; accent-color:#e8a33d; min-width:0; }
+  .row .val { flex:0 0 34px; text-align:right; color:#e8a33d; }
+  .row input[type=checkbox] { accent-color:#e8a33d; }
+  .row input[type=color] { flex:0 0 34px; height:20px; border:none; background:none; padding:0; }
+  button { background:#2b303a; color:#dfe3ea; border:1px solid #444c59; border-radius:5px; padding:4px 8px; font:inherit; cursor:pointer; margin:2px 2px 0 0;}
+  button:hover { background:#39404d; }
+  #hint { position:fixed; left:12px; bottom:10px; color:#00000066; font-size:11px; pointer-events:none; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="panel"><h1>MOEBIUS LINES</h1></div>
+<div id="hint">drag&nbsp;=&nbsp;orbit&nbsp;&nbsp;·&nbsp;&nbsp;shift-drag&nbsp;=&nbsp;pan&nbsp;&nbsp;·&nbsp;&nbsp;wheel&nbsp;=&nbsp;zoom</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdnjs.cloudflare.com/ajax/libs/three.js/0.160.0/three.module.min.js" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+/* ============================================================
+   Params — everything the control panel drives
+   ============================================================ */
+const P = {
+  // edge extraction — face-ID only: every face boundary is a line
+  idThreshold: 0.005,
+  // line look
+  lineWidth: 0.5, distanceFalloff: 1.25,
+  wobbleAmp: 1.1, wobbleFreq: 0.08,
+  // hatching
+  hatchOn: false, hatchThreshold: 0.0, crossThreshold: 0.02,
+  hatchSpacing: 10.0, hatchWidth: 0.05, hatchAngle: 45,
+  // colors
+  inkColor: '#1d1a17', paperColor: '#f6f2e6', paperGrain: 0.05,
+  // thin lines & AA
+  oneSided: true, coverageAA: true, superSample: 1,
+  msaa: true, fxaa: true, vectorMode: false, progressive: false,
+  // vector style (only affects vector mode)
+  overshoot: 0.05, inkVary: 0.3,
+  // scene
+  perQuad: true, autoRotate: false, seed: 7, density: 2.5,
+};
+
+/* ============================================================
+   Seeded RNG
+   ============================================================ */
+function mulberry32(a) {
+  return function() {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+let rng = mulberry32(P.seed);
+
+// dirty-flag rendering: frames only render when something changed
+// (camera, sliders, rebuilds). Lets progressive supersampling slot
+// in a refined frame when you stop moving, and idles the GPU at rest.
+let dirty = true;
+function markDirty() { dirty = true; }
+
+/* ============================================================
+   Face-ID coloring — YOUR technique:
+   random color per face -> edge detect the color buffer.
+   perQuad=true colors triangle *pairs* (most three.js primitives
+   emit quads as consecutive tri pairs) so quads don't get a
+   diagonal seam. perQuad=false shows every triangle.
+   ============================================================ */
+function faceIdColors(geometry, perQuad, variation = 1.0) {
+  const geom = geometry.index ? geometry.toNonIndexed() : geometry;
+  const count = geom.attributes.position.count;
+  const colors = new Float32Array(count * 3);
+  const step = perQuad ? 6 : 3;
+  for (let i = 0; i < count; i += step) {
+    const r = .5 + (rng() - .5) * variation;
+    const g = .5 + (rng() - .5) * variation;
+    const b = .5 + (rng() - .5) * variation;
+    for (let j = 0; j < step && i + j < count; j++) {
+      colors[(i + j) * 3] = r; colors[(i + j) * 3 + 1] = g; colors[(i + j) * 3 + 2] = b;
+    }
+  }
+  geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+  return geom;
+}
+
+/* ============================================================
+   Renderer / scene bootstrap
+   ============================================================ */
+const app = document.getElementById('app');
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+app.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 300);
+
+// shared "ID" material — the scene is *rendered as* its face colors
+const idMaterial = new THREE.MeshBasicMaterial({ vertexColors: true });
+const normalMaterial = new THREE.MeshNormalMaterial();
+// vector mode: paper-colored fill occludes, real line geometry draws
+const fillMaterial = new THREE.MeshBasicMaterial({
+  color: 0xf6f2e6, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
+// hand-drawn line shader: world-space noise wobble in the vertex
+// stage (stable while orbiting — no screen-space swimming), per-edge
+// seed for ink variation and double-stroke offsets, distance-based
+// opacity fade, and a small eye-space lift so wobbled lines can't
+// dip behind the fill occluder and break into dashes.
+const lineMaterial = new THREE.ShaderMaterial({
+  uniforms: {
+    uInk:     { value: new THREE.Color(0x1d1a17) },
+    uAmpW:    { value: 0.05 },  // wobble amplitude, world units
+    uFreqW:   { value: 2.0 },   // wobble spatial frequency
+    uLift:    { value: 0.15 },  // eye-space pull toward camera
+    uFalloff: { value: 0.55 },
+    uInkVary: { value: 0.3 },
+    uFadeK:   { value: 14.0 },
+  },
+  vertexShader: /* glsl */`
+    attribute float aSeed;
+    uniform float uAmpW, uFreqW, uLift;
+    varying float vSeed, vDist;
+    void main() {
+      vec3 p = position;
+      float s = aSeed * 43.0;
+      float f1 = uFreqW, f2 = uFreqW * 2.7;
+      vec3 w = vec3(
+        sin(p.y * f1 + s)       + 0.6 * sin(p.z * f2 + s * 1.7),
+        sin(p.z * f1 + s * 2.3) + 0.6 * sin(p.x * f2 + s * 0.6),
+        sin(p.x * f1 + s * 1.1) + 0.6 * sin(p.y * f2 + s * 2.9));
+      p += w * uAmpW * 0.625;
+      vec4 mv = modelViewMatrix * vec4(p, 1.0);
+      vDist = -mv.z;
+      mv.z += uLift;
+      vSeed = aSeed;
+      gl_Position = projectionMatrix * mv;
+    }`,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    uniform vec3 uInk;
+    uniform float uInkVary, uFalloff, uFadeK;
+    varying float vSeed, vDist;
+    void main() {
+      float a = 1.0 - uInkVary * fract(vSeed * 91.17);
+      a *= mix(1.0, clamp(uFadeK / vDist, 0.3, 1.0), min(uFalloff, 1.0));
+      a *= clamp(mix(1.0, clamp(uFadeK / vDist, 0.0, 1.0), max(uFalloff - 1.0, 0.0)), 0.0, 1.0);
+      gl_FragColor = vec4(uInk, a);
+    }`,
+  transparent: true, depthWrite: false,
+});
+
+/* ============================================================
+   ALL DETAIL IN THE GEOMETRY.
+   A greeble system: every panel line, rivet, vent slat, flange
+   bolt and railing post is real geometry with its own face-ID
+   color. Everything is baked into ONE merged mesh (one draw
+   call), so tens of thousands of parts render like one object.
+   ============================================================ */
+let sceneRoot = null, lineSegs = null;
+let triCount = 0, edgeCount = 0;
+
+// ---- merge machinery -----------------------------------------
+let bag = [];
+const _one = new THREE.Vector3(1, 1, 1);
+function frameOf(x, y, z, rx = 0, ry = 0, rz = 0) {
+  return new THREE.Matrix4().compose(
+    new THREE.Vector3(x, y, z),
+    new THREE.Quaternion().setFromEuler(new THREE.Euler(rx, ry, rz)), _one);
+}
+// place a geometry inside a frame (or chain of frames)
+function put(frame, geom, x, y, z, rx = 0, ry = 0, rz = 0, variation = 1) {
+  const g = faceIdColors(geom, P.perQuad, variation);
+  g.applyMatrix4(frameOf(x, y, z, rx, ry, rz));
+  if (frame) g.applyMatrix4(frame);
+  bag.push(g);
+  return g;
+}
+// pull real edge segments out of a non-indexed geometry, for vector
+// mode. In per-quad mode each consecutive triangle PAIR is treated as
+// one face: the shared (duplicated) vertices are the diagonal, and we
+// emit the other four edges — the same boundaries the face-ID
+// detector finds, but as actual line geometry.
+function extractEdges(g, perQuad, store) {
+  const p = g.attributes.position.array;
+  const n = g.attributes.position.count;
+  const fr = x => x - Math.floor(x);
+  // emit one edge: randomized endpoint overshoot, then subdivide so
+  // the vertex-shader wobble can actually bend it, tagged with a
+  // per-edge seed (duplicated shared edges get different seeds ->
+  // natural double-stroke)
+  function push(i, j, b) {
+    let ax = p[b + i * 3], ay = p[b + i * 3 + 1], az = p[b + i * 3 + 2];
+    let bx = p[b + j * 3], by = p[b + j * 3 + 1], bz = p[b + j * 3 + 2];
+    const dx = bx - ax, dy = by - ay, dz = bz - az;
+    const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    if (len < 1e-6) return;
+    const idx = store.edges++;
+    const h1 = fr(idx * 0.75487766), h2 = fr(idx * 0.56984029), seed = fr(idx * 0.61803399);
+    const ux = dx / len, uy = dy / len, uz = dz / len;
+    const oA = store.overshoot * (0.25 + 0.75 * h1), oB = store.overshoot * (0.25 + 0.75 * h2);
+    ax -= ux * oA; ay -= uy * oA; az -= uz * oA;
+    bx += ux * oB; by += uy * oB; bz += uz * oB;
+    const nSub = Math.max(1, Math.min(6, Math.round((len + oA + oB) / 0.35)));
+    for (let s = 0; s < nSub; s++) {
+      const t0 = s / nSub, t1 = (s + 1) / nSub;
+      store.pos.push(ax + (bx - ax) * t0, ay + (by - ay) * t0, az + (bz - az) * t0,
+                     ax + (bx - ax) * t1, ay + (by - ay) * t1, az + (bz - az) * t1);
+      store.seed.push(seed, seed);
+    }
+  }
+  const EA = [[0, 1], [1, 2], [2, 0]], EB = [[3, 4], [4, 5], [5, 3]];
+  let v = 0;
+  if (perQuad) {
+    for (; v + 6 <= n; v += 6) {
+      const b = v * 3, mA = [], mB = [];
+      for (let i = 0; i < 3; i++) for (let j = 3; j < 6; j++) {
+        const dx = p[b + i * 3] - p[b + j * 3], dy = p[b + i * 3 + 1] - p[b + j * 3 + 1],
+              dz = p[b + i * 3 + 2] - p[b + j * 3 + 2];
+        if (dx * dx + dy * dy + dz * dz < 1e-10) { mA.push(i); mB.push(j); }
+      }
+      if (mA.length === 2) {   // proper pair: drop the shared diagonal
+        for (const [a2, b2] of EA) if (!(mA.includes(a2) && mA.includes(b2))) push(a2, b2, b);
+        for (const [a2, b2] of EB) if (!(mB.includes(a2) && mB.includes(b2))) push(a2, b2, b);
+      } else {
+        for (const [a2, b2] of EA) push(a2, b2, b);
+        for (const [a2, b2] of EB) push(a2, b2, b);
+      }
+    }
+  }
+  for (; v + 3 <= n; v += 3) { const b = v * 3; push(0, 1, b); push(1, 2, b); push(2, 0, b); }
+}
+
+function mergeBag() {
+  let total = 0;
+  for (const g of bag) total += g.attributes.position.count;
+  const pos = new Float32Array(total * 3), nor = new Float32Array(total * 3), col = new Float32Array(total * 3);
+  const store = { pos: [], seed: [], edges: 0, overshoot: P.overshoot };
+  let o = 0;
+  for (const g of bag) {
+    pos.set(g.attributes.position.array, o * 3);
+    nor.set(g.attributes.normal.array, o * 3);
+    col.set(g.attributes.color.array, o * 3);
+    o += g.attributes.position.count;
+    extractEdges(g, P.perQuad, store);
+    g.dispose();
+  }
+  bag = [];
+  const merged = new THREE.BufferGeometry();
+  merged.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  merged.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
+  merged.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  triCount = total / 3;
+  edgeCount = store.edges;
+  const lineGeom = new THREE.BufferGeometry();
+  lineGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(store.pos), 3));
+  lineGeom.setAttribute('aSeed', new THREE.BufferAttribute(new Float32Array(store.seed), 1));
+  return { merged, lineGeom };
+}
+
+// ---- small parts ---------------------------------------------
+function rivet(frame, x, y, z, r = 0.05) {
+  put(frame, new THREE.CylinderGeometry(r, r * 1.25, r * 1.2, 6, 1), x, y, z, Math.PI / 2, 0, 0, 0.7);
+}
+function boltRing(frame, x, y, z, radius, n, boltR = 0.045, facePlane = false) {
+  for (let i = 0; i < n; i++) {
+    const a = (i / n) * Math.PI * 2;
+    if (facePlane)   // ring in the x/y plane (wall-mounted, bolts point +z)
+      put(frame, new THREE.CylinderGeometry(boltR, boltR, boltR * 2, 6, 1),
+        x + Math.cos(a) * radius, y + Math.sin(a) * radius, z, Math.PI / 2, 0, 0, 0.7);
+    else             // ring in the x/z plane (horizontal, bolts point up)
+      put(frame, new THREE.CylinderGeometry(boltR, boltR, boltR * 2, 6, 1),
+        x + Math.cos(a) * radius, y, z + Math.sin(a) * radius, 0, 0, 0, 0.7);
+  }
+}
+
+// recursive panel split of a rect [-w/2,w/2]x[-h/2,h/2]
+function splitRect(u0, v0, u1, v1, depth, out) {
+  const w = u1 - u0, h = v1 - v0;
+  if (depth <= 0 || (w < 1.3 && h < 1.3) || rng() < 0.18) { out.push([u0, v0, u1, v1]); return; }
+  if (w > h) { const t = u0 + w * (0.35 + rng() * 0.3); splitRect(u0, v0, t, v1, depth - 1, out); splitRect(t, v0, u1, v1, depth - 1, out); }
+  else      { const t = v0 + h * (0.35 + rng() * 0.3); splitRect(u0, v0, u1, t, depth - 1, out); splitRect(u0, t, u1, v1, depth - 1, out); }
+}
+
+// decorate one face of a block. faceFrame maps face-local
+// (u, v, out-of-face) -> block space. fw x fh is the face size.
+function panelFace(faceFrame, fw, fh, D) {
+  const cells = [];
+  splitRect(-fw / 2 + .15, -fh / 2 + .15, fw / 2 - .15, fh / 2 - .15,
+    2 + Math.round(D), cells);
+  for (const [u0, v0, u1, v1] of cells) {
+    const cw = u1 - u0, ch = v1 - v0, uc = (u0 + u1) / 2, vc = (v0 + v1) / 2;
+    if (cw < .3 || ch < .3) continue;
+    const m = 0.07;                             // inset margin
+    const t = 0.04 + rng() * 0.09;              // plate thickness
+    // the panel plate itself — low variation: fine lines
+    put(faceFrame, new THREE.BoxGeometry(cw - 2 * m, ch - 2 * m, t), uc, vc, t / 2, 0, 0, 0, 0.3);
+    const deco = rng();
+    if (deco < 0.22 * D && cw > .8 && ch > .8) {
+      // corner rivets
+      const ru = cw / 2 - m - .12, rv = ch / 2 - m - .12;
+      rivet(faceFrame, uc - ru, vc - rv, t); rivet(faceFrame, uc + ru, vc - rv, t);
+      rivet(faceFrame, uc - ru, vc + rv, t); rivet(faceFrame, uc + ru, vc + rv, t);
+    } else if (deco < 0.40 * D && cw > 1.0 && ch > .7) {
+      // vent slats
+      const n = Math.min(11, Math.floor((ch - 2 * m) / 0.22));
+      for (let i = 0; i < n; i++) {
+        const vy = vc - (ch - 2 * m - .2) / 2 + i * ((ch - 2 * m - .2) / Math.max(1, n - 1));
+        put(faceFrame, new THREE.BoxGeometry(cw - 2 * m - .25, 0.07, 0.06), uc, vy, t + 0.03, 0, 0, 0, 0.55);
+      }
+    } else if (deco < 0.52 * D && Math.min(cw, ch) > 1.0) {
+      // porthole: disc + raised ring + bolts
+      const pr = Math.min(cw, ch) * 0.28;
+      put(faceFrame, new THREE.CylinderGeometry(pr, pr, 0.06, 16, 1), uc, vc, t + 0.03, Math.PI / 2, 0, 0, 0.4);
+      put(faceFrame, new THREE.TorusGeometry(pr, 0.05, 6, 16), uc, vc, t + 0.06, 0, 0, 0, 0.6);
+      boltRing(faceFrame, uc, vc, t + 0.05, pr + 0.14, 6, 0.045, true);
+    } else if (deco < 0.66 * D && cw > .9) {
+      // little box cluster (gauges / junctions)
+      const n = 1 + Math.floor(rng() * 3);
+      for (let i = 0; i < n; i++) {
+        const gw = .18 + rng() * .4, gh2 = .15 + rng() * .35, gt = .1 + rng() * .22;
+        put(faceFrame, new THREE.BoxGeometry(gw, gh2, gt),
+          uc + (rng() - .5) * (cw - 2 * m - gw), vc + (rng() - .5) * (ch - 2 * m - gh2), t + gt / 2, 0, 0, 0, 0.6);
+      }
+      if (rng() < .5) rivet(faceFrame, uc, vc + ch / 2 - m - .1, t);
+    }
+    // occasional rivet seam along the bottom edge of the plate
+    if (rng() < 0.25 * D && cw > 1.4) {
+      const n = Math.floor((cw - 2 * m) / 0.4);
+      for (let i = 0; i < n; i++)
+        rivet(faceFrame, uc - (cw - 2 * m) / 2 + .2 + i * .4, v0 + m + .1, t, 0.04);
+    }
+  }
+}
+
+function ladder(blockFrame, x, z, h, ry) {
+  const f = frameOf(x, 0, z, 0, ry, 0);
+  f.premultiply(blockFrame);
+  for (const s of [-0.22, 0.22])
+    put(f, new THREE.BoxGeometry(0.06, h, 0.06), s, h / 2, 0.1, 0, 0, 0, 0.6);
+  const n = Math.floor(h / 0.38);
+  for (let i = 1; i < n; i++)
+    put(f, new THREE.CylinderGeometry(0.03, 0.03, 0.44, 5, 1), 0, i * 0.38, 0.1, 0, 0, Math.PI / 2, 0.6);
+}
+
+function railing(blockFrame, w, d, topY) {
+  const hw = w / 2 - .15, hd = d / 2 - .15, rh = 0.85;
+  const edges = [
+    [-hw, -hd, hw, -hd], [hw, -hd, hw, hd], [hw, hd, -hw, hd], [-hw, hd, -hw, -hd]];
+  for (const [x0, z0, x1, z1] of edges) {
+    const len = Math.hypot(x1 - x0, z1 - z0), ang = Math.atan2(z1 - z0, x1 - x0);
+    const n = Math.max(2, Math.round(len / 1.1));
+    for (let i = 0; i <= n; i++) {
+      const tt = i / n;
+      put(blockFrame, new THREE.BoxGeometry(0.05, rh, 0.05),
+        x0 + (x1 - x0) * tt, topY + rh / 2, z0 + (z1 - z0) * tt, 0, 0, 0, 0.6);
+    }
+    for (const ry2 of [rh, rh * 0.55])
+      put(blockFrame, new THREE.BoxGeometry(len, 0.045, 0.045),
+        (x0 + x1) / 2, topY + ry2, (z0 + z1) / 2, 0, -ang, 0, 0.6);
+  }
+}
+
+function pipeRun(frame, x, z, baseY, pr, ph, D) {
+  const segs = Math.max(2, Math.floor(ph / 1.4));
+  put(frame, new THREE.CylinderGeometry(pr, pr, ph, 10, segs), x, baseY + ph / 2, z, 0, 0, 0, 0.5);
+  // flanges with bolt rings every ~2.2 units
+  for (let fy = baseY + 0.9; fy < baseY + ph - .3; fy += 2.2) {
+    put(frame, new THREE.CylinderGeometry(pr * 1.4, pr * 1.4, 0.16, 10, 1), x, fy, z, 0, 0, 0, 0.55);
+    if (rng() < 0.7 * D) boltRing(frame, x, fy + 0.1, z, pr * 1.18, 6, 0.035);
+  }
+  // elbow + horizontal stub at the top
+  if (rng() < 0.65) {
+    const er = pr * 1.9;
+    put(frame, new THREE.TorusGeometry(er, pr, 8, 10, Math.PI / 2), x - er, baseY + ph, z, 0, 0, 0, 0.5);
+    const stub = 1 + rng() * 3;
+    put(frame, new THREE.CylinderGeometry(pr, pr, stub, 10, 2),
+      x - er - stub / 2, baseY + ph + er, z, 0, 0, Math.PI / 2, 0.5);
+    put(frame, new THREE.CylinderGeometry(pr * 1.3, pr * 1.3, 0.14, 10, 1),
+      x - er - stub, baseY + ph + er, z, 0, 0, Math.PI / 2, 0.55);
+  } else {
+    put(frame, new THREE.CylinderGeometry(pr * 1.5, pr * 1.5, 0.35, 10, 1), x, baseY + ph, z, 0, 0, 0, 0.55);
+  }
+}
+
+function cable(p1, p2, r = 0.07) {
+  const mid = p1.clone().lerp(p2, 0.5); mid.y -= p1.distanceTo(p2) * (0.12 + rng() * 0.12);
+  const curve = new THREE.CatmullRomCurve3([p1, mid, p2]);
+  put(null, new THREE.TubeGeometry(curve, 36, r, 6), 0, 0, 0, 0, 0, 0, 0.8);
+}
+
+/* ---- the scene itself ---------------------------------------- */
+function buildScene() {
+  if (sceneRoot) { sceneRoot.geometry.dispose(); scene.remove(sceneRoot); }
+  if (lineSegs) { lineSegs.geometry.dispose(); scene.remove(lineSegs); }
+  rng = mulberry32(P.seed);
+  bag = [];
+  const D = P.density;
+
+  // ground: base sheet + individual floor plates (real gaps = real lines)
+  put(null, new THREE.PlaneGeometry(170, 170, 8, 8), 0, -0.02, 0, -Math.PI / 2, 0, 0, 0.06);
+  const N = 8;
+  for (let gx = -N; gx <= N; gx++) for (let gz = -N; gz <= N; gz++) {
+    put(null, new THREE.BoxGeometry(4.55, 0.12, 4.55), gx * 4.75, 0.06, gz * 4.75, 0, 0, 0, 0.14);
+    const r = rng();
+    if (r < 0.045 * D) {           // manhole
+      put(null, new THREE.CylinderGeometry(0.85, 0.85, 0.18, 14, 1), gx * 4.75, 0.14, gz * 4.75, 0, 0, 0, 0.35);
+      boltRing(null, gx * 4.75, 0.24, gz * 4.75, 0.66, 6);
+    } else if (r < 0.085 * D) {    // floor grate
+      for (let i = 0; i < 8; i++)
+        put(null, new THREE.BoxGeometry(3.4, 0.05, 0.16), gx * 4.75, 0.15, gz * 4.75 - 1.5 + i * 0.42, 0, 0, 0, 0.4);
+    }
+  }
+
+  // machine blocks
+  const blockTops = [];
+  const clusters = 5;
+  for (let c = 0; c < clusters; c++) {
+    const cx = (rng() - .5) * 46, cz = (rng() - .5) * 46;
+    const bw = 4.5 + rng() * 6, bh = 3.5 + rng() * 9, bd = 4.5 + rng() * 6;
+    const bf = frameOf(cx, 0, cz, 0, rng() < 0.25 ? rng() * 0.8 : 0, 0);
+    put(bf, new THREE.BoxGeometry(bw, bh, bd), 0, bh / 2, 0, 0, 0, 0, 0.9);
+
+    // panelize the four sides + top
+    const faces = [
+      [frameOf(0, bh / 2, bd / 2).premultiply(bf), bw, bh],                       // +z
+      [frameOf(0, bh / 2, -bd / 2, 0, Math.PI, 0).premultiply(bf), bw, bh],       // -z
+      [frameOf(bw / 2, bh / 2, 0, 0, Math.PI / 2, 0).premultiply(bf), bd, bh],    // +x
+      [frameOf(-bw / 2, bh / 2, 0, 0, -Math.PI / 2, 0).premultiply(bf), bd, bh],  // -x
+      [frameOf(0, bh, 0, -Math.PI / 2, 0, 0).premultiply(bf), bw, bd],            // top
+    ];
+    for (const [ff, fw, fh] of faces) panelFace(ff, fw, fh, D);
+
+    // rooftop machinery
+    const pipes = 1 + Math.floor(rng() * 2 * D);
+    for (let i = 0; i < pipes; i++)
+      pipeRun(bf, (rng() - .5) * bw * .6, (rng() - .5) * bd * .6, bh, .22 + rng() * .42, 2 + rng() * 7, D);
+    if (rng() < .55) {   // tank + saddle
+      const tr = .9 + rng() * 1.4, tx = (rng() - .5) * bw * .5, tz = (rng() - .5) * bd * .5;
+      put(bf, new THREE.SphereGeometry(tr, 16, 12), tx, bh + tr * .75, tz, 0, 0, 0, 0.45);
+      put(bf, new THREE.CylinderGeometry(tr * .55, tr * .7, tr * .5, 10, 1), tx, bh + tr * .2, tz, 0, 0, 0, 0.55);
+      put(bf, new THREE.TorusGeometry(tr * .8, .06, 6, 18), tx, bh + tr * .75, tz, Math.PI / 2, 0, 0, 0.6);
+    }
+    if (rng() < .6) railing(bf, bw, bd, bh);
+    if (rng() < .65) ladder(bf, (rng() - .5) * bw * .6, bd / 2, bh, 0);
+
+    // AC-unit style boxes on the roof
+    const rn = Math.floor(rng() * 3 * D);
+    for (let i = 0; i < rn; i++) {
+      const gw = .6 + rng() * 1.6, gh2 = .4 + rng() * 1.2, gd2 = .6 + rng() * 1.6;
+      const gx2 = (rng() - .5) * (bw - gw), gz2 = (rng() - .5) * (bd - gd2);
+      put(bf, new THREE.BoxGeometry(gw, gh2, gd2), gx2, bh + gh2 / 2, gz2, 0, 0, 0, 0.55);
+      const slats = Math.floor(gw / .18);
+      for (let s = 0; s < slats; s++)
+        put(bf, new THREE.BoxGeometry(0.05, gh2 * .6, gd2 * .8), gx2 - gw / 2 + .12 + s * .18, bh + gh2 / 2, gz2, 0, 0, 0, 0.6);
+    }
+    blockTops.push(new THREE.Vector3(cx, bh, cz));
+  }
+
+  // ground-level pipe runs with support cradles
+  for (let i = 0; i < Math.round(3 * D); i++) {
+    const pr = .3 + rng() * .35, plen = 16 + rng() * 26;
+    const px = (rng() - .5) * 40, pz = (rng() - .5) * 40, pa = rng() * Math.PI;
+    const pf = frameOf(px, 0, pz, 0, pa, 0);
+    put(pf, new THREE.CylinderGeometry(pr, pr, plen, 10, Math.floor(plen / 2.5)), 0, pr + .25, 0, 0, 0, Math.PI / 2, 0.5);
+    for (let s = -plen / 2 + 1.5; s < plen / 2; s += 3.2) {
+      put(pf, new THREE.BoxGeometry(0.5, 0.28, pr * 2.4), s, 0.14, 0, 0, 0, 0, 0.55);
+      put(pf, new THREE.TorusGeometry(pr * 1.12, .05, 6, 12), s, pr + .25, 0, 0, Math.PI / 2, 0, 0.6);
+    }
+    // inline flange pairs
+    for (let s = -plen / 2 + 4; s < plen / 2; s += 7 + rng() * 4) {
+      put(pf, new THREE.CylinderGeometry(pr * 1.35, pr * 1.35, .3, 10, 1), s, pr + .25, 0, 0, 0, Math.PI / 2, 0.55);
+    }
+  }
+
+  // catenary cables between rooftops
+  const cn = Math.min(blockTops.length * 2, Math.round(4 * D));
+  for (let i = 0; i < cn; i++) {
+    const a = blockTops[Math.floor(rng() * blockTops.length)];
+    let b = blockTops[Math.floor(rng() * blockTops.length)];
+    if (a === b) continue;
+    cable(a.clone().add(new THREE.Vector3((rng() - .5) * 2, .2, (rng() - .5) * 2)),
+          b.clone().add(new THREE.Vector3((rng() - .5) * 2, .2, (rng() - .5) * 2)),
+          0.05 + rng() * 0.05);
+  }
+
+  // antenna masts
+  for (let i = 0; i < Math.round(4 * D); i++) {
+    const ah = 4 + rng() * 8, ax = (rng() - .5) * 58, az = (rng() - .5) * 58;
+    const af = frameOf(ax, 0, az, 0, rng() * Math.PI, 0);
+    put(af, new THREE.CylinderGeometry(.09, .16, ah, 6, 3), 0, ah / 2, 0, 0, 0, 0, 0.55);
+    const bars = 2 + Math.floor(rng() * 3);
+    for (let s = 0; s < bars; s++) {
+      const by = ah * (.5 + .5 * s / bars);
+      put(af, new THREE.CylinderGeometry(.035, .035, 1.6, 5, 1), 0, by, 0, 0, 0, Math.PI / 2, 0.6);
+      put(af, new THREE.SphereGeometry(.09, 6, 5), .8, by, 0, 0, 0, 0, 0.6);
+      put(af, new THREE.SphereGeometry(.09, 6, 5), -.8, by, 0, 0, 0, 0, 0.6);
+    }
+    if (rng() < .5)   // dish
+      put(af, new THREE.CylinderGeometry(.7, .55, .2, 12, 1), 0, ah - .5, .35, Math.PI / 2.6, 0, 0, 0.5);
+    put(af, new THREE.ConeGeometry(.07, .8, 5, 1), 0, ah + .4, 0, 0, 0, 0, 0.6);
+  }
+
+  // hero object — high-res torus knot, floating like a monument
+  put(null, new THREE.TorusKnotGeometry(3.1, 0.95, 220, 20), 0, 13.5, 0, 0, 0, 0, 0.5);
+
+  const { merged, lineGeom } = mergeBag();
+  sceneRoot = new THREE.Mesh(merged, idMaterial);
+  sceneRoot.frustumCulled = false;
+  scene.add(sceneRoot);
+  lineSegs = new THREE.LineSegments(lineGeom, lineMaterial);
+  lineSegs.frustumCulled = false;
+  lineSegs.visible = false;
+  scene.add(lineSegs);
+  markDirty();
+}
+buildScene();
+
+/* ============================================================
+   Render targets: ID color + depth in one, view normals in another
+   ============================================================ */
+// TWO target sets: a 1x set for interactive frames and (when
+// supersample > 1) a full-scale set for refined stills. Keeping both
+// alive means switching costs nothing per frame — no pass logic or
+// shader behavior changes between them, only buffer size.
+let targetsLo = null, targetsHi = null, rtScreen = null;
+function makeTargetSet(scale) {
+  const s = renderer.getPixelRatio() * scale;
+  const w = Math.floor(innerWidth * s);
+  const h = Math.floor(innerHeight * s);
+  const depthTexture = new THREE.DepthTexture(w, h);
+  depthTexture.type = THREE.UnsignedIntType;
+  return {
+    scale,
+    rtID: new THREE.WebGLRenderTarget(w, h, {
+      minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+      depthTexture, depthBuffer: true,
+      samples: P.msaa ? 4 : 0,
+    }),
+    rtNormal: new THREE.WebGLRenderTarget(w, h, {
+      minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+    }),
+    rtInk: new THREE.WebGLRenderTarget(w, h, {
+      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+    }),
+  };
+}
+function disposeSet(t) { if (t) { t.rtID.dispose(); t.rtNormal.dispose(); t.rtInk.dispose(); } }
+function makeTargets() {
+  disposeSet(targetsLo); disposeSet(targetsHi);
+  if (rtScreen) rtScreen.dispose();
+  targetsLo = makeTargetSet(1);
+  targetsHi = P.superSample > 1 ? makeTargetSet(P.superSample) : null;
+  const sw = Math.floor(innerWidth * renderer.getPixelRatio());
+  const sh = Math.floor(innerHeight * renderer.getPixelRatio());
+  // screen-res intermediate so FXAA can run AFTER the downsample
+  rtScreen = new THREE.WebGLRenderTarget(sw, sh, {
+    minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+  });
+  markDirty();
+}
+makeTargets();
+
+/* ============================================================
+   Post pass — where the ink happens
+   ============================================================ */
+const post = new THREE.ShaderMaterial({
+  uniforms: {
+    tID:        { value: null },
+    tNormal:    { value: null },
+    tDepth:     { value: null },
+    resolution: { value: new THREE.Vector2() },
+    cameraNear: { value: camera.near },
+    cameraFar:  { value: camera.far },
+    lightDir:   { value: new THREE.Vector3() },
+    inkColor:   { value: new THREE.Color(P.inkColor) },
+    paperColor: { value: new THREE.Color(P.paperColor) },
+    idThreshold: { value: 0 },
+    lineWidth: { value: 0 }, distanceFalloff: { value: 0 },
+    wobbleAmp: { value: 0 }, wobbleFreq: { value: 0 },
+    hatchOn: { value: 1 }, hatchThreshold: { value: 0 }, crossThreshold: { value: 0 },
+    hatchSpacing: { value: 0 }, hatchWidth: { value: 0 }, hatchAngle: { value: 0 },
+    paperGrain: { value: 0 }, oneSided: { value: 0 }, coverage: { value: 0 },
+  },
+  vertexShader: /* glsl */`
+    varying vec2 vUv;
+    void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }
+  `,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    varying vec2 vUv;
+    uniform sampler2D tID, tNormal, tDepth;
+    uniform vec2 resolution;
+    uniform float cameraNear, cameraFar;
+    uniform vec3 lightDir, inkColor, paperColor;
+    uniform float idThreshold, lineWidth, distanceFalloff,
+                  wobbleAmp, wobbleFreq, hatchOn, hatchThreshold, crossThreshold,
+                  hatchSpacing, hatchWidth, hatchAngle, paperGrain,
+                  oneSided, coverage;
+
+    // ---- helpers -------------------------------------------------
+    float hash(vec2 p) {
+      return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+    }
+    float vnoise(vec2 p) {              // value noise, for wobble + grain
+      vec2 i = floor(p), f = fract(p);
+      vec2 u = f * f * (3.0 - 2.0 * f);
+      return mix(mix(hash(i), hash(i + vec2(1,0)), u.x),
+                 mix(hash(i + vec2(0,1)), hash(i + vec2(1,1)), u.x), u.y);
+    }
+    float linDepth(vec2 uv) {           // linear view-space distance
+      float z = texture2D(tDepth, uv).x;
+      float ndc = z * 2.0 - 1.0;
+      return (2.0 * cameraNear * cameraFar) /
+             (cameraFar + cameraNear - ndc * (cameraFar - cameraNear));
+    }
+    vec3 normalAt(vec2 uv) { return texture2D(tNormal, uv).xyz * 2.0 - 1.0; }
+    float lum(vec3 c) { return c.r + c.g + c.b; }
+
+    // color difference toward one neighbor. In one-sided mode the
+    // line only draws on the NEARER surface (or, for coplanar
+    // seams, on the arbitrarily-but-consistently brighter face) —
+    // halving line width for free.
+    float dirDiff(vec3 c, vec2 su, float dC) {
+      vec3 cn = texture2D(tID, su).rgb;
+      float diff = distance(c, cn);
+      if (oneSided > 0.5 && diff > 0.0) {
+        float dN = linDepth(su);
+        float eps = 0.012 * dC + 0.02;
+        bool keep = (dN > dC + eps) || (abs(dN - dC) <= eps && lum(c) > lum(cn));
+        if (!keep) diff = 0.0;
+      }
+      return diff;
+    }
+    // the whole face-ID detector, callable at sub-pixel offsets
+    float inkTest(vec2 uv, vec2 o, float dC) {
+      vec3 c = texture2D(tID, uv).rgb;
+      float d =        dirDiff(c, uv + vec2(o.x, 0.), dC);
+      d = max(d, dirDiff(c, uv - vec2(o.x, 0.), dC));
+      d = max(d, dirDiff(c, uv + vec2(0., o.y), dC));
+      d = max(d, dirDiff(c, uv - vec2(0., o.y), dC));
+      return smoothstep(idThreshold, idThreshold * 1.8, d);
+    }
+
+    void main() {
+      vec2 px = 1.0 / resolution;
+
+      // hand-drawn wobble: perturb WHERE we look, so every line inherits it
+      vec2 uv = vUv;
+      if (wobbleAmp > 0.0) {
+        vec2 wp = vUv * resolution * wobbleFreq;
+        uv += (vec2(vnoise(wp), vnoise(wp + 71.3)) - 0.5) * wobbleAmp * 2.0 * px;
+      }
+
+      float dC = linDepth(uv);
+      bool sky = dC > cameraFar * 0.99;
+
+      // line width in pixels, attenuated with distance so far detail
+      // collapses into fine lines instead of mush. Falloff 0..1 blends
+      // width thinning (original behavior); 1..3 additionally fades
+      // distant ink toward paper, past the width floor.
+      float atten = mix(1.0, clamp(14.0 / dC, 0.25, 1.6), min(distanceFalloff, 1.0));
+      float w = max(lineWidth * atten, 0.5);
+      vec2 o = px * w;
+
+      // ---- FACE-ID EDGES — the whole detector --------------------
+      // every face has a unique random color, so ANY face boundary,
+      // silhouette, or object-vs-object overlap produces a color
+      // step. Coverage AA runs the test at 4 sub-pixel offsets and
+      // averages, approximating analytic edge coverage.
+      float ink;
+      if (coverage > 0.5) {
+        vec2 q = px * 0.25;
+        ink = 0.25 * (inkTest(uv + vec2(-q.x, -q.y), o, dC)
+                    + inkTest(uv + vec2( q.x, -q.y), o, dC)
+                    + inkTest(uv + vec2(-q.x,  q.y), o, dC)
+                    + inkTest(uv + vec2( q.x,  q.y), o, dC));
+      } else {
+        ink = inkTest(uv, o, dC);
+      }
+      if (sky) ink = 0.0;
+
+      // ---- HATCHING from the normal buffer -----------------------
+      if (hatchOn > 0.5 && !sky) {
+        vec3 n = normalAt(uv);
+        float shade = clamp(dot(n, normalize(lightDir)), 0.0, 1.0);
+        float a = radians(hatchAngle);
+        vec2 sp = vUv * resolution;
+        // wobble the hatch too, coarser
+        sp += (vec2(vnoise(sp * .02), vnoise(sp * .02 + 40.0)) - .5) * 6.0;
+        float h1 = fract((sp.x * cos(a) + sp.y * sin(a)) / hatchSpacing);
+        float h2 = fract((sp.x * cos(a + 1.5708) + sp.y * sin(a + 1.5708)) / hatchSpacing);
+        float lineA = step(h1, hatchWidth);
+        float lineB = step(h2, hatchWidth);
+        if (shade < hatchThreshold) ink = max(ink, lineA * 0.85);
+        if (shade < crossThreshold) ink = max(ink, lineB * 0.85);
+      }
+
+      // falloff beyond 1: distance fade of ALL ink (edges + hatching)
+      float fExtra = max(distanceFalloff - 1.0, 0.0);
+      if (fExtra > 0.0)
+        ink *= clamp(mix(1.0, clamp(14.0 / dC, 0.0, 1.0), fExtra), 0.0, 1.0);
+
+      // ---- compose on paper --------------------------------------
+      vec3 paper = paperColor * (1.0 - paperGrain * vnoise(vUv * resolution * 0.7));
+      vec3 col = mix(paper, inkColor, clamp(ink, 0.0, 1.0));
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `,
+  depthTest: false, depthWrite: false,
+});
+const postScene = new THREE.Scene();
+const postQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), post);
+postQuad.frustumCulled = false;
+postScene.add(postQuad);
+const postCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+/* ---- second fullscreen stage: FXAA or plain filtered blit ---- */
+const blitVert = /* glsl */`
+  varying vec2 vUv;
+  void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`;
+const copyMat = new THREE.ShaderMaterial({
+  uniforms: { tDiffuse: { value: null } },
+  vertexShader: blitVert,
+  fragmentShader: /* glsl */`
+    varying vec2 vUv; uniform sampler2D tDiffuse;
+    void main() { gl_FragColor = vec4(texture2D(tDiffuse, vUv).rgb, 1.0); }`,
+  depthTest: false, depthWrite: false,
+});
+const fxaaMat = new THREE.ShaderMaterial({
+  uniforms: { tDiffuse: { value: null }, resolution: { value: new THREE.Vector2() } },
+  vertexShader: blitVert,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    varying vec2 vUv;
+    uniform sampler2D tDiffuse; uniform vec2 resolution;
+    #define FXAA_REDUCE_MIN (1.0/128.0)
+    #define FXAA_REDUCE_MUL (1.0/8.0)
+    #define FXAA_SPAN_MAX 8.0
+    void main() {
+      vec2 px = 1.0 / resolution;
+      vec3 rgbNW = texture2D(tDiffuse, vUv + vec2(-1.,-1.) * px).rgb;
+      vec3 rgbNE = texture2D(tDiffuse, vUv + vec2( 1.,-1.) * px).rgb;
+      vec3 rgbSW = texture2D(tDiffuse, vUv + vec2(-1., 1.) * px).rgb;
+      vec3 rgbSE = texture2D(tDiffuse, vUv + vec2( 1., 1.) * px).rgb;
+      vec3 rgbM  = texture2D(tDiffuse, vUv).rgb;
+      vec3 luma = vec3(0.299, 0.587, 0.114);
+      float lumaNW = dot(rgbNW, luma), lumaNE = dot(rgbNE, luma),
+            lumaSW = dot(rgbSW, luma), lumaSE = dot(rgbSE, luma), lumaM = dot(rgbM, luma);
+      float lumaMin = min(lumaM, min(min(lumaNW, lumaNE), min(lumaSW, lumaSE)));
+      float lumaMax = max(lumaM, max(max(lumaNW, lumaNE), max(lumaSW, lumaSE)));
+      vec2 dir = vec2(-((lumaNW + lumaNE) - (lumaSW + lumaSE)),
+                       ((lumaNW + lumaSW) - (lumaNE + lumaSE)));
+      float dirReduce = max((lumaNW + lumaNE + lumaSW + lumaSE) * (0.25 * FXAA_REDUCE_MUL), FXAA_REDUCE_MIN);
+      float rcpDirMin = 1.0 / (min(abs(dir.x), abs(dir.y)) + dirReduce);
+      dir = min(vec2(FXAA_SPAN_MAX), max(vec2(-FXAA_SPAN_MAX), dir * rcpDirMin)) * px;
+      vec3 rgbA = 0.5 * (texture2D(tDiffuse, vUv + dir * (1.0/3.0 - 0.5)).rgb
+                       + texture2D(tDiffuse, vUv + dir * (2.0/3.0 - 0.5)).rgb);
+      vec3 rgbB = rgbA * 0.5 + 0.25 * (texture2D(tDiffuse, vUv + dir * -0.5).rgb
+                                     + texture2D(tDiffuse, vUv + dir *  0.5).rgb);
+      float lumaB = dot(rgbB, luma);
+      gl_FragColor = vec4((lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB, 1.0);
+    }`,
+  depthTest: false, depthWrite: false,
+});
+const blitScene = new THREE.Scene();
+const blitQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), copyMat);
+blitQuad.frustumCulled = false;
+blitScene.add(blitQuad);
+
+/* ============================================================
+   Minimal orbit controls (no examples/jsm dependency)
+   ============================================================ */
+const orbit = { theta: 0.8, phi: 1.12, radius: 46, target: new THREE.Vector3(0, 5, 0) };
+let dragging = false, panning = false, lx = 0, ly = 0;
+renderer.domElement.addEventListener('pointerdown', e => {
+  dragging = true; panning = e.shiftKey || e.button === 2; lx = e.clientX; ly = e.clientY;
+  renderer.domElement.setPointerCapture(e.pointerId);
+});
+addEventListener('pointerup', () => dragging = false);
+addEventListener('pointermove', e => {
+  if (!dragging) return;
+  const dx = e.clientX - lx, dy = e.clientY - ly; lx = e.clientX; ly = e.clientY;
+  if (panning) {
+    const s = orbit.radius * 0.0016;
+    const right = new THREE.Vector3().setFromMatrixColumn(camera.matrix, 0);
+    const up = new THREE.Vector3().setFromMatrixColumn(camera.matrix, 1);
+    orbit.target.addScaledVector(right, -dx * s).addScaledVector(up, dy * s);
+  } else {
+    orbit.theta -= dx * 0.005;
+    orbit.phi = Math.max(0.08, Math.min(Math.PI / 2 - 0.02, orbit.phi - dy * 0.005));
+  }
+  markDirty();
+});
+renderer.domElement.addEventListener('wheel', e => {
+  e.preventDefault();
+  orbit.radius = Math.max(6, Math.min(160, orbit.radius * (1 + Math.sign(e.deltaY) * 0.09)));
+  markDirty();
+}, { passive: false });
+renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
+
+function updateCamera() {
+  if (P.autoRotate) orbit.theta += 0.0022;
+  const sp = Math.sin(orbit.phi), r = orbit.radius;
+  camera.position.set(
+    orbit.target.x + r * sp * Math.sin(orbit.theta),
+    orbit.target.y + r * Math.cos(orbit.phi),
+    orbit.target.z + r * sp * Math.cos(orbit.theta));
+  camera.lookAt(orbit.target);
+}
+
+/* ============================================================
+   Control panel (hand-rolled, zero deps)
+   ============================================================ */
+const panel = document.getElementById('panel');
+function section(title) { const h = document.createElement('h2'); h.textContent = title; panel.appendChild(h); }
+function slider(key, label, min, max, step, onCommit) {
+  const row = document.createElement('div'); row.className = 'row';
+  const val = document.createElement('span'); val.className = 'val'; val.textContent = P[key];
+  row.innerHTML = `<label>${label}</label>`;
+  const inp = document.createElement('input');
+  Object.assign(inp, { type: 'range', min, max, step, value: P[key] });
+  inp.addEventListener('input', () => { P[key] = parseFloat(inp.value); val.textContent = inp.value; markDirty(); });
+  if (onCommit) inp.addEventListener('change', onCommit);  // fires on release, not every tick
+  row.appendChild(inp); row.appendChild(val); panel.appendChild(row);
+}
+function checkbox(key, label, onChange) {
+  const row = document.createElement('div'); row.className = 'row';
+  row.innerHTML = `<label>${label}</label>`;
+  const inp = document.createElement('input');
+  inp.type = 'checkbox'; inp.checked = P[key];
+  inp.addEventListener('change', () => { P[key] = inp.checked; markDirty(); if (onChange) onChange(); });
+  row.appendChild(inp); panel.appendChild(row);
+}
+function colorPick(key, label) {
+  const row = document.createElement('div'); row.className = 'row';
+  row.innerHTML = `<label>${label}</label>`;
+  const inp = document.createElement('input');
+  inp.type = 'color'; inp.value = P[key];
+  inp.addEventListener('input', () => { P[key] = inp.value; markDirty(); });
+  row.appendChild(inp); panel.appendChild(row);
+}
+function buttons(defs) {
+  const row = document.createElement('div'); row.className = 'row';
+  for (const [label, fn] of defs) {
+    const b = document.createElement('button'); b.textContent = label;
+    b.addEventListener('click', fn); row.appendChild(b);
+  }
+  panel.appendChild(row);
+}
+
+section('face-id edges');
+slider('idThreshold', 'threshold', 0.001, 0.3, 0.001);
+checkbox('perQuad', 'per-quad colors', () => buildScene());
+section('thin lines & aa');
+checkbox('oneSided', 'one-sided lines');
+checkbox('coverageAA', 'coverage aa');
+slider('superSample', 'supersample ×', 1, 2, 0.25, () => makeTargets());
+checkbox('progressive', 'progressive ss');
+checkbox('msaa', 'msaa id buffer', () => makeTargets());
+checkbox('fxaa', 'fxaa');
+checkbox('vectorMode', 'vector lines');
+section('vector style');
+slider('overshoot', 'overshoot', 0, 0.2, 0.01, () => buildScene());
+slider('inkVary', 'ink vary', 0, 0.8, 0.01);
+section('line quality');
+slider('lineWidth', 'width px', 0.5, 4, 0.1);
+slider('distanceFalloff', 'dist falloff', 0, 3, 0.01);
+slider('wobbleAmp', 'wobble amp', 0, 4, 0.05);
+slider('wobbleFreq', 'wobble freq', 0.005, 0.2, 0.005);
+section('hatching');
+checkbox('hatchOn', 'enabled');
+slider('hatchThreshold', 'shade start', 0, 1, 0.01);
+slider('crossThreshold', 'cross-hatch', 0, 1, 0.01);
+slider('hatchSpacing', 'spacing px', 3, 20, 0.5);
+slider('hatchWidth', 'stroke', 0.05, 0.9, 0.01);
+slider('hatchAngle', 'angle°', 0, 180, 1);
+section('paper & ink');
+colorPick('inkColor', 'ink');
+colorPick('paperColor', 'paper');
+slider('paperGrain', 'grain', 0, 0.25, 0.005);
+section('scene');
+slider('density', 'greeble density', 0.3, 2.5, 0.05, () => buildScene());
+checkbox('autoRotate', 'auto-rotate');
+const stats = document.createElement('div');
+stats.className = 'row'; stats.style.color = '#8fa3bf';
+panel.appendChild(stats);
+buttons([
+  ['regenerate', () => { P.seed = (Math.random() * 1e6) | 0; buildScene(); }],
+  ['export png', () => {
+    const a = document.createElement('a');
+    a.download = 'moebius-lines.png';
+    a.href = renderer.domElement.toDataURL('image/png');
+    a.click();
+  }],
+]);
+
+/* ============================================================
+   Main loop
+   ============================================================ */
+const lightWorld = new THREE.Vector3(-0.55, 0.8, 0.35).normalize();
+const _lv = new THREE.Vector3();
+let frames = 0, lastStats = performance.now();
+let refinePending = false, lastChange = 0, lastRender = 0;
+
+function renderFrame(useHi) {
+  updateCamera();
+
+  if (P.vectorMode) {
+    // ---- VECTOR PATH: paper fill occludes, real line geometry ----
+    sceneRoot.material = fillMaterial;
+    fillMaterial.color.set(P.paperColor);
+    const lu = lineMaterial.uniforms;
+    lu.uInk.value.set(P.inkColor);
+    lu.uAmpW.value = P.wobbleAmp * 0.045;        // px-ish slider -> world units
+    lu.uFreqW.value = P.wobbleFreq * 25.0;
+    lu.uLift.value = P.wobbleAmp * 0.09 + 0.06;  // scale lift with wobble
+    lu.uFalloff.value = P.distanceFalloff;
+    lu.uInkVary.value = P.inkVary;
+    lineSegs.visible = true;
+    renderer.setRenderTarget(null);
+    renderer.setClearColor(new THREE.Color(P.paperColor), 1);
+    renderer.clear();
+    renderer.render(scene, camera);
+    return;
+  }
+  sceneRoot.material = idMaterial;
+  lineSegs.visible = false;
+
+  const T = (useHi && targetsHi) ? targetsHi : targetsLo;
+
+  // pass 1: face-ID colors + depth
+  renderer.setRenderTarget(T.rtID);
+  renderer.setClearColor(0xffffff, 1);
+  renderer.clear();
+  scene.overrideMaterial = null;
+  renderer.render(scene, camera);
+
+  // pass 2: view-space normals — only needed while hatching is on
+  if (P.hatchOn) {
+    renderer.setRenderTarget(T.rtNormal);
+    renderer.setClearColor(0x8080ff, 1);
+    renderer.clear();
+    scene.overrideMaterial = normalMaterial;
+    renderer.render(scene, camera);
+    scene.overrideMaterial = null;
+  }
+
+  // pass 3: ink
+  const u = post.uniforms;
+  u.tID.value = T.rtID.texture;
+  u.tNormal.value = T.rtNormal.texture;
+  u.tDepth.value = T.rtID.depthTexture;
+  u.resolution.value.set(T.rtID.width, T.rtID.height);
+  u.lightDir.value.copy(_lv.copy(lightWorld).transformDirection(camera.matrixWorldInverse));
+  u.inkColor.value.set(P.inkColor);
+  u.paperColor.value.set(P.paperColor);
+  for (const k of ['idThreshold','lineWidth','distanceFalloff',
+    'wobbleAmp','wobbleFreq','hatchThreshold','crossThreshold',
+    'hatchSpacing','hatchWidth','hatchAngle','paperGrain']) u[k].value = P[k];
+  u.hatchOn.value = P.hatchOn ? 1 : 0;
+  u.oneSided.value = P.oneSided ? 1 : 0;
+  u.coverage.value = P.coverageAA ? 1 : 0;
+
+  // route through rtInk when the image needs a filtered resample
+  const ssActive = T.scale !== 1;
+  const needsBlit = P.fxaa || ssActive;
+  renderer.setRenderTarget(needsBlit ? T.rtInk : null);
+  renderer.render(postScene, postCamera);
+  if (!needsBlit) return;
+  if (P.fxaa && ssActive) {
+    // downsample FIRST, then FXAA at screen res — same look,
+    // FXAA cost no longer scales with supersample
+    copyMat.uniforms.tDiffuse.value = T.rtInk.texture;
+    blitQuad.material = copyMat;
+    renderer.setRenderTarget(rtScreen);
+    renderer.render(blitScene, postCamera);
+    fxaaMat.uniforms.tDiffuse.value = rtScreen.texture;
+    fxaaMat.uniforms.resolution.value.set(rtScreen.width, rtScreen.height);
+    blitQuad.material = fxaaMat;
+    renderer.setRenderTarget(null);
+    renderer.render(blitScene, postCamera);
+  } else if (P.fxaa) {
+    fxaaMat.uniforms.tDiffuse.value = T.rtInk.texture;
+    fxaaMat.uniforms.resolution.value.set(T.rtInk.width, T.rtInk.height);
+    blitQuad.material = fxaaMat;
+    renderer.setRenderTarget(null);
+    renderer.render(blitScene, postCamera);
+  } else {
+    copyMat.uniforms.tDiffuse.value = T.rtInk.texture;
+    blitQuad.material = copyMat;
+    renderer.setRenderTarget(null);
+    renderer.render(blitScene, postCamera);
+  }
+}
+
+function tick() {
+  const now = performance.now();
+  if (P.autoRotate) dirty = true;
+  const prog = P.progressive && !P.vectorMode && targetsHi;
+  let counted = false;
+  if (dirty) {
+    renderFrame(!prog);            // interactive frame: 1x while progressive
+    dirty = false;
+    refinePending = !!prog;
+    lastChange = now; lastRender = now; counted = true;
+  } else if (refinePending && now - lastChange > 250) {
+    renderFrame(true);             // the supersampled still
+    refinePending = false;
+    lastRender = now; counted = true;
+  } else if (now - lastRender > 2000) {
+    renderFrame(true);             // idle safety refresh (not counted in fps)
+    lastRender = now;
+  }
+  if (counted) frames++;
+  if (now - lastStats > 500) {
+    const fps = frames ? `${Math.round(frames * 1000 / (now - lastStats))} fps` : 'idle';
+    stats.textContent = `tris ${(triCount / 1000).toFixed(0)}k · edges ${(edgeCount / 1000).toFixed(0)}k · ${fps}`;
+    window.__tris = triCount;
+    frames = 0; lastStats = now;
+  }
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+// dev hooks (used by headless tests; harmless in normal use)
+window.__P = P; window.__makeTargets = makeTargets; window.__buildScene = buildScene;
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+  makeTargets();
+});
+</script>
+</body>
+</html>

@@ -33,6 +33,10 @@ Anti-aliasing options stack: one-sided lines, coverage AA, MSAA on the ID buffer
 
 A second, fully separate renderer: at build time every quad boundary is extracted as real line geometry (the duplicated diagonal vertices of each triangle pair identify which edge to drop), then the scene renders as a paper-colored occluder (polygon offset) with the edge lines drawn on top — classic hidden-line rendering, perfectly crisp at any zoom. The lines get their hand-drawn character from a custom shader: world-space noise wobble in the vertex stage (stable while orbiting), per-edge seeds so duplicated shared edges read as natural double-strokes, randomized endpoint overshoot, per-stroke ink variation, and distance-based opacity fade.
 
+### Preview scenes
+
+Four scenes to flip between: **yard** (the procedural greeble city), **garden** (the same solids at three tessellation levels — a direct look at how geometric density becomes line density), **prims** (a minimal debugging scene), and **model**, which renders `speeder.obj` — a real, hand-editable quads-only OBJ file (regenerate it with `make_speeder.py`, or sculpt it in any editor). Drop any `.obj` onto the window, or use the load button, to run your own model through the ink pipeline. Better still, keep models organized in a `Models/` folder — the **models folder…** button turns every subdirectory into its own scene showcasing the OBJs inside it (triangulated models are detected and colored per-triangle automatically).
+
 ## Controls
 
 Everything is on sliders in the panel: detection threshold, per-quad coloring, the five AA toggles, line width and distance falloff, wobble amplitude/frequency, hatching (thresholds, spacing, angle), ink/paper colors and grain, vector-mode overshoot and ink variation, and greeble density (rebuilds the scene). `export png` saves the current frame.

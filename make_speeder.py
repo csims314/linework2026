@@ -9,6 +9,7 @@ Structure notes (also written into the OBJ as comments):
   v lines in the OBJ.
 """
 import math
+from pathlib import Path
 
 verts = []   # (x, y, z)
 faces = []   # tuples of 1-based vertex indices (len 3 or 4)
@@ -170,5 +171,9 @@ for (name, comment, start), (_, _, end) in zip(part_bounds, part_bounds[1:]):
         lines.append('f ' + ' '.join(str(i) for i in f))
     lines.append('')
 
-open('/home/claude/moebius/speeder.obj', 'w').write('\n'.join(lines))
-print(f'wrote speeder.obj: {len(verts)} verts, {qcount} quads, {tcount} tris')
+# written next to this script, with LF endings on every platform so
+# regenerating on Windows doesn't rewrite the whole file as CRLF
+out = Path(__file__).with_name('speeder.obj')
+with open(out, 'w', newline='\n') as fh:
+    fh.write('\n'.join(lines))
+print(f'wrote {out}: {len(verts)} verts, {qcount} quads, {tcount} tris')

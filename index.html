@@ -32,15 +32,33 @@
   .row .val { flex:0 0 34px; text-align:right; color:#e8a33d; }
   .row input[type=checkbox] { accent-color:#e8a33d; }
   .row input[type=color] { flex:0 0 34px; height:20px; border:none; background:none; padding:0; }
+  .row select { flex:1; min-width:0; background:#2b303a; color:#dfe3ea; border:1px solid #444c59;
+    border-radius:5px; padding:3px 4px; font:inherit; font-size:11px; cursor:pointer; }
   button { background:#2b303a; color:#dfe3ea; border:1px solid #444c59; border-radius:5px; padding:4px 8px; font:inherit; cursor:pointer; margin:2px 2px 0 0;}
   button:hover { background:#39404d; }
   #hint { position:fixed; left:12px; bottom:10px; color:#00000066; font-size:11px; pointer-events:none; }
+  #budget {
+    position:fixed; left:10px; bottom:32px; width:186px;
+    background:rgba(20,22,26,.92); color:#cfd3da; border-radius:8px;
+    padding:10px 12px 12px; font-size:11px; user-select:none; backdrop-filter:blur(4px);
+    font-family: ui-monospace, 'Cascadia Code', Menlo, Consolas, monospace;
+  }
+  #budget h1 { font-size:12px; margin:2px 0 8px; color:#fff; letter-spacing:.06em; }
+  #budget .m { margin:0 0 7px; }
+  #budget .m:last-child { margin-bottom:0; }
+  #budget .cap { display:flex; justify-content:space-between; margin-bottom:3px; line-height:1.1; }
+  #budget .cap .lab { color:#8fa3bf; }
+  #budget .cap .val { color:#dfe3ea; }
+  #budget .bar { display:flex; gap:1px; height:7px; }
+  #budget .seg { flex:1; background:#2b303a; border-radius:1px; }
+  #budget .m.stale .bar { opacity:.3; }
 </style>
 </head>
 <body>
 <div id="app"></div>
 <div id="sceneMenu"><h1>SCENES</h1><div id="sceneList"></div></div>
 <div id="panel"><h1>MOEBIUS LINES</h1></div>
+<div id="budget"><h1>BUDGET</h1><div id="budgetList"></div></div>
 <div id="hint">drag&nbsp;=&nbsp;orbit&nbsp;&nbsp;·&nbsp;&nbsp;shift-drag&nbsp;=&nbsp;pan&nbsp;&nbsp;·&nbsp;&nbsp;wheel&nbsp;=&nbsp;zoom&nbsp;&nbsp;·&nbsp;&nbsp;drop&nbsp;.obj&nbsp;to&nbsp;load</div>
 
 <script type="importmap">
@@ -56,6 +74,18 @@ import * as THREE from 'three';
 const P = {
   // edge extraction — face-ID only: every face boundary is a line
   idThreshold: 0.005,
+  // region grouping: neighbors that share a color draw no line between them
+  regionGroup: true, similarity: 0.5,
+  // debug: draw the face-ID buffer itself instead of the ink
+  showIDs: false,
+  // feature LOD: fade a line when the shapes it separates are small on screen.
+  // minFeature is a % of screen height; 0 disables the whole feature.
+  minFeature: 0.4, lodMetric: 'area', lodUnit: 'region', keepSilhouettes: false,
+  // near plane as a fraction of the orbit distance — raise it to buy depth
+  // precision (less z-fighting), lower it if close geometry starts clipping
+  nearFactor: 0.02,
+  // drop loaded-model faces sealed inside another part (assembled models)
+  cullBuried: false,
   // line look
   lineWidth: 0.5, distanceFalloff: 1.25,
   wobbleAmp: 1.1, wobbleFreq: 0.08,
@@ -69,6 +99,8 @@ const P = {
   msaa: true, fxaa: true, vectorMode: false, progressive: false,
   // vector style (only affects vector mode)
   overshoot: 0.05, inkVary: 0.3,
+  // camera: orbit around a target, or free-floating WASD/QE flight
+  flyMode: false, flySpeed: 1,
   // scene
   scene: 'yard', perQuad: true, autoRotate: false, seed: 7, density: 2.5,
 };
@@ -85,6 +117,11 @@ function mulberry32(a) {
   };
 }
 let rng = mulberry32(P.seed);
+// Face colors draw from their OWN stream. They used to share `rng` with the
+// procedural builders, which meant any option changing how many colors get
+// rolled — per-quad, region grouping, similarity — also reshuffled the greeble
+// layout. Same seed, separate stream: color options now only change color.
+let crng = mulberry32(P.seed ^ 0x9e3779b9);
 
 // dirty-flag rendering: frames only render when something changed
 // (camera, sliders, rebuilds). Lets progressive supersampling slot
@@ -674,20 +711,267 @@ let modelScenes = [];   // [{ name, files: [{ name, text }] }]
    emit quads as consecutive tri pairs) so quads don't get a
    diagonal seam. perQuad=false shows every triangle.
    ============================================================ */
+/* ------------------------------------------------------------
+   Region grouping — the ID-map idea, applied to line control.
+   Rather than one random color per face, adjacent faces are
+   flood-filled into REGIONS and each region gets ONE color.
+   Since the detector only inks where the color steps, a region's
+   interior falls silent: a smooth sphere collapses to a single
+   region and draws just its silhouette, while a cube still keeps
+   its six faces. Two neighbors join when their face normals agree
+   to within `similarity` (1 = coplanar only, lower tolerates more
+   curvature) and nothing explicit separates them — an OBJ
+   o/g/usemtl change always forces a boundary.
+   ------------------------------------------------------------ */
+function computeRegions(g, stride, similarity, triGroups) {
+  const p = g.attributes.position.array;
+  const nVert = g.attributes.position.count;
+  const nFace = Math.ceil(nVert / stride);
+  const triPerFace = stride / 3;
+
+  // weld by quantized position: toNonIndexed() split the shared
+  // vertices apart, but neighbors have to agree on vertex identity
+  // 1e-4 is deliberately tight. Loosening it does NOT join parts that merely
+  // butt together — it welds unrelated vertices, which collapses faces and
+  // breaks the edge topology, so *fewer* neighbours pair up and regions go up.
+  const weld = new Map(), vid = new Int32Array(nVert);
+  for (let i = 0; i < nVert; i++) {
+    const b = i * 3;
+    const k = Math.round(p[b] * 1e4) + '_' + Math.round(p[b + 1] * 1e4) +
+              '_' + Math.round(p[b + 2] * 1e4);
+    let id = weld.get(k);
+    if (id === undefined) { id = weld.size; weld.set(k, id); }
+    vid[i] = id;
+  }
+
+  // per face: area-weighted normal + its boundary edges. An edge used
+  // twice *inside* one face is the quad's diagonal, not a boundary.
+  const fn = new Float32Array(nFace * 3);
+  const faceEdges = new Array(nFace);
+  const owner = new Map();              // edge key -> first face, -1 once paired
+  const pairs = [], pairKeys = [];      // faces meeting across a shared edge
+  const seen = new Map();
+  for (let f = 0; f < nFace; f++) {
+    const v0 = f * stride, vN = Math.min(stride, nVert - v0);
+    let ax = 0, ay = 0, az = 0;
+    seen.clear();
+    for (let t = 0; t + 3 <= vN; t += 3) {
+      const i0 = v0 + t, b0 = i0 * 3, b1 = b0 + 3, b2 = b0 + 6;
+      const ux = p[b1] - p[b0], uy = p[b1 + 1] - p[b0 + 1], uz = p[b1 + 2] - p[b0 + 2];
+      const wx = p[b2] - p[b0], wy = p[b2 + 1] - p[b0 + 1], wz = p[b2 + 2] - p[b0 + 2];
+      // cross product length is 2x area, so summing weights by area
+      ax += uy * wz - uz * wy; ay += uz * wx - ux * wz; az += ux * wy - uy * wx;
+      for (let e = 0; e < 3; e++) {
+        const s = i0 + e, d = i0 + (e + 1) % 3, a = vid[s], c = vid[d];
+        const key = a < c ? a + '_' + c : c + '_' + a;
+        const prev = seen.get(key);
+        if (prev) prev.n++; else seen.set(key, { n: 1, i: s, j: d });
+      }
+    }
+    const l = Math.hypot(ax, ay, az) || 1;
+    fn[f * 3] = ax / l; fn[f * 3 + 1] = ay / l; fn[f * 3 + 2] = az / l;
+    const bnd = [];
+    for (const [key, v] of seen) {
+      if (v.n !== 1) continue;                      // internal diagonal
+      bnd.push(key, v.i, v.j);
+      const o = owner.get(key);
+      if (o === undefined) owner.set(key, f);
+      else if (o >= 0) { pairs.push(o, f); pairKeys.push(key); owner.set(key, -1); }
+    }
+    faceEdges[f] = bnd;
+  }
+
+  // union neighbors whose normals agree and that nothing separates
+  const parent = new Int32Array(nFace);
+  for (let f = 0; f < nFace; f++) parent[f] = f;
+  const find = x => { while (parent[x] !== x) { parent[x] = parent[parent[x]]; x = parent[x]; } return x; };
+  for (let i = 0; i < pairs.length; i += 2) {
+    const a = pairs[i], b = pairs[i + 1];
+    if (triGroups && triGroups[a * triPerFace] !== triGroups[b * triPerFace]) continue;
+    if (fn[a * 3] * fn[b * 3] + fn[a * 3 + 1] * fn[b * 3 + 1] +
+        fn[a * 3 + 2] * fn[b * 3 + 2] < similarity) continue;
+    const ra = find(a), rb = find(b);
+    if (ra !== rb) parent[rb] = ra;
+  }
+
+  const region = new Int32Array(nFace), remap = new Map();
+  for (let f = 0; f < nFace; f++) {
+    const r = find(f);
+    let id = remap.get(r);
+    if (id === undefined) { id = remap.size; remap.set(r, id); }
+    region[f] = id;
+  }
+  // edges with the same region on both sides are the lines that go
+  // away; region adjacency drives color separation below
+  const silent = new Set(), nbr = new Array(remap.size);
+  for (let i = 0; i < remap.size; i++) nbr[i] = [];
+  for (let i = 0; i < pairs.length; i += 2) {
+    const ra = region[pairs[i]], rb = region[pairs[i + 1]];
+    if (ra === rb) silent.add(pairKeys[i >> 1]);
+    else { nbr[ra].push(rb); nbr[rb].push(ra); }
+  }
+  return { region, count: remap.size, nFace, faceEdges, silent, nbr, pairs, pairKeys };
+}
+
+/* ------------------------------------------------------------
+   Feature size — how big a shape is, for screen-relative LOD.
+   `similarity` is baked and view-independent, so it can decide a
+   sphere is smooth but never that the sphere is 8px tall. This
+   measures each shape in world units; the shaders divide by
+   distance to get its apparent size and fade small stuff out.
+
+   Three metrics, because which one reads best depends on how thin
+   shapes like pipes and masts should behave — all are baked so
+   the dropdown switches with no rebuild.
+   ------------------------------------------------------------ */
+const LOD_METRICS = ['area', 'diagonal', 'thin'];
+const LOD_UNITS = ['region', 'object'];
+
+// log encode into one byte: covers ~0.01 to 200 world units at ~4%
+// relative precision, which is all an 8-bit alpha channel can carry
+function encodeSize(s) {
+  const t = (Math.log2(Math.max(s, 1e-3)) + 7) / 15;
+  return Math.max(0, Math.min(255, Math.round(t * 255)));
+}
+
+function sizeMetrics(geom, stride, regionOf, nUnit) {
+  const p = geom.attributes.position.array;
+  const nVert = geom.attributes.position.count;
+  const nFace = Math.ceil(nVert / stride);
+  const area = new Float64Array(nUnit), bb = new Float64Array(nUnit * 6);
+  for (let u = 0; u < nUnit; u++) {
+    bb[u * 6] = bb[u * 6 + 1] = bb[u * 6 + 2] = Infinity;
+    bb[u * 6 + 3] = bb[u * 6 + 4] = bb[u * 6 + 5] = -Infinity;
+  }
+  let oArea = 0;
+  const ob = [Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity];
+  for (let f = 0; f < nFace; f++) {
+    const u = regionOf ? regionOf[f] : f;
+    const v0 = f * stride, vN = Math.min(stride, nVert - v0);
+    for (let t = 0; t + 3 <= vN; t += 3) {
+      const b0 = (v0 + t) * 3, b1 = b0 + 3, b2 = b0 + 6;
+      const ux = p[b1] - p[b0], uy = p[b1 + 1] - p[b0 + 1], uz = p[b1 + 2] - p[b0 + 2];
+      const wx = p[b2] - p[b0], wy = p[b2 + 1] - p[b0 + 1], wz = p[b2 + 2] - p[b0 + 2];
+      const a = Math.hypot(uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx) * 0.5;
+      area[u] += a; oArea += a;
+    }
+    for (let i = v0; i < v0 + vN; i++) {
+      const b = i * 3;
+      for (let k = 0; k < 3; k++) {
+        const x = p[b + k];
+        if (x < bb[u * 6 + k]) bb[u * 6 + k] = x;
+        if (x > bb[u * 6 + 3 + k]) bb[u * 6 + 3 + k] = x;
+        if (x < ob[k]) ob[k] = x;
+        if (x > ob[3 + k]) ob[3 + k] = x;
+      }
+    }
+  }
+  // "thin" is the MIDDLE bbox extent, not the smallest: the smallest is
+  // 0 for any flat patch, which would make every panel read as a sliver
+  const metrics = (ar, dx, dy, dz) => {
+    const s = [dx, dy, dz].sort((a, b) => a - b);
+    return [Math.sqrt(ar), Math.hypot(dx, dy, dz), s[1]];
+  };
+  const enc = new Uint8Array(nUnit * 3);
+  for (let u = 0; u < nUnit; u++) {
+    const m = metrics(area[u],
+      Math.max(0, bb[u * 6 + 3] - bb[u * 6]),
+      Math.max(0, bb[u * 6 + 4] - bb[u * 6 + 1]),
+      Math.max(0, bb[u * 6 + 5] - bb[u * 6 + 2]));
+    for (let k = 0; k < 3; k++) enc[u * 3 + k] = encodeSize(m[k]);
+  }
+  const om = metrics(oArea, Math.max(0, ob[3] - ob[0]),
+    Math.max(0, ob[4] - ob[1]), Math.max(0, ob[5] - ob[2]));
+  return { enc, obj: om.map(encodeSize) };
+}
+
 function faceIdColors(geometry, perQuad, variation = 1.0) {
   const geom = geometry.index ? geometry.toNonIndexed() : geometry;
   const count = geom.attributes.position.count;
   const colors = new Float32Array(count * 3);
   const step = perQuad ? 6 : 3;
-  for (let i = 0; i < count; i += step) {
-    const r = .5 + (rng() - .5) * variation;
-    const g = .5 + (rng() - .5) * variation;
-    const b = .5 + (rng() - .5) * variation;
-    for (let j = 0; j < step && i + j < count; j++) {
-      colors[(i + j) * 3] = r; colors[(i + j) * 3 + 1] = g; colors[(i + j) * 3 + 2] = b;
+  const paint = (from, to, r, g, b) => {
+    for (let i = from; i < to && i < count; i++) {
+      colors[i * 3] = r; colors[i * 3 + 1] = g; colors[i * 3 + 2] = b;
     }
+  };
+
+  if (!P.regionGroup) {
+    for (let i = 0; i < count; i += step)
+      paint(i, i + step, .5 + (crng() - .5) * variation,
+                         .5 + (crng() - .5) * variation,
+                         .5 + (crng() - .5) * variation);
+  } else {
+    const R = computeRegions(geom, step, P.similarity, geometry.userData.faceGroup);
+    // one color per region. Each is rolled a few times and the roll
+    // landing furthest from the neighbors already placed wins — two
+    // near-identical colors across a boundary are an edge the
+    // detector would miss, i.e. a hole in the linework.
+    const rc = new Float32Array(R.count * 3), done = new Uint8Array(R.count);
+
+    for (let r = 0; r < R.count; r++) {
+      let best = -1, br = .5, bg = .5, bb = .5;
+      for (let k = 0; k < 4; k++) {
+        const cr = .5 + (crng() - .5) * variation;
+        const cg = .5 + (crng() - .5) * variation;
+        const cb = .5 + (crng() - .5) * variation;
+        let near = Infinity;
+        for (const n of R.nbr[r]) {
+          if (!done[n]) continue;
+          const dr = cr - rc[n * 3], dg = cg - rc[n * 3 + 1], db = cb - rc[n * 3 + 2];
+          near = Math.min(near, dr * dr + dg * dg + db * db);
+        }
+        if (near > best) { best = near; br = cr; bg = cg; bb = cb; }
+        if (near === Infinity) break;      // nothing placed nearby yet
+      }
+      rc[r * 3] = br; rc[r * 3 + 1] = bg; rc[r * 3 + 2] = bb;
+      done[r] = 1;
+    }
+    for (let f = 0; f < R.nFace; f++) {
+      const r = R.region[f];
+      paint(f * step, f * step + step, rc[r * 3], rc[r * 3 + 1], rc[r * 3 + 2]);
+    }
+    geom.userData.regions = R;            // vector mode reuses this
   }
   geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+  // ---- feature-LOD sizes ----------------------------------------
+  // One size per unit, where a unit is a region (or a bare face when
+  // grouping is off) plus the whole geometry as the "object" unit.
+  // Both go out as normalized bytes: the value lands in an 8-bit
+  // alpha channel anyway, so floats would just waste bandwidth.
+  const nFace = Math.ceil(count / step);
+  const R = geom.userData.regions;
+  const regionOf = R ? R.region : null;
+  const SM = sizeMetrics(geom, step, regionOf, R ? R.count : nFace);
+  const szR = new Uint8Array(count * 3), szO = new Uint8Array(count * 3);
+  for (let f = 0; f < nFace; f++) {
+    const u = regionOf ? regionOf[f] : f;
+    for (let j = 0; j < step; j++) {
+      const i = f * step + j;
+      if (i >= count) break;
+      szR[i * 3] = SM.enc[u * 3]; szR[i * 3 + 1] = SM.enc[u * 3 + 1]; szR[i * 3 + 2] = SM.enc[u * 3 + 2];
+      szO[i * 3] = SM.obj[0]; szO[i * 3 + 1] = SM.obj[1]; szO[i * 3 + 2] = SM.obj[2];
+    }
+  }
+  geom.setAttribute('aSizeRegion', new THREE.BufferAttribute(szR, 3, true));
+  geom.setAttribute('aSizeObject', new THREE.BufferAttribute(szO, 3, true));
+
+  // per-edge size for vector mode: an edge is gated by the SMALLER of
+  // the two regions it separates. Encoding is monotonic, so the min of
+  // the encoded bytes is the encoding of the min.
+  if (R) {
+    const em = new Map();
+    for (let i = 0; i < R.pairs.length; i += 2) {
+      const a = R.region[R.pairs[i]] * 3, b = R.region[R.pairs[i + 1]] * 3;
+      em.set(R.pairKeys[i >> 1], [
+        Math.min(SM.enc[a], SM.enc[b]),
+        Math.min(SM.enc[a + 1], SM.enc[b + 1]),
+        Math.min(SM.enc[a + 2], SM.enc[b + 2])]);
+    }
+    geom.userData.edgeSize = em;
+  }
+  geom.userData.sizes = SM;
   return geom;
 }
 
@@ -695,7 +979,10 @@ function faceIdColors(geometry, perQuad, variation = 1.0) {
    Renderer / scene bootstrap
    ============================================================ */
 const app = document.getElementById('app');
-const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+const renderer = new THREE.WebGLRenderer({
+  antialias: true, preserveDrawingBuffer: true,
+  powerPreference: 'high-performance',   // request the discrete GPU on dual-GPU laptops
+});
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 renderer.setSize(innerWidth, innerHeight);
 app.appendChild(renderer.domElement);
@@ -703,9 +990,31 @@ app.appendChild(renderer.domElement);
 const scene = new THREE.Scene();
 const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 300);
 
-// shared "ID" material — the scene is *rendered as* its face colors
-// DoubleSide so user-loaded OBJ models render regardless of winding
-const idMaterial = new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide });
+// shared "ID" material — the scene is *rendered as* its face colors,
+// with the selected feature size riding in the alpha channel (the ID
+// target is RGBA already, so this costs no extra pass or buffer).
+// DoubleSide so user-loaded OBJ models render regardless of winding.
+const idMaterial = new THREE.ShaderMaterial({
+  vertexColors: true,                     // makes three declare `attribute vec3 color`
+  side: THREE.DoubleSide,
+  uniforms: { uMetric: { value: 0 }, uUnit: { value: 0 } },
+  vertexShader: /* glsl */`
+    attribute vec3 aSizeRegion, aSizeObject;
+    uniform float uMetric, uUnit;
+    varying vec3 vCol;
+    varying float vSize;
+    void main() {
+      vCol = color;
+      vec3 s = uUnit < 0.5 ? aSizeRegion : aSizeObject;
+      vSize = uMetric < 0.5 ? s.x : (uMetric < 1.5 ? s.y : s.z);
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }`,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    varying vec3 vCol;
+    varying float vSize;
+    void main() { gl_FragColor = vec4(vCol, vSize); }`,
+});
 const normalMaterial = new THREE.MeshNormalMaterial({ side: THREE.DoubleSide });
 // vector mode: paper-colored fill occludes, real line geometry draws
 const fillMaterial = new THREE.MeshBasicMaterial({
@@ -725,12 +1034,19 @@ const lineMaterial = new THREE.ShaderMaterial({
     uFalloff: { value: 0.55 },
     uInkVary: { value: 0.3 },
     uFadeK:   { value: 14.0 },
+    uMetric:  { value: 0 },
+    uUnit:    { value: 0 },
+    uMinFeat: { value: 0.0 },   // fraction of screen height; 0 = off
+    uInvFov:  { value: 1.0 },
   },
   vertexShader: /* glsl */`
     attribute float aSeed;
-    uniform float uAmpW, uFreqW, uLift;
-    varying float vSeed, vDist;
+    attribute vec3 aSizeRegion, aSizeObject;
+    uniform float uAmpW, uFreqW, uLift, uMetric, uUnit;
+    varying float vSeed, vDist, vSize;
     void main() {
+      vec3 sz = uUnit < 0.5 ? aSizeRegion : aSizeObject;
+      vSize = uMetric < 0.5 ? sz.x : (uMetric < 1.5 ? sz.y : sz.z);
       vec3 p = position;
       float s = aSeed * 43.0;
       float f1 = uFreqW, f2 = uFreqW * 2.7;
@@ -748,12 +1064,18 @@ const lineMaterial = new THREE.ShaderMaterial({
   fragmentShader: /* glsl */`
     precision highp float;
     uniform vec3 uInk;
-    uniform float uInkVary, uFalloff, uFadeK;
-    varying float vSeed, vDist;
+    uniform float uInkVary, uFalloff, uFadeK, uMinFeat, uInvFov;
+    varying float vSeed, vDist, vSize;
     void main() {
       float a = 1.0 - uInkVary * fract(vSeed * 91.17);
       a *= mix(1.0, clamp(uFadeK / vDist, 0.3, 1.0), min(uFalloff, 1.0));
       a *= clamp(mix(1.0, clamp(uFadeK / vDist, 0.0, 1.0), max(uFalloff - 1.0, 0.0)), 0.0, 1.0);
+      // feature LOD: apparent size of this edge's shape, as a fraction
+      // of screen height — same test the ink shader runs
+      if (uMinFeat > 0.0) {
+        float frac = exp2(vSize * 15.0 - 7.0) * uInvFov / max(vDist, 1e-4);
+        a *= smoothstep(uMinFeat, uMinFeat * 2.0, frac);
+      }
       gl_FragColor = vec4(uInk, a);
     }`,
   transparent: true, depthWrite: false,
@@ -766,8 +1088,11 @@ const lineMaterial = new THREE.ShaderMaterial({
    color. Everything is baked into ONE merged mesh (one draw
    call), so tens of thousands of parts render like one object.
    ============================================================ */
-let sceneRoot = null, lineSegs = null;
-let triCount = 0, edgeCount = 0;
+let sceneRoot = null, lineSegs = null, sceneSphere = null;
+let triCount = 0, edgeCount = 0, regionCount = 0;
+// declared here, not with the budget meters: buildScene() runs at module
+// top-level well before that point and would hit the temporal dead zone
+let lastBuildMs = 0, lastFrameMs = 0;
 
 // ---- merge machinery -----------------------------------------
 let bag = [];
@@ -800,9 +1125,14 @@ function extractEdges(g, perQuad, store) {
   // the vertex-shader wobble can actually bend it, tagged with a
   // per-edge seed (duplicated shared edges get different seeds ->
   // natural double-stroke)
-  function push(i, j, b) {
-    let ax = p[b + i * 3], ay = p[b + i * 3 + 1], az = p[b + i * 3 + 2];
-    let bx = p[b + j * 3], by = p[b + j * 3 + 1], bz = p[b + j * 3 + 2];
+  // feature-LOD size of the edge about to be emitted, set by the callers
+  // below; object size is constant for the whole geometry
+  const SM = g.userData.sizes;
+  const oSz = SM ? SM.obj : [255, 255, 255];
+  let rSz = oSz;
+  function push(i, j) {
+    let ax = p[i * 3], ay = p[i * 3 + 1], az = p[i * 3 + 2];
+    let bx = p[j * 3], by = p[j * 3 + 1], bz = p[j * 3 + 2];
     const dx = bx - ax, dy = by - ay, dz = bz - az;
     const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
     if (len < 1e-6) return;
@@ -818,12 +1148,40 @@ function extractEdges(g, perQuad, store) {
       store.pos.push(ax + (bx - ax) * t0, ay + (by - ay) * t0, az + (bz - az) * t0,
                      ax + (bx - ax) * t1, ay + (by - ay) * t1, az + (bz - az) * t1);
       store.seed.push(seed, seed);
+      store.szR.push(rSz[0], rSz[1], rSz[2], rSz[0], rSz[1], rSz[2]);
+      store.szO.push(oSz[0], oSz[1], oSz[2], oSz[0], oSz[1], oSz[2]);
     }
   }
+  // region grouping already worked out every face's boundary edges and
+  // which of them are interior to a region — an interior edge carries
+  // no color step in raster mode, so it draws no line here either.
+  // Boundary edges still appear once per adjoining face, keeping the
+  // double-stroke.
+  const R = g.userData.regions;
+  if (R) {
+    const em = g.userData.edgeSize;
+    for (let f = 0; f < R.nFace; f++) {
+      const bnd = R.faceEdges[f], own = R.region[f] * 3;
+      // border edges have no second face, so they fall back to their own region
+      const fallback = SM ? [SM.enc[own], SM.enc[own + 1], SM.enc[own + 2]] : oSz;
+      for (let e = 0; e < bnd.length; e += 3) {
+        if (R.silent.has(bnd[e])) continue;
+        rSz = (em && em.get(bnd[e])) || fallback;
+        push(bnd[e + 1], bnd[e + 2]);
+      }
+    }
+    return;
+  }
+
+  // no grouping: each face is its own unit, so an edge takes the size of
+  // the face that emitted it
+  const faceSz = f => (SM ? [SM.enc[f * 3], SM.enc[f * 3 + 1], SM.enc[f * 3 + 2]] : oSz);
+  const fStride = perQuad ? 6 : 3;   // sizeMetrics indexed faces by this stride
   const EA = [[0, 1], [1, 2], [2, 0]], EB = [[3, 4], [4, 5], [5, 3]];
   let v = 0;
   if (perQuad) {
     for (; v + 6 <= n; v += 6) {
+      rSz = faceSz(v / 6);
       const b = v * 3, mA = [], mB = [];
       for (let i = 0; i < 3; i++) for (let j = 3; j < 6; j++) {
         const dx = p[b + i * 3] - p[b + j * 3], dy = p[b + i * 3 + 1] - p[b + j * 3 + 1],
@@ -831,28 +1189,35 @@ function extractEdges(g, perQuad, store) {
         if (dx * dx + dy * dy + dz * dz < 1e-10) { mA.push(i); mB.push(j); }
       }
       if (mA.length === 2) {   // proper pair: drop the shared diagonal
-        for (const [a2, b2] of EA) if (!(mA.includes(a2) && mA.includes(b2))) push(a2, b2, b);
-        for (const [a2, b2] of EB) if (!(mB.includes(a2) && mB.includes(b2))) push(a2, b2, b);
+        for (const [a2, b2] of EA) if (!(mA.includes(a2) && mA.includes(b2))) push(v + a2, v + b2);
+        for (const [a2, b2] of EB) if (!(mB.includes(a2) && mB.includes(b2))) push(v + a2, v + b2);
       } else {
-        for (const [a2, b2] of EA) push(a2, b2, b);
-        for (const [a2, b2] of EB) push(a2, b2, b);
+        for (const [a2, b2] of EA) push(v + a2, v + b2);
+        for (const [a2, b2] of EB) push(v + a2, v + b2);
       }
     }
   }
-  for (; v + 3 <= n; v += 3) { const b = v * 3; push(0, 1, b); push(1, 2, b); push(2, 0, b); }
+  for (; v + 3 <= n; v += 3) {
+    rSz = faceSz(Math.floor(v / fStride));
+    push(v, v + 1); push(v + 1, v + 2); push(v + 2, v);
+  }
 }
 
 function mergeBag() {
   let total = 0;
   for (const g of bag) total += g.attributes.position.count;
   const pos = new Float32Array(total * 3), nor = new Float32Array(total * 3), col = new Float32Array(total * 3);
-  const store = { pos: [], seed: [], edges: 0, overshoot: P.overshoot };
-  let o = 0;
+  const szR = new Uint8Array(total * 3), szO = new Uint8Array(total * 3);
+  const store = { pos: [], seed: [], szR: [], szO: [], edges: 0, overshoot: P.overshoot };
+  let o = 0, regions = 0;
   for (const g of bag) {
     pos.set(g.attributes.position.array, o * 3);
     nor.set(g.attributes.normal.array, o * 3);
     col.set(g.attributes.color.array, o * 3);
+    szR.set(g.attributes.aSizeRegion.array, o * 3);
+    szO.set(g.attributes.aSizeObject.array, o * 3);
     o += g.attributes.position.count;
+    if (g.userData.regions) regions += g.userData.regions.count;
     extractEdges(g, P.perQuad && !g.userData.forceTri, store);
     g.dispose();
   }
@@ -861,11 +1226,16 @@ function mergeBag() {
   merged.setAttribute('position', new THREE.BufferAttribute(pos, 3));
   merged.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
   merged.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  merged.setAttribute('aSizeRegion', new THREE.BufferAttribute(szR, 3, true));
+  merged.setAttribute('aSizeObject', new THREE.BufferAttribute(szO, 3, true));
   triCount = total / 3;
   edgeCount = store.edges;
+  regionCount = regions;
   const lineGeom = new THREE.BufferGeometry();
   lineGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(store.pos), 3));
   lineGeom.setAttribute('aSeed', new THREE.BufferAttribute(new Float32Array(store.seed), 1));
+  lineGeom.setAttribute('aSizeRegion', new THREE.BufferAttribute(new Uint8Array(store.szR), 3, true));
+  lineGeom.setAttribute('aSizeObject', new THREE.BufferAttribute(new Uint8Array(store.szO), 3, true));
   return { merged, lineGeom };
 }
 
@@ -1002,35 +1372,45 @@ function cable(p1, p2, r = 0.07) {
 
 /* ---- the scene itself ---------------------------------------- */
 function buildScene() {
+  const buildT0 = performance.now();
   if (sceneRoot) { sceneRoot.geometry.dispose(); scene.remove(sceneRoot); }
   if (lineSegs) { lineSegs.geometry.dispose(); scene.remove(lineSegs); }
   rng = mulberry32(P.seed);
+  crng = mulberry32(P.seed ^ 0x9e3779b9);
   bag = [];
   const D = P.density;
   if (P.scene === 'garden') buildGarden();
   else if (P.scene === 'prims') buildPrims();
   else if (P.scene === 'model') buildModel();
-  else if (P.scene.startsWith('dir:')) buildDirScene(+P.scene.slice(4));
+  else if (P.scene.startsWith('dir:')) {
+    const [di, fi] = P.scene.slice(4).split(':');
+    buildDirScene(+di, fi === undefined ? -1 : +fi);
+  }
   else buildYard(D);
   finishScene();
+  lastBuildMs = performance.now() - buildT0;
 }
 
-/* ---- a scene per Models/ subdirectory: grid of every .obj in it ---- */
-function buildDirScene(i) {
+/* ---- a scene per Models/ subdirectory ------------------------------
+   "dir:i"   -> every .obj in that folder, laid out in a grid so they
+                can be compared side by side
+   "dir:i:k" -> just file k, centred and alone                        */
+function buildDirScene(i, only) {
   const sc = modelScenes[i];
   if (!sc) { buildYard(P.density); return; }
   put(null, new THREE.PlaneGeometry(160, 160, 16, 16), 0, -0.02, 0, -Math.PI / 2, 0, 0, 0.10);
-  const n = sc.files.length;
-  const cols = Math.ceil(Math.sqrt(n));
-  const rowsN = Math.ceil(n / cols), spacing = 24;
-  for (let k = 0; k < n; k++) {
-    const col = k % cols, row = Math.floor(k / cols);
-    const x = (col - (cols - 1) / 2) * spacing;
-    const z = (row - (rowsN - 1) / 2) * spacing;
+  const solo = only >= 0 && only < sc.files.length;
+  const list = solo ? [only] : sc.files.map((_, k) => k);
+  const cols = Math.ceil(Math.sqrt(list.length));
+  const rowsN = Math.ceil(list.length / cols), spacing = 24;
+  list.forEach((k, slot) => {
+    const col = slot % cols, row = Math.floor(slot / cols);
+    const x = solo ? 0 : (col - (cols - 1) / 2) * spacing;
+    const z = solo ? 0 : (row - (rowsN - 1) / 2) * spacing;
     try {
       put(null, parseOBJ(sc.files[k].text), x, 0, z, 0, 0.4 + k * 0.7, 0, 0.55);
     } catch (e) { console.error('failed to parse', sc.files[k].name, e); }
-  }
+  });
 }
 
 function buildYard(D) {
@@ -1178,32 +1558,106 @@ function buildPrims() {
    even counts to keep pairing aligned. */
 function buildModel() {
   put(null, new THREE.PlaneGeometry(120, 120, 12, 12), 0, -0.02, 0, -Math.PI / 2, 0, 0, 0.10);
+  // one file, one model. This used to place a second copy further off to
+  // show distance falloff, but that reads as a bug when you load your own
+  // .obj — and it parsed the file twice, which is real work on a big one.
   put(null, parseOBJ(currentObjText), 0, 0, 0, 0, 0.5, 0, 0.55);
-  put(null, parseOBJ(currentObjText), -20, 0, 16, 0, 2.4, 0, 0.55);   // a second, further off
 }
 
 function parseOBJ(text) {
-  const vs = [], pos = [];
+  const vs = [], pos = [], faceGroup = [];
   let quadFaces = 0, triFaces = 0;
+  // o / g / usemtl changes are hard region boundaries: two parts that
+  // merely touch — or two materials meeting on a flat panel — must
+  // never merge into one region no matter how well their normals agree
+  const gIds = new Map();
+  let part = '', mtl = '', gid = 0;
+  const regroup = () => {
+    const k = part + '\u0000' + mtl;
+    if (!gIds.has(k)) gIds.set(k, gIds.size);
+    gid = gIds.get(k);
+  };
+  regroup();
   const addTri = (a, b, c) => {
     if (!vs[a] || !vs[b] || !vs[c]) return;
     pos.push(vs[a][0], vs[a][1], vs[a][2], vs[b][0], vs[b][1], vs[b][2], vs[c][0], vs[c][1], vs[c][2]);
+    faceGroup.push(gid);
   };
+  // faces are collected first so buried ones can be culled before emitting
+  const faceList = [];
   for (const raw of text.split('\n')) {
     const t = raw.trim().split(/\s+/);
     if (t[0] === 'v') vs.push([+t[1], +t[2], +t[3]]);
+    else if (t[0] === 'o' || t[0] === 'g') { part = t.slice(1).join(' '); regroup(); }
+    else if (t[0] === 'usemtl') { mtl = t.slice(1).join(' '); regroup(); }
     else if (t[0] === 'f') {
-      const idx = t.slice(1).map(s => {
-        const i = parseInt(s.split('/')[0], 10);
-        return i < 0 ? vs.length + i : i - 1;
-      });
-      if (idx.length === 4) { quadFaces++; addTri(idx[0], idx[1], idx[2]); addTri(idx[0], idx[2], idx[3]); }
-      else {
-        if (idx.length === 3) triFaces++;
-        for (let i = 1; i < idx.length - 1; i++) addTri(idx[0], idx[i], idx[i + 1]);
+      faceList.push({
+        idx: t.slice(1).map(s => {
+          const i = parseInt(s.split('/')[0], 10);
+          return i < 0 ? vs.length + i : i - 1;
+        }), g: gid });
+    }
+  }
+
+  // ---- cull buried faces -----------------------------------------
+  // Assembled models are piles of interpenetrating primitives, and over
+  // half their faces can sit *inside* a neighbouring part. A solid
+  // renderer never shows those, but this one draws edges from every
+  // face, so they surface as scribble wherever they poke through.
+  // A part is treated as a solid box only when it really is one (<=12
+  // faces over <=8 corners), which is exactly the primitive-assembly
+  // case and keeps the test from swallowing concave or hollow parts.
+  let culled = 0;
+  if (P.cullBuried) {
+    const nG = gIds.size;
+    const bb = new Float64Array(nG * 6), nFace = new Int32Array(nG);
+    const verts = Array.from({ length: nG }, () => new Set());
+    for (let g = 0; g < nG; g++) {
+      bb[g*6] = bb[g*6+1] = bb[g*6+2] = Infinity;
+      bb[g*6+3] = bb[g*6+4] = bb[g*6+5] = -Infinity;
+    }
+    for (const f of faceList) {
+      nFace[f.g]++;
+      for (const i of f.idx) {
+        const v = vs[i]; if (!v) continue;
+        // by POSITION, not index: exporters split a box's 8 corners into
+        // 24 indices for UVs, which would hide its true corner count
+        verts[f.g].add(Math.round(v[0]*1e5) + '_' + Math.round(v[1]*1e5) + '_' + Math.round(v[2]*1e5));
+        for (let k = 0; k < 3; k++) {
+          if (v[k] < bb[f.g*6+k]) bb[f.g*6+k] = v[k];
+          if (v[k] > bb[f.g*6+3+k]) bb[f.g*6+3+k] = v[k];
+        }
+      }
+    }
+    const solid = [];
+    for (let g = 0; g < nG; g++) if (nFace[g] > 0 && nFace[g] <= 12 && verts[g].size <= 8) solid.push(g);
+    const eps = 1e-5;
+    for (const f of faceList) {
+      let cx0 = 0, cy0 = 0, cz0 = 0, n = 0;
+      for (const i of f.idx) { const v = vs[i]; if (!v) continue; cx0 += v[0]; cy0 += v[1]; cz0 += v[2]; n++; }
+      if (!n) continue;
+      cx0 /= n; cy0 /= n; cz0 /= n;
+      for (const g of solid) {
+        if (g === f.g) continue;
+        const b = g * 6;
+        if (cx0 > bb[b]+eps && cx0 < bb[b+3]-eps && cy0 > bb[b+1]+eps && cy0 < bb[b+4]-eps &&
+            cz0 > bb[b+2]+eps && cz0 < bb[b+5]-eps) { f.buried = true; culled++; break; }
       }
     }
   }
+
+  for (const f of faceList) {
+    if (f.buried) continue;
+    const idx = f.idx;
+    gid = f.g;                       // addTri tags each triangle with it
+    if (idx.length === 4) { quadFaces++; addTri(idx[0], idx[1], idx[2]); addTri(idx[0], idx[2], idx[3]); }
+    else {
+      if (idx.length === 3) triFaces++;
+      for (let i = 1; i < idx.length - 1; i++) addTri(idx[0], idx[i], idx[i + 1]);
+    }
+  }
+  if (culled) console.info(
+    `cull buried: dropped ${culled} of ${faceList.length} faces (${(100*culled/faceList.length).toFixed(0)}%) inside other parts`);
   // normalize: uniform-scale to a 16-unit footprint, sit on the ground, center x/z
   let mn = [1e9, 1e9, 1e9], mx = [-1e9, -1e9, -1e9];
   for (let i = 0; i < pos.length; i += 3) for (let k = 0; k < 3; k++) {
@@ -1233,11 +1687,14 @@ function parseOBJ(text) {
   geo.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
   // mostly-triangulated models opt out of quad pairing (see put())
   geo.userData.forceTri = quadFaces < triFaces;
+  geo.userData.faceGroup = Int32Array.from(faceGroup);
   return geo;
 }
 
 function finishScene() {
   const { merged, lineGeom } = mergeBag();
+  merged.computeBoundingSphere();
+  sceneSphere = merged.boundingSphere;   // drives the adaptive far plane
   sceneRoot = new THREE.Mesh(merged, idMaterial);
   sceneRoot.frustumCulled = false;
   scene.add(sceneRoot);
@@ -1314,6 +1771,7 @@ const post = new THREE.ShaderMaterial({
     hatchOn: { value: 1 }, hatchThreshold: { value: 0 }, crossThreshold: { value: 0 },
     hatchSpacing: { value: 0 }, hatchWidth: { value: 0 }, hatchAngle: { value: 0 },
     paperGrain: { value: 0 }, oneSided: { value: 0 }, coverage: { value: 0 },
+    minFeature: { value: 0 }, invFovScale: { value: 1 }, keepSil: { value: 0 },
   },
   vertexShader: /* glsl */`
     varying vec2 vUv;
@@ -1329,7 +1787,7 @@ const post = new THREE.ShaderMaterial({
     uniform float idThreshold, lineWidth, distanceFalloff,
                   wobbleAmp, wobbleFreq, hatchOn, hatchThreshold, crossThreshold,
                   hatchSpacing, hatchWidth, hatchAngle, paperGrain,
-                  oneSided, coverage;
+                  oneSided, coverage, minFeature, invFovScale, keepSil;
 
     // ---- helpers -------------------------------------------------
     float hash(vec2 p) {
@@ -1350,29 +1808,57 @@ const post = new THREE.ShaderMaterial({
     vec3 normalAt(vec2 uv) { return texture2D(tNormal, uv).xyz * 2.0 - 1.0; }
     float lum(vec3 c) { return c.r + c.g + c.b; }
 
-    // color difference toward one neighbor. In one-sided mode the
-    // line only draws on the NEARER surface (or, for coplanar
-    // seams, on the arbitrarily-but-consistently brighter face) —
-    // halving line width for free.
-    float dirDiff(vec3 c, vec2 su, float dC) {
-      vec3 cn = texture2D(tID, su).rgb;
-      float diff = distance(c, cn);
-      if (oneSided > 0.5 && diff > 0.0) {
+    // ---- feature LOD --------------------------------------------
+    // the ID buffer's alpha carries each shape's world size (log
+    // encoded). Divided by distance it gives the shape's apparent
+    // size as a FRACTION of screen height — not pixels, so the
+    // result is identical in the interactive 1x frame and the
+    // refined supersampled one.
+    float lodGain(float enc, float dist) {
+      if (minFeature <= 0.0) return 1.0;
+      float frac = exp2(enc * 15.0 - 7.0) * invFovScale / max(dist, 1e-4);
+      return smoothstep(minFeature, minFeature * 2.0, frac);
+    }
+
+    // ink contributed toward ONE neighbor. In one-sided mode the line
+    // only draws on the NEARER surface (or, for coplanar seams, on the
+    // arbitrarily-but-consistently brighter face) — halving line width
+    // for free. The LOD gain uses the SMALLER of the two shapes the
+    // edge separates, so a shrinking detail fades away completely
+    // rather than leaving an outline around nothing.
+    float dirInk(vec4 c, vec2 su, float dC, float gC) {
+      vec4 cn = texture2D(tID, su);
+      float diff = distance(c.rgb, cn.rgb);
+      if (diff <= 0.0) return 0.0;
+      float ink = smoothstep(idThreshold, idThreshold * 1.8, diff);
+      if (ink <= 0.0) return 0.0;
+      if (oneSided > 0.5 || minFeature > 0.0) {
         float dN = linDepth(su);
         float eps = 0.012 * dC + 0.02;
-        bool keep = (dN > dC + eps) || (abs(dN - dC) <= eps && lum(c) > lum(cn));
-        if (!keep) diff = 0.0;
+        if (oneSided > 0.5) {
+          bool keep = (dN > dC + eps) || (abs(dN - dC) <= eps && lum(c.rgb) > lum(cn.rgb));
+          if (!keep) return 0.0;
+        }
+        // an edge with a big depth step across it is a silhouette —
+        // optionally exempt, so distant objects keep an outline
+        bool sil = abs(dN - dC) > eps;
+        if (minFeature > 0.0 && !(keepSil > 0.5 && sil))
+          ink *= min(gC, lodGain(cn.a, dN));
       }
-      return diff;
+      return ink;
     }
-    // the whole face-ID detector, callable at sub-pixel offsets
+    // the whole face-ID detector, callable at sub-pixel offsets.
+    // smoothstep is monotonic, so thresholding per direction and then
+    // taking the max is identical to the other order — it just lets
+    // each direction carry its own LOD gain.
     float inkTest(vec2 uv, vec2 o, float dC) {
-      vec3 c = texture2D(tID, uv).rgb;
-      float d =        dirDiff(c, uv + vec2(o.x, 0.), dC);
-      d = max(d, dirDiff(c, uv - vec2(o.x, 0.), dC));
-      d = max(d, dirDiff(c, uv + vec2(0., o.y), dC));
-      d = max(d, dirDiff(c, uv - vec2(0., o.y), dC));
-      return smoothstep(idThreshold, idThreshold * 1.8, d);
+      vec4 c = texture2D(tID, uv);
+      float gC = lodGain(c.a, dC);
+      float d =        dirInk(c, uv + vec2(o.x, 0.), dC, gC);
+      d = max(d, dirInk(c, uv - vec2(o.x, 0.), dC, gC));
+      d = max(d, dirInk(c, uv + vec2(0., o.y), dC, gC));
+      d = max(d, dirInk(c, uv - vec2(0., o.y), dC, gC));
+      return d;
     }
 
     void main() {
@@ -1505,6 +1991,68 @@ blitScene.add(blitQuad);
    Minimal orbit controls (no examples/jsm dependency)
    ============================================================ */
 const orbit = { theta: 0.8, phi: 1.12, radius: 46, target: new THREE.Vector3(0, 5, 0) };
+// free-flight state. yaw 0 looks down -z, matching three's default camera;
+// pitch is positive looking up.
+const fly = { pos: new THREE.Vector3(), yaw: 0, pitch: 0 };
+const keys = new Set();
+const _fwd = new THREE.Vector3(), _rgt = new THREE.Vector3(), _at = new THREE.Vector3();
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+function flyForward(out) {
+  const cp = Math.cos(fly.pitch);
+  return out.set(-Math.sin(fly.yaw) * cp, Math.sin(fly.pitch), -Math.cos(fly.yaw) * cp);
+}
+// switching modes must not move the view: entering flight adopts the orbit
+// camera's exact position and heading; leaving it drops the orbit target
+// straight ahead at the current radius, which reproduces the same frame.
+function syncCameraMode(toFly) {
+  if (toFly) {
+    fly.pos.copy(camera.position);
+    _at.subVectors(orbit.target, camera.position).normalize();
+    fly.pitch = Math.asin(clamp(_at.y, -1, 1));
+    fly.yaw = Math.atan2(-_at.x, -_at.z);
+  } else {
+    orbit.target.copy(fly.pos).addScaledVector(flyForward(_fwd), orbit.radius);
+    _at.subVectors(fly.pos, orbit.target);
+    const r = _at.length() || 1;
+    orbit.phi = clamp(Math.acos(clamp(_at.y / r, -1, 1)), 0.08, Math.PI / 2 - 0.02);
+    orbit.theta = Math.atan2(_at.x, _at.z);
+  }
+}
+
+let flyBox = null, inFly = false;
+function refreshHint() {
+  const h = document.getElementById('hint');
+  if (h) h.textContent = P.flyMode
+    ? 'wasd = move · q/e = down/up · shift = fast · drag = look · wheel = dolly · f = orbit'
+    : 'drag = orbit · shift-drag = pan · wheel = zoom · drop .obj to load · f = fly';
+}
+function setFlyMode(on) {
+  on = !!on;
+  P.flyMode = on;
+  if (on === inFly) return;               // already there; don't re-sync the view
+  syncCameraMode(on);                     // read the OLD mode's camera first
+  inFly = on;
+  if (flyBox) flyBox.checked = on;
+  keys.clear();
+  refreshHint();
+  markDirty();
+}
+
+const typingIn = t => t && /^(INPUT|SELECT|TEXTAREA)$/.test(t.tagName);
+addEventListener('keydown', e => {
+  if (typingIn(e.target) || e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k === 'f') { setFlyMode(!P.flyMode); return; }
+  if ('wasdqe'.includes(k) && k.length === 1) { keys.add(k); markDirty(); }
+  if (k === 'shift') keys.add('shift');
+});
+addEventListener('keyup', e => {
+  const k = e.key.toLowerCase();
+  keys.delete(k === 'shift' ? 'shift' : k);
+});
+addEventListener('blur', () => keys.clear());   // don't fly off when focus leaves
+
 let dragging = false, panning = false, lx = 0, ly = 0;
 renderer.domElement.addEventListener('pointerdown', e => {
   dragging = true; panning = e.shiftKey || e.button === 2; lx = e.clientX; ly = e.clientY;
@@ -1514,7 +2062,10 @@ addEventListener('pointerup', () => dragging = false);
 addEventListener('pointermove', e => {
   if (!dragging) return;
   const dx = e.clientX - lx, dy = e.clientY - ly; lx = e.clientX; ly = e.clientY;
-  if (panning) {
+  if (P.flyMode) {                       // drag to look; same sign as orbit
+    fly.yaw -= dx * 0.004;
+    fly.pitch = clamp(fly.pitch - dy * 0.004, -1.5, 1.5);
+  } else if (panning) {
     const s = orbit.radius * 0.0016;
     const right = new THREE.Vector3().setFromMatrixColumn(camera.matrix, 0);
     const up = new THREE.Vector3().setFromMatrixColumn(camera.matrix, 1);
@@ -1527,19 +2078,76 @@ addEventListener('pointermove', e => {
 });
 renderer.domElement.addEventListener('wheel', e => {
   e.preventDefault();
-  orbit.radius = Math.max(6, Math.min(160, orbit.radius * (1 + Math.sign(e.deltaY) * 0.09)));
+  if (P.flyMode) {                       // dolly along the view, so the wheel
+    const step = flySpeedUnits() * 0.35; // still reads as "zoom"
+    fly.pos.addScaledVector(flyForward(_fwd), -Math.sign(e.deltaY) * step);
+  } else {
+    orbit.radius = Math.max(6, Math.min(160, orbit.radius * (1 + Math.sign(e.deltaY) * 0.09)));
+  }
   markDirty();
 }, { passive: false });
 renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
 
+// flight speed scales with the scene so it feels the same in a 16-unit model
+// and a 170-unit yard
+function flySpeedUnits() {
+  return (sceneSphere ? sceneSphere.radius : 100) * 0.28 * P.flySpeed;
+}
+let lastCamT = performance.now();
+
 function updateCamera() {
-  if (P.autoRotate) orbit.theta += 0.0022;
-  const sp = Math.sin(orbit.phi), r = orbit.radius;
-  camera.position.set(
-    orbit.target.x + r * sp * Math.sin(orbit.theta),
-    orbit.target.y + r * Math.cos(orbit.phi),
-    orbit.target.z + r * sp * Math.cos(orbit.theta));
-  camera.lookAt(orbit.target);
+  const nowT = performance.now();
+  const dt = Math.min(0.1, (nowT - lastCamT) / 1000);   // cap so a stall can't teleport
+  lastCamT = nowT;
+
+  if (P.flyMode) {
+    flyForward(_fwd);
+    _rgt.set(Math.cos(fly.yaw), 0, -Math.sin(fly.yaw));
+    const v = flySpeedUnits() * (keys.has('shift') ? 4 : 1) * dt;
+    if (keys.has('w')) fly.pos.addScaledVector(_fwd, v);
+    if (keys.has('s')) fly.pos.addScaledVector(_fwd, -v);
+    if (keys.has('d')) fly.pos.addScaledVector(_rgt, v);
+    if (keys.has('a')) fly.pos.addScaledVector(_rgt, -v);
+    if (keys.has('e')) fly.pos.y += v;
+    if (keys.has('q')) fly.pos.y -= v;
+    camera.position.copy(fly.pos);
+    camera.lookAt(_at.copy(fly.pos).add(_fwd));
+  } else {
+    if (P.autoRotate) orbit.theta += 0.0022;
+    const sp = Math.sin(orbit.phi), r = orbit.radius;
+    camera.position.set(
+      orbit.target.x + r * sp * Math.sin(orbit.theta),
+      orbit.target.y + r * Math.cos(orbit.phi),
+      orbit.target.z + r * sp * Math.cos(orbit.theta));
+    camera.lookAt(orbit.target);
+  }
+
+  // ---- adaptive depth range -------------------------------------
+  // Depth resolution goes as z²(far-near)/(2·far·near), so a near plane
+  // parked far closer than the camera can ever get is pure waste. The old
+  // fixed 0.1/300 resolved only ~1.3mm at the default orbit distance, and
+  // that waste is expensive here: two z-fighting faces carry *different*
+  // random ID colors, so every coin-flipped pixel becomes a color step the
+  // detector inks as shimmering noise.
+  const centre = sceneSphere ? sceneSphere.center : orbit.target;
+  const radius = sceneSphere ? sceneSphere.radius : 100;
+  // orbit can never get closer to its target than the radius, so that's a safe
+  // basis. Flight can be anywhere, so cap the near plane there — otherwise
+  // flying far from the scene centre would clip whatever you flew up to.
+  const camDist = P.flyMode ? camera.position.distanceTo(centre) : orbit.radius;
+  let near = Math.max(0.05, camDist * P.nearFactor);
+  if (P.flyMode) near = Math.min(near, 0.5);
+  // exactly the farthest point of the bounding sphere: tight but never clips
+  const far = Math.max(near + 1, camera.position.distanceTo(centre) + radius);
+  if (near !== camera.near || far !== camera.far) {
+    camera.near = near; camera.far = far;
+    camera.updateProjectionMatrix();
+  }
+  // linDepth() reconstructs world distance from these, so they have to
+  // follow the camera. They used to be set once at material creation,
+  // which was only safe while the planes never moved.
+  post.uniforms.cameraNear.value = near;
+  post.uniforms.cameraFar.value = far;
 }
 
 /* ============================================================
@@ -1564,6 +2172,20 @@ function checkbox(key, label, onChange) {
   inp.type = 'checkbox'; inp.checked = P[key];
   inp.addEventListener('change', () => { P[key] = inp.checked; markDirty(); if (onChange) onChange(); });
   row.appendChild(inp); panel.appendChild(row);
+  return inp;                              // so the F key can keep it in sync
+}
+function dropdown(key, label, options, onChange) {
+  const row = document.createElement('div'); row.className = 'row';
+  row.innerHTML = `<label>${label}</label>`;
+  const sel = document.createElement('select');
+  for (const o of options) {
+    const op = document.createElement('option');
+    op.value = o; op.textContent = o;
+    sel.appendChild(op);
+  }
+  sel.value = P[key];
+  sel.addEventListener('change', () => { P[key] = sel.value; markDirty(); if (onChange) onChange(); });
+  row.appendChild(sel); panel.appendChild(row);
 }
 function colorPick(key, label) {
   const row = document.createElement('div'); row.className = 'row';
@@ -1585,6 +2207,18 @@ function buttons(defs) {
 section('face-id edges');
 slider('idThreshold', 'threshold', 0.001, 0.3, 0.001);
 checkbox('perQuad', 'per-quad colors', () => buildScene());
+checkbox('regionGroup', 'region grouping', () => buildScene());
+slider('similarity', 'similarity', 0.1, 1, 0.005, () => buildScene());
+checkbox('showIDs', 'show face colors');
+// feature LOD — all variants are baked, so these switch with no rebuild
+section('feature lod');
+slider('minFeature', 'min feature %', 0, 3, 0.05);
+dropdown('lodMetric', 'size metric', LOD_METRICS);
+dropdown('lodUnit', 'size of', LOD_UNITS);
+checkbox('keepSilhouettes', 'keep outlines');
+section('depth precision');
+slider('nearFactor', 'near plane ×', 0.002, 0.1, 0.002);
+checkbox('cullBuried', 'cull buried faces', () => buildScene());
 section('thin lines & aa');
 checkbox('oneSided', 'one-sided lines');
 checkbox('coverageAA', 'coverage aa');
@@ -1612,12 +2246,12 @@ section('paper & ink');
 colorPick('inkColor', 'ink');
 colorPick('paperColor', 'paper');
 slider('paperGrain', 'grain', 0, 0.25, 0.005);
+section('camera');
+flyBox = checkbox('flyMode', 'fly camera (f)', () => setFlyMode(P.flyMode));
+slider('flySpeed', 'fly speed', 0.1, 5, 0.1);
+checkbox('autoRotate', 'auto-rotate (orbit)');
 section('scene');
 slider('density', 'greeble density', 0.3, 2.5, 0.05, () => buildScene());
-checkbox('autoRotate', 'auto-rotate');
-const stats = document.createElement('div');
-stats.className = 'row'; stats.style.color = '#8fa3bf';
-panel.appendChild(stats);
 buttons([
   ['regenerate', () => { P.seed = (Math.random() * 1e6) | 0; buildScene(); }],
   ['export png', () => {
@@ -1629,6 +2263,65 @@ buttons([
 ]);
 
 /* ============================================================
+   Budget meters — how full each resource is against the point
+   where it starts to hurt. The bar runs empty..HEAVY, and turns
+   amber past COMFORTABLE, red once HEAVY is passed. On a modern
+   GPU the ink pass is fullscreen and geometry rides in one draw
+   call, so frame time is rarely the binding constraint — rebuild
+   time is, because welding, region grouping and edge extraction
+   are all single-threaded JS.
+   ============================================================ */
+const SEGS = 18;
+const fmtN = v => v >= 1e6 ? (v / 1e6).toFixed(2) + 'M'
+               : v >= 1e3 ? (v / 1e3).toFixed(v >= 1e5 ? 0 : 1) + 'k' : String(Math.round(v));
+const BUDGETS = [
+  { label: 'frame',   comfortable: 8.3,  heavy: 16.7, fmt: v => v.toFixed(1) + 'ms' },
+  { label: 'tris',    comfortable: 5e5,  heavy: 1.5e6, fmt: fmtN },
+  { label: 'edges',   comfortable: 5e5,  heavy: 2e6,   fmt: fmtN },
+  { label: 'regions', comfortable: 1e5,  heavy: 3e5,   fmt: fmtN },
+  { label: 'rebuild', comfortable: 2000, heavy: 5000,  fmt: v => (v / 1000).toFixed(2) + 's' },
+];
+const budgetList = document.getElementById('budgetList');
+for (const b of BUDGETS) {
+  const m = document.createElement('div'); m.className = 'm';
+  m.innerHTML = `<div class="cap"><span class="lab">${b.label}</span><span class="val">–</span></div>`;
+  const bar = document.createElement('div'); bar.className = 'bar';
+  b.segs = [];
+  for (let i = 0; i < SEGS; i++) {
+    const s = document.createElement('div'); s.className = 'seg';
+    bar.appendChild(s); b.segs.push(s);
+  }
+  m.appendChild(bar); budgetList.appendChild(m);
+  b.el = m; b.valEl = m.querySelector('.val');
+}
+function setMeter(b, value, note, stale) {
+  b.valEl.textContent = note || b.fmt(value);
+  b.el.classList.toggle('stale', !!stale);
+  const frac = value / b.heavy;
+  const green = b.comfortable / b.heavy;
+  for (let i = 0; i < SEGS; i++) {
+    const at = (i + 0.5) / SEGS;                 // this segment's position on the bar
+    if (at > frac) { b.segs[i].style.background = '#2b303a'; continue; }
+    b.segs[i].style.background = frac > 1 ? '#d9534f'
+      : at <= green ? '#5aa469' : '#e8a33d';
+  }
+}
+// frameCount/elapsed give the real achieved frame interval rather than CPU
+// submit time. The dirty-flag loop means it's only meaningful while something
+// is changing, so the last live reading is held and dimmed once idle.
+function updateBudget(frameCount, elapsed) {
+  const live = frameCount > 1;
+  if (live) lastFrameMs = elapsed / frameCount;
+  setMeter(BUDGETS[0], lastFrameMs,
+    lastFrameMs ? (live ? null : lastFrameMs.toFixed(1) + 'ms idle') : 'idle', !live);
+  setMeter(BUDGETS[1], triCount);
+  setMeter(BUDGETS[2], edgeCount);
+  setMeter(BUDGETS[3], regionCount, P.regionGroup ? null : 'off', !P.regionGroup);
+  setMeter(BUDGETS[4], lastBuildMs);
+  window.__tris = triCount;
+}
+
+/* ============================================================
    Main loop
    ============================================================ */
 const lightWorld = new THREE.Vector3(-0.55, 0.8, 0.35).normalize();
@@ -1636,10 +2329,20 @@ const _lv = new THREE.Vector3();
 let frames = 0, lastStats = performance.now();
 let refinePending = false, lastChange = 0, lastRender = 0;
 
+// world size -> fraction of screen height is size * invFov / distance
+function invFovScale() {
+  return 1.0 / (2.0 * Math.tan(THREE.MathUtils.degToRad(camera.fov) * 0.5));
+}
+function lodIndices() {
+  return [Math.max(0, LOD_METRICS.indexOf(P.lodMetric)),
+          Math.max(0, LOD_UNITS.indexOf(P.lodUnit))];
+}
+
 function renderFrame(useHi) {
   updateCamera();
+  const [mi, ui] = lodIndices();
 
-  if (P.vectorMode) {
+  if (P.vectorMode && !P.showIDs) {
     // ---- VECTOR PATH: paper fill occludes, real line geometry ----
     sceneRoot.material = fillMaterial;
     fillMaterial.color.set(P.paperColor);
@@ -1650,6 +2353,9 @@ function renderFrame(useHi) {
     lu.uLift.value = P.wobbleAmp * 0.09 + 0.06;  // scale lift with wobble
     lu.uFalloff.value = P.distanceFalloff;
     lu.uInkVary.value = P.inkVary;
+    lu.uMetric.value = mi; lu.uUnit.value = ui;
+    lu.uMinFeat.value = P.minFeature / 100;
+    lu.uInvFov.value = invFovScale();
     lineSegs.visible = true;
     renderer.setRenderTarget(null);
     renderer.setClearColor(new THREE.Color(P.paperColor), 1);
@@ -1658,6 +2364,8 @@ function renderFrame(useHi) {
     return;
   }
   sceneRoot.material = idMaterial;
+  idMaterial.uniforms.uMetric.value = mi;
+  idMaterial.uniforms.uUnit.value = ui;
   lineSegs.visible = false;
 
   const T = (useHi && targetsHi) ? targetsHi : targetsLo;
@@ -1668,6 +2376,18 @@ function renderFrame(useHi) {
   renderer.clear();
   scene.overrideMaterial = null;
   renderer.render(scene, camera);
+
+  // debug view: show the ID buffer itself instead of inking it. This is what
+  // the detector actually sees, so region grouping, similarity, buried-face
+  // culling and overlapping geometry all become directly visible — a flat
+  // block of colour is one region, and speckle is surfaces fighting.
+  if (P.showIDs) {
+    copyMat.uniforms.tDiffuse.value = T.rtID.texture;
+    blitQuad.material = copyMat;
+    renderer.setRenderTarget(null);
+    renderer.render(blitScene, postCamera);
+    return;
+  }
 
   // pass 2: view-space normals — only needed while hatching is on
   if (P.hatchOn) {
@@ -1694,6 +2414,9 @@ function renderFrame(useHi) {
   u.hatchOn.value = P.hatchOn ? 1 : 0;
   u.oneSided.value = P.oneSided ? 1 : 0;
   u.coverage.value = P.coverageAA ? 1 : 0;
+  u.minFeature.value = P.minFeature / 100;   // slider is a percentage
+  u.invFovScale.value = invFovScale();
+  u.keepSil.value = P.keepSilhouettes ? 1 : 0;
 
   // route through rtInk when the image needs a filtered resample
   const ssActive = T.scale !== 1;
@@ -1729,7 +2452,10 @@ function renderFrame(useHi) {
 
 function tick() {
   const now = performance.now();
-  if (P.autoRotate) dirty = true;
+  // flight has to keep rendering while a movement key is held, otherwise the
+  // dirty-flag loop would idle mid-move
+  if (P.autoRotate && !P.flyMode) dirty = true;
+  if (P.flyMode && keys.size) dirty = true;
   const prog = P.progressive && !P.vectorMode && targetsHi;
   let counted = false;
   if (dirty) {
@@ -1747,9 +2473,7 @@ function tick() {
   }
   if (counted) frames++;
   if (now - lastStats > 500) {
-    const fps = frames ? `${Math.round(frames * 1000 / (now - lastStats))} fps` : 'idle';
-    stats.textContent = `tris ${(triCount / 1000).toFixed(0)}k · edges ${(edgeCount / 1000).toFixed(0)}k · ${fps}`;
-    window.__tris = triCount;
+    updateBudget(frames, now - lastStats);
     frames = 0; lastStats = now;
   }
   requestAnimationFrame(tick);
@@ -1824,8 +2548,46 @@ async function scanModelsDir(dir) {
   return scenes;
 }
 
+/* The cache carries full .obj text, so the scene list is usable the
+   instant the page loads — before (or without) the folder permission
+   coming back. That text runs to megabytes, so two guards: skip the
+   write when a scan matches what's already stored (the normal case on
+   every reload), and cap the total so one huge Models folder can't
+   bloat the store. Files past the cap keep their scene but lose their
+   text; the disk scan right behind this fills them back in. */
+// Generous, because the signature check above means a write only happens
+// when the folder's contents actually change — not on every load. A single
+// detailed .obj can be 20 MB on its own.
+const CACHE_BUDGET = 96e6;   // characters of .obj text
+let cachedSig = '';
+
+function scenesSig(scenes) {
+  return scenes.map(s => s.name + '\u0000' +
+    s.files.map(f => f.name + ':' + f.text.length).join(',')).join('');
+}
+
+function cacheModelScenes(scenes) {
+  const sig = scenesSig(scenes);
+  if (sig === cachedSig) return;          // already stored, unchanged
+  cachedSig = sig;
+  let budget = CACHE_BUDGET, dropped = 0;
+  const slim = scenes.map(s => {
+    const files = [];
+    for (const f of s.files) {
+      if (f.text.length > budget) { dropped++; continue; }
+      budget -= f.text.length;
+      files.push(f);
+    }
+    return { name: s.name, files };
+  });
+  if (dropped) console.info(
+    `model cache: ${dropped} file(s) over the ${CACHE_BUDGET / 1e6} MB budget, not cached`);
+  idbSet('modelScenes', { sig, scenes: slim }).catch(() => {});
+}
+
 function setModelScenes(scenes, activate) {
   modelScenes = scenes;
+  cacheModelScenes(scenes);
   if (activate && scenes.length) P.scene = 'dir:0';
   refreshSceneMenu();
   buildScene();
@@ -1869,22 +2631,42 @@ function refreshSceneMenu() {
   add('lod garden', P.scene === 'garden', pick('garden'));
   add('primitives', P.scene === 'prims', pick('prims'));
   add('obj model', P.scene === 'model', pick('model'));
-  modelScenes.forEach((sc, i) =>
-    add(sc.name, P.scene === 'dir:' + i, pick('dir:' + i)));
+  // folder entry shows everything together; with more than one .obj in
+  // the folder, each file also gets its own entry so it can be viewed alone
+  modelScenes.forEach((sc, i) => {
+    const many = sc.files.length > 1;
+    add(sc.name + (many ? ` (${sc.files.length})` : ''),
+      P.scene === 'dir:' + i, pick('dir:' + i));
+    if (many) sc.files.forEach((f, k) =>
+      add('  ' + f.name.replace(/\.obj$/i, ''),
+        P.scene === `dir:${i}:${k}`, pick(`dir:${i}:${k}`)));
+  });
   const div = document.createElement('div'); div.className = 'div'; list.appendChild(div);
   add('models folder…', false, pickModelsFolder);
   if (pendingDirHandle) add('reload models ↻', false, reloadPendingModels);
   add('load obj…', false, () => objInput.click());
 }
 refreshSceneMenu();
+refreshHint();
 
-// auto-restore the Models folder from a previous session
+// auto-restore: the scene list (with cached model data) appears
+// immediately on load; the stored folder handle then refreshes it
+// from disk — silently if the browser kept the permission, else via
+// the "reload models" button.
 (async () => {
+  try {
+    const cached = await idbGet('modelScenes');
+    if (cached && cached.scenes && cached.scenes.length) {
+      modelScenes = cached.scenes;
+      cachedSig = cached.sig;   // an identical disk scan now writes nothing
+      refreshSceneMenu();
+    }
+  } catch (e) { /* no cache yet */ }
   try {
     const h = await idbGet('modelsDir');
     if (!h || !h.queryPermission) return;
     if (await h.queryPermission({ mode: 'read' }) === 'granted') {
-      setModelScenes(await scanModelsDir(h), false);
+      setModelScenes(await scanModelsDir(h), false);   // fresh from disk
     } else {
       pendingDirHandle = h;
       refreshSceneMenu();
@@ -1894,6 +2676,12 @@ refreshSceneMenu();
 
 // dev hooks (used by headless tests; harmless in normal use)
 window.__P = P; window.__makeTargets = makeTargets; window.__buildScene = buildScene;
+window.__stats = () => ({ tris: triCount, edges: edgeCount, regions: regionCount });
+window.__render = (hi = true) => renderFrame(hi);   // headless: rAF is frozen when hidden
+window.__orbit = orbit;                            // headless camera placement
+window.__updateBudget = updateBudget;
+window.__fly = fly; window.__keys = keys; window.__setFlyMode = setFlyMode;
+window.__camera = camera;
 window.__setModelScenes = s => setModelScenes(s, true);
 
 addEventListener('resize', () => {

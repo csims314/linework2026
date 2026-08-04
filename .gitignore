@@ -1,0 +1,15 @@
+# scratch / debris
+_to_delete/
+tmp_obj_*
+*.bundle
+
+# python (make_speeder.py)
+__pycache__/
+*.py[cod]
+
+# os / editor
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

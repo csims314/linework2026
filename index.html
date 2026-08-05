@@ -26,6 +26,13 @@
   #sceneMenu button.active { background:#e8a33d; border-color:#e8a33d; color:#14161a; }
   #sceneMenu .div { border-top:1px solid #333a45; margin:8px 0 6px; }
   #panel h2 { font-size:10px; margin:12px 0 4px; color:#8fa3bf; text-transform:uppercase; letter-spacing:.12em; border-bottom:1px solid #333a45; padding-bottom:3px;}
+  #panel details { margin-top:10px; border-top:1px solid #333a45; }
+  #panel summary { cursor:pointer; list-style:none; user-select:none; padding:7px 0 2px;
+    font-size:10px; color:#8fa3bf; text-transform:uppercase; letter-spacing:.12em; }
+  #panel summary::-webkit-details-marker { display:none; }
+  #panel summary::before { content:'\25B8'; display:inline-block; width:12px; color:#e8a33d; }
+  #panel details[open] summary::before { content:'\25BE'; }
+  #panel details[open] > h2:first-of-type { margin-top:6px; }
   .row { display:flex; align-items:center; gap:6px; margin:3px 0; }
   .row label { flex:0 0 108px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .row input[type=range] { flex:1; accent-color:#e8a33d; min-width:0; }
@@ -39,6 +46,7 @@
   #hint { position:fixed; left:12px; bottom:10px; color:#00000066; font-size:11px; pointer-events:none; }
   #budget {
     position:fixed; left:10px; bottom:32px; width:186px;
+    max-height:calc(100% - 52px); overflow-y:auto;
     background:rgba(20,22,26,.92); color:#cfd3da; border-radius:8px;
     padding:10px 12px 12px; font-size:11px; user-select:none; backdrop-filter:blur(4px);
     font-family: ui-monospace, 'Cascadia Code', Menlo, Consolas, monospace;
@@ -52,6 +60,10 @@
   #budget .bar { display:flex; gap:1px; height:7px; }
   #budget .seg { flex:1; background:#2b303a; border-radius:1px; }
   #budget .m.stale .bar { opacity:.3; }
+  #budget .sub { color:#6d7d92; font-size:9px; margin-top:2px; letter-spacing:.02em; }
+  #budget .gpu { margin-top:9px; padding-top:7px; border-top:1px solid #333a45;
+    color:#8fa3bf; font-size:10px; line-height:1.35; word-break:break-word; }
+  #budget .info { color:#6d7d92; font-size:10px; margin-top:7px; line-height:1.4; }
 </style>
 </head>
 <body>
@@ -734,6 +746,7 @@ function computeRegions(g, stride, similarity, triGroups) {
   // 1e-4 is deliberately tight. Loosening it does NOT join parts that merely
   // butt together — it welds unrelated vertices, which collapses faces and
   // breaks the edge topology, so *fewer* neighbours pair up and regions go up.
+  const tw0 = performance.now();
   const weld = new Map(), vid = new Int32Array(nVert);
   for (let i = 0; i < nVert; i++) {
     const b = i * 3;
@@ -743,6 +756,7 @@ function computeRegions(g, stride, similarity, triGroups) {
     if (id === undefined) { id = weld.size; weld.set(k, id); }
     vid[i] = id;
   }
+  const tr0 = performance.now(); tWeld += tr0 - tw0;
 
   // per face: area-weighted normal + its boundary edges. An edge used
   // twice *inside* one face is the quad's diagonal, not a boundary.
@@ -810,6 +824,7 @@ function computeRegions(g, stride, similarity, triGroups) {
     if (ra === rb) silent.add(pairKeys[i >> 1]);
     else { nbr[ra].push(rb); nbr[rb].push(ra); }
   }
+  tRegion += performance.now() - tr0;
   return { region, count: remap.size, nFace, faceEdges, silent, nbr, pairs, pairKeys };
 }
 
@@ -1089,10 +1104,14 @@ const lineMaterial = new THREE.ShaderMaterial({
    call), so tens of thousands of parts render like one object.
    ============================================================ */
 let sceneRoot = null, lineSegs = null, sceneSphere = null;
-let triCount = 0, edgeCount = 0, regionCount = 0;
+let triCount = 0, edgeCount = 0, regionCount = 0, lineVertCount = 0;
 // declared here, not with the budget meters: buildScene() runs at module
 // top-level well before that point and would hit the temporal dead zone
 let lastBuildMs = 0, lastFrameMs = 0;
+// where the rebuild actually goes — welding, region flood-fill, edge
+// extraction. Rebuild is the binding constraint, so the split is what
+// makes it actionable rather than just a number.
+let tWeld = 0, tRegion = 0, tEdges = 0;
 
 // ---- merge machinery -----------------------------------------
 let bag = [];
@@ -1218,7 +1237,9 @@ function mergeBag() {
     szO.set(g.attributes.aSizeObject.array, o * 3);
     o += g.attributes.position.count;
     if (g.userData.regions) regions += g.userData.regions.count;
+    const te0 = performance.now();
     extractEdges(g, P.perQuad && !g.userData.forceTri, store);
+    tEdges += performance.now() - te0;
     g.dispose();
   }
   bag = [];
@@ -1231,6 +1252,7 @@ function mergeBag() {
   triCount = total / 3;
   edgeCount = store.edges;
   regionCount = regions;
+  lineVertCount = store.pos.length / 3;
   const lineGeom = new THREE.BufferGeometry();
   lineGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(store.pos), 3));
   lineGeom.setAttribute('aSeed', new THREE.BufferAttribute(new Float32Array(store.seed), 1));
@@ -1373,6 +1395,7 @@ function cable(p1, p2, r = 0.07) {
 /* ---- the scene itself ---------------------------------------- */
 function buildScene() {
   const buildT0 = performance.now();
+  tWeld = tRegion = tEdges = 0;
   if (sceneRoot) { sceneRoot.geometry.dispose(); scene.remove(sceneRoot); }
   if (lineSegs) { lineSegs.geometry.dispose(); scene.remove(lineSegs); }
   rng = mulberry32(P.seed);
@@ -2154,7 +2177,10 @@ function updateCamera() {
    Control panel (hand-rolled, zero deps)
    ============================================================ */
 const panel = document.getElementById('panel');
-function section(title) { const h = document.createElement('h2'); h.textContent = title; panel.appendChild(h); }
+// controls append here; retargeted below so most of them land inside the
+// collapsible "advanced" block instead of the panel itself
+let uiTarget = panel;
+function section(title) { const h = document.createElement('h2'); h.textContent = title; uiTarget.appendChild(h); }
 function slider(key, label, min, max, step, onCommit) {
   const row = document.createElement('div'); row.className = 'row';
   const val = document.createElement('span'); val.className = 'val'; val.textContent = P[key];
@@ -2163,7 +2189,7 @@ function slider(key, label, min, max, step, onCommit) {
   Object.assign(inp, { type: 'range', min, max, step, value: P[key] });
   inp.addEventListener('input', () => { P[key] = parseFloat(inp.value); val.textContent = inp.value; markDirty(); });
   if (onCommit) inp.addEventListener('change', onCommit);  // fires on release, not every tick
-  row.appendChild(inp); row.appendChild(val); panel.appendChild(row);
+  row.appendChild(inp); row.appendChild(val); uiTarget.appendChild(row);
 }
 function checkbox(key, label, onChange) {
   const row = document.createElement('div'); row.className = 'row';
@@ -2171,7 +2197,7 @@ function checkbox(key, label, onChange) {
   const inp = document.createElement('input');
   inp.type = 'checkbox'; inp.checked = P[key];
   inp.addEventListener('change', () => { P[key] = inp.checked; markDirty(); if (onChange) onChange(); });
-  row.appendChild(inp); panel.appendChild(row);
+  row.appendChild(inp); uiTarget.appendChild(row);
   return inp;                              // so the F key can keep it in sync
 }
 function dropdown(key, label, options, onChange) {
@@ -2185,7 +2211,7 @@ function dropdown(key, label, options, onChange) {
   }
   sel.value = P[key];
   sel.addEventListener('change', () => { P[key] = sel.value; markDirty(); if (onChange) onChange(); });
-  row.appendChild(sel); panel.appendChild(row);
+  row.appendChild(sel); uiTarget.appendChild(row);
 }
 function colorPick(key, label) {
   const row = document.createElement('div'); row.className = 'row';
@@ -2193,7 +2219,7 @@ function colorPick(key, label) {
   const inp = document.createElement('input');
   inp.type = 'color'; inp.value = P[key];
   inp.addEventListener('input', () => { P[key] = inp.value; markDirty(); });
-  row.appendChild(inp); panel.appendChild(row);
+  row.appendChild(inp); uiTarget.appendChild(row);
 }
 function buttons(defs) {
   const row = document.createElement('div'); row.className = 'row';
@@ -2201,15 +2227,24 @@ function buttons(defs) {
     const b = document.createElement('button'); b.textContent = label;
     b.addEventListener('click', fn); row.appendChild(b);
   }
-  panel.appendChild(row);
+  uiTarget.appendChild(row);
 }
+
+// ---- always visible -------------------------------------------------
+checkbox('showIDs', 'show face colors');
+slider('superSample', 'supersample ×', 1, 2, 0.25, () => makeTargets());
+
+// ---- everything else, behind the expander ---------------------------
+const advanced = document.createElement('details');
+advanced.innerHTML = '<summary>advanced</summary>';
+panel.appendChild(advanced);
+uiTarget = advanced;
 
 section('face-id edges');
 slider('idThreshold', 'threshold', 0.001, 0.3, 0.001);
 checkbox('perQuad', 'per-quad colors', () => buildScene());
 checkbox('regionGroup', 'region grouping', () => buildScene());
 slider('similarity', 'similarity', 0.1, 1, 0.005, () => buildScene());
-checkbox('showIDs', 'show face colors');
 // feature LOD — all variants are baked, so these switch with no rebuild
 section('feature lod');
 slider('minFeature', 'min feature %', 0, 3, 0.05);
@@ -2222,7 +2257,6 @@ checkbox('cullBuried', 'cull buried faces', () => buildScene());
 section('thin lines & aa');
 checkbox('oneSided', 'one-sided lines');
 checkbox('coverageAA', 'coverage aa');
-slider('superSample', 'supersample ×', 1, 2, 0.25, () => makeTargets());
 checkbox('progressive', 'progressive ss');
 checkbox('msaa', 'msaa id buffer', () => makeTargets());
 checkbox('fxaa', 'fxaa');
@@ -2274,13 +2308,47 @@ buttons([
 const SEGS = 18;
 const fmtN = v => v >= 1e6 ? (v / 1e6).toFixed(2) + 'M'
                : v >= 1e3 ? (v / 1e3).toFixed(v >= 1e5 ? 0 : 1) + 'k' : String(Math.round(v));
+// Reads out as fps, but the BAR still tracks frame time, so it fills toward
+// the limit like every other meter here — a full red bar means trouble even
+// though a high fps number would not. The colour is what carries the meaning.
+const fmtFps = v => v > 0 ? String(Math.round(1000 / v)) : 'idle';
+const fmtMB = v => v >= 1e9 ? (v / 1e9).toFixed(2) + 'GB' : Math.round(v / 1e6) + 'MB';
 const BUDGETS = [
-  { label: 'frame',   comfortable: 8.3,  heavy: 16.7, fmt: v => v.toFixed(1) + 'ms' },
-  { label: 'tris',    comfortable: 5e5,  heavy: 1.5e6, fmt: fmtN },
-  { label: 'edges',   comfortable: 5e5,  heavy: 2e6,   fmt: fmtN },
-  { label: 'regions', comfortable: 1e5,  heavy: 3e5,   fmt: fmtN },
-  { label: 'rebuild', comfortable: 2000, heavy: 5000,  fmt: v => (v / 1000).toFixed(2) + 's' },
+  { label: 'fps',        comfortable: 8.3,   heavy: 16.7,   fmt: fmtFps },
+  { label: 'shader',     comfortable: 40,    heavy: 100,    fmt: v => v.toFixed(1) },
+  { label: 'tris',       comfortable: 5e5,   heavy: 1.5e6,  fmt: fmtN },
+  { label: 'edges',      comfortable: 5e5,   heavy: 2e6,    fmt: fmtN },
+  { label: 'line verts', comfortable: 2e6,   heavy: 6e6,    fmt: fmtN },
+  { label: 'regions',    comfortable: 1e5,   heavy: 3e5,    fmt: fmtN },
+  { label: 'gpu mem',    comfortable: 256e6, heavy: 1024e6, fmt: fmtMB },
+  { label: 'js heap',    comfortable: 512e6, heavy: 1536e6, fmt: fmtMB },
+  { label: 'rebuild',    comfortable: 2000,  heavy: 5000,   fmt: v => (v / 1000).toFixed(2) + 's' },
 ];
+
+// Megapixels actually shaded per ink pass, times the sub-tests each pixel
+// runs. This is the number that predicts frame time: the ink pass is
+// fullscreen, so supersample (which scales the target area) and coverage AA
+// (4 sub-tests) drive cost far harder than triangle count does.
+function shaderLoad() {
+  const T = targetsHi || targetsLo;
+  if (!T) return 0;
+  return (T.rtID.width * T.rtID.height / 1e6) * (P.coverageAA ? 4 : 1);
+}
+// Attribute bytes for the merged mesh and the line geometry, plus every
+// live render target. Targets scale with supersample squared, so they can
+// quietly outweigh the geometry at high settings.
+function gpuBytes() {
+  let b = triCount * 3 * 42 + lineVertCount * 22;   // see mergeBag attributes
+  const tgt = t => t ? t.rtID.width * t.rtID.height * (4 * (P.msaa ? 4 : 1) + 12) : 0;
+  b += tgt(targetsLo) + tgt(targetsHi);
+  if (rtScreen) b += rtScreen.width * rtScreen.height * 4;
+  return b;
+}
+// Geometry draws only — the fullscreen post passes aren't the interesting
+// number. One merged mesh, plus the normal pass or the vector line pass.
+function drawCalls() {
+  return P.vectorMode ? 2 : (P.hatchOn ? 2 : 1);
+}
 const budgetList = document.getElementById('budgetList');
 for (const b of BUDGETS) {
   const m = document.createElement('div'); m.className = 'm';
@@ -2293,7 +2361,36 @@ for (const b of BUDGETS) {
   }
   m.appendChild(bar); budgetList.appendChild(m);
   b.el = m; b.valEl = m.querySelector('.val');
+  if (b.label === 'rebuild') {                 // stage split lives under it
+    b.subEl = document.createElement('div');
+    b.subEl.className = 'sub';
+    m.appendChild(b.subEl);
+  }
 }
+const infoEl = document.createElement('div');
+infoEl.className = 'info';
+document.getElementById('budget').appendChild(infoEl);
+// Which adapter actually got picked. Worth showing because the renderer asks
+// for powerPreference:'high-performance', and on a dual-GPU laptop this is the
+// only way to confirm the request was honoured rather than silently ignored.
+(function showGPU() {
+  const el = document.createElement('div');
+  el.className = 'gpu';
+  let name = 'gpu unknown';
+  try {
+    const gl = renderer.getContext();
+    const dbg = gl.getExtension('WEBGL_debug_renderer_info');
+    const raw = (dbg && gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL)) || gl.getParameter(gl.RENDERER);
+    // ANGLE reports e.g. "ANGLE (NVIDIA, NVIDIA GeForce RTX 4090 Laptop GPU
+    // (0x00002757) Direct3D11 vs_5_0 ps_5_0, D3D11)" — keep just the device
+    const m = /^ANGLE \([^,]+,\s*(.+?)(?:\s*\(0x|\s+Direct3D|\s+vs_|,\s*D3D)/.exec(raw);
+    name = (m ? m[1] : raw).trim();
+  } catch (e) { /* masked or unavailable — leave the fallback */ }
+  el.textContent = name;
+  el.title = name;
+  document.getElementById('budget').appendChild(el);
+})();
+
 function setMeter(b, value, note, stale) {
   b.valEl.textContent = note || b.fmt(value);
   b.el.classList.toggle('stale', !!stale);
@@ -2313,11 +2410,24 @@ function updateBudget(frameCount, elapsed) {
   const live = frameCount > 1;
   if (live) lastFrameMs = elapsed / frameCount;
   setMeter(BUDGETS[0], lastFrameMs,
-    lastFrameMs ? (live ? null : lastFrameMs.toFixed(1) + 'ms idle') : 'idle', !live);
-  setMeter(BUDGETS[1], triCount);
-  setMeter(BUDGETS[2], edgeCount);
-  setMeter(BUDGETS[3], regionCount, P.regionGroup ? null : 'off', !P.regionGroup);
-  setMeter(BUDGETS[4], lastBuildMs);
+    live ? null : (lastFrameMs ? fmtFps(lastFrameMs) + ' idle' : 'idle'), !live);
+  setMeter(BUDGETS[1], shaderLoad());
+  setMeter(BUDGETS[2], triCount);
+  setMeter(BUDGETS[3], edgeCount);
+  setMeter(BUDGETS[4], lineVertCount, P.vectorMode ? null : 'unused', !P.vectorMode);
+  setMeter(BUDGETS[5], regionCount, P.regionGroup ? null : 'off', !P.regionGroup);
+  setMeter(BUDGETS[6], gpuBytes());
+  const heap = performance.memory ? performance.memory.usedJSHeapSize : 0;
+  setMeter(BUDGETS[7], heap, heap ? null : 'n/a', !heap);
+  setMeter(BUDGETS[8], lastBuildMs);
+  // "rest" is geometry construction, size metrics and the merge — included so
+  // the split accounts for the whole rebuild rather than a mystery remainder
+  const rest = Math.max(0, lastBuildMs - tWeld - tRegion - tEdges);
+  BUDGETS[8].subEl.textContent = `weld ${Math.round(tWeld)} · group ${Math.round(tRegion)}` +
+    ` · edge ${Math.round(tEdges)} · rest ${Math.round(rest)} ms`;
+  const cv = renderer.domElement;
+  infoEl.textContent =
+    `${drawCalls()} draw${drawCalls() > 1 ? 's' : ''} · ${(cv.width * cv.height / 1e6).toFixed(2)} MP canvas`;
   window.__tris = triCount;
 }
 

@@ -90,19 +90,29 @@ Four scenes to flip between: **yard** (the procedural greeble city), **garden** 
 
 ## Controls
 
-Everything is on sliders in the panel: detection threshold, per-quad coloring, region grouping and its similarity threshold, feature LOD (minimum feature size, size metric, size unit, outline exemption), near-plane depth precision, the five AA toggles, line width and distance falloff, wobble amplitude/frequency, hatching (thresholds, spacing, angle), ink/paper colors and grain, vector-mode overshoot and ink variation, camera mode and flight speed, and greeble density (rebuilds the scene). `export png` saves the current frame.
+The panel keeps only `show face colors` and `supersample ×` visible; everything else sits behind an **advanced** expander, collapsed by default, so the panel is ~120px tall until you need it.
+
+Under that: detection threshold, per-quad coloring, region grouping and its similarity threshold, feature LOD (minimum feature size, size metric, size unit, outline exemption), near-plane depth precision, the five AA toggles, line width and distance falloff, wobble amplitude/frequency, hatching (thresholds, spacing, angle), ink/paper colors and grain, vector-mode overshoot and ink variation, camera mode and flight speed, and greeble density (rebuilds the scene). `export png` saves the current frame.
 
 The **budget panel** (bottom left) meters each resource against the point where it starts to hurt, rather than just reporting raw counts. Each bar runs empty to *heavy*, staying green through the *comfortable* range, going amber past it and red once the limit is passed:
 
-| meter | comfortable | heavy |
-|---|---|---|
-| frame time | 8.3 ms (120 fps) | 16.7 ms (60 fps) |
-| triangles | 500k | 1.5M |
-| edges | 500k | 2M |
-| regions | 100k | 300k |
-| rebuild | 2 s | 5 s |
+| meter | comfortable | heavy | |
+|---|---|---|---|
+| fps | 120 | 60 | |
+| shader | 40 | 100 | megapixels shaded × sub-tests per pixel |
+| triangles | 500k | 1.5M | |
+| edges | 500k | 2M | |
+| line verts | 2M | 6M | vector mode only |
+| regions | 100k | 300k | |
+| gpu mem | 256 MB | 1 GB | attributes + every live render target |
+| js heap | 512 MB | 1.5 GB | Chrome only |
+| rebuild | 2 s | 5 s | split into weld / group / edge / rest |
 
-The geometry meters are deliberately generous. All geometry rides in one draw call and the ink pass is fullscreen, so its cost tracks pixels and AA settings rather than triangle count — measured, going from 756 to 55,000 triangles barely moved frame time. **Rebuild is usually the binding constraint**, because vertex welding, region grouping and edge extraction are single-threaded JavaScript at roughly 5–15 µs per triangle. Expect to sit through multi-second rebuilds long before frame rate suffers. Frame time reads live only while something is changing — the dirty-flag loop idles otherwise, so the last live figure is held and dimmed.
+**shader** is the one that explains frame time. The ink pass is fullscreen, so cost tracks pixels rather than triangles: supersampling scales the target area and coverage AA runs four sub-tests per pixel. Turning on 2× supersample takes it from 14.3 to 57.3 and drives gpu mem from 133 MB to 534 MB, since the render targets scale with the square of the supersample factor — which is what the 3.08× frame cost measured earlier actually is.
+
+A footer shows geometry draw calls (1 normally, 2 with hatching or in vector mode), canvas megapixels, and the GPU actually in use — worth having because the renderer requests `powerPreference: 'high-performance'`, and on a dual-GPU laptop that line is the only confirmation the request was honoured.
+
+The geometry meters are deliberately generous. All geometry rides in one draw call and the ink pass is fullscreen, so its cost tracks pixels and AA settings rather than triangle count — measured, going from 756 to 55,000 triangles barely moved frame time. **Rebuild is usually the binding constraint**, because vertex welding, region grouping and edge extraction are single-threaded JavaScript at roughly 5–15 µs per triangle. Expect to sit through multi-second rebuilds long before frame rate suffers. The fps meter reads live only while something is changing — the dirty-flag loop idles otherwise, so the last live figure is held and dimmed. Its bar tracks frame *time*, so it fills toward the limit like every other meter here: a full red bar means trouble even though a high fps number would not. The colour carries the meaning, not the fill.
 
 ## Tech
 

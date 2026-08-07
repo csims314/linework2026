@@ -114,6 +114,9 @@ const P = {
   // instead — flat cel step or smooth ramp, both reusing the shade
   // thresholds (cross adds a deeper core shadow) and the noise sliders
   shadeStyle: 'hard', shadowAmount: 0.22,
+  // ink along shadow boundaries (0 = off) and its width as a multiple
+  // of the regular line radius
+  shadowLine: 0, shadowLineWidth: 1,
   // colors
   inkColor: '#1d1a17', paperColor: '#f6f2e6', paperGrain: 0.05,
   // watercolor (raster mode only): per-kind fills baked at rebuild,
@@ -1994,6 +1997,7 @@ const post = new THREE.ShaderMaterial({
     hatchSpacing: { value: 0 }, hatchWidth: { value: 0 }, hatchAngle: { value: 0 },
     hatchNoise: { value: 0 }, hatchNoiseScale: { value: 1 }, hatchBreak: { value: 0 },
     shadeMode: { value: 0 }, shadowAmount: { value: 0 },
+    shadowLine: { value: 0 }, shadowLineWidth: { value: 1 },
     paperGrain: { value: 0 }, oneSided: { value: 0 }, coverage: { value: 0 },
     minFeature: { value: 0 }, invFovScale: { value: 1 }, keepSil: { value: 0 },
     // watercolor
@@ -2019,7 +2023,7 @@ const post = new THREE.ShaderMaterial({
     uniform float idThreshold, lineWidth, distanceFalloff,
                   wobbleAmp, wobbleFreq, hatchOn, hatchThreshold, crossThreshold,
                   hatchSpacing, hatchWidth, hatchAngle, hatchNoise, hatchNoiseScale,
-                  hatchBreak, shadeMode, shadowAmount,
+                  hatchBreak, shadeMode, shadowAmount, shadowLine, shadowLineWidth,
                   paperGrain, oneSided, coverage, minFeature, invFovScale, keepSil;
     uniform sampler2D tPaint;
     uniform vec3 skyColor;
@@ -2124,6 +2128,17 @@ const post = new THREE.ShaderMaterial({
       return d;
     }
 
+    // the shading test as a reusable mask, so shadow boundaries can be
+    // edge-detected exactly like the face-ID buffer: evaluate at neighbor
+    // taps, any disagreement is a line
+    float shadowMaskAt(vec2 p) {
+      vec3 n = normalAt(p);
+      float shade = clamp(dot(n, normalize(lightDir)), 0.0, 1.0);
+      vec3 w = worldAt(p);
+      float sn = (vnoise3(w * (0.35 / hatchNoiseScale)) - 0.5) * hatchNoise * 0.3;
+      return step(shade + sn, hatchThreshold);
+    }
+
     void main() {
       vec2 px = 1.0 / resolution;
 
@@ -2223,6 +2238,20 @@ const post = new THREE.ShaderMaterial({
         if (shade < hatchThreshold) ink = max(ink, step(h1, hatchWidth) * hFade * k1);
         if (shade < crossThreshold) ink = max(ink, step(h2, hatchWidth) * hFade * k2);
         }
+      }
+
+      // ---- SHADOW-BOUNDARY INK -----------------------------------
+      // the shadow mask run through the same neighbor-disagreement test
+      // the face-ID detector uses, so the terminator gets a drawn line.
+      // Works for hard and soft alike (the mask is the ramp's midline).
+      if (hatchOn > 0.5 && !sky && shadeMode > 0.5 && shadowLine > 0.0) {
+        float m0 = shadowMaskAt(uv);
+        vec2 so = o * shadowLineWidth;
+        float sl =         abs(shadowMaskAt(uv + vec2(so.x, 0.0)) - m0);
+        sl = max(sl, abs(shadowMaskAt(uv - vec2(so.x, 0.0)) - m0));
+        sl = max(sl, abs(shadowMaskAt(uv + vec2(0.0, so.y)) - m0));
+        sl = max(sl, abs(shadowMaskAt(uv - vec2(0.0, so.y)) - m0));
+        ink = max(ink, sl * shadowLine);
       }
 
       // falloff beyond 1: distance fade of ALL ink (edges + hatching)
@@ -2602,6 +2631,8 @@ section('shading');
 checkbox('hatchOn', 'enabled');
 dropdown('shadeStyle', 'style', ['hatch', 'hard', 'soft']);
 slider('shadowAmount', 'intensity', 0, 1, 0.01);
+slider('shadowLine', 'shadow lines', 0, 1, 0.01);
+slider('shadowLineWidth', 'shadow line w', 0.5, 3, 0.05);
 slider('hatchThreshold', 'shade start', 0, 1, 0.01);
 slider('crossThreshold', 'cross-hatch', 0, 1, 0.01);
 slider('hatchSpacing', 'spacing', 1, 60, 0.5);
@@ -2866,7 +2897,8 @@ function renderFrame(useHi) {
   for (const k of ['idThreshold','lineWidth','distanceFalloff',
     'wobbleAmp','wobbleFreq','hatchThreshold','crossThreshold',
     'hatchSpacing','hatchWidth','hatchAngle','hatchNoise','hatchNoiseScale',
-    'hatchBreak','shadowAmount','paperGrain','washAmount','washScale','poolAmount','inkTint','aerialFade']) u[k].value = P[k];
+    'hatchBreak','shadowAmount','shadowLine','shadowLineWidth',
+    'paperGrain','washAmount','washScale','poolAmount','inkTint','aerialFade']) u[k].value = P[k];
   u.shadeMode.value = P.shadeStyle === 'hard' ? 1 : (P.shadeStyle === 'soft' ? 2 : 0);
   // setRGB with raw bytes skips the linear conversion .set(hex) would do,
   // keeping the uniform in the same raw display space as the aPaint bytes

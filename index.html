@@ -1991,6 +1991,7 @@ const post = new THREE.ShaderMaterial({
     washAmount: { value: 0 }, poolAmount: { value: 0 },
     inkTint: { value: 0 }, aerialFade: { value: 0 },
     invViewProj: { value: new THREE.Matrix4() },
+    viewToWorldN: { value: new THREE.Matrix3() },
   },
   vertexShader: /* glsl */`
     varying vec2 vUv;
@@ -2011,6 +2012,7 @@ const post = new THREE.ShaderMaterial({
     uniform vec3 skyColor;
     uniform float colorOn, washAmount, poolAmount, inkTint, aerialFade;
     uniform mat4 invViewProj;
+    uniform mat3 viewToWorldN;
 
     // ---- helpers -------------------------------------------------
     float hash(vec2 p) {
@@ -2130,6 +2132,11 @@ const post = new THREE.ShaderMaterial({
       float w = max(lineWidth * atten, 0.5);
       vec2 o = px * w;
 
+      // world anchor shared by hatching and pigment: surface position
+      // from the depth buffer, and the world size of one pixel there
+      vec3 wp = worldAt(uv);
+      float wpx = dC / (invFovScale * resolution.y);
+
       // ---- FACE-ID EDGES — the whole detector --------------------
       // every face has a unique random color, so ANY face boundary,
       // silhouette, or object-vs-object overlap produces a color
@@ -2147,20 +2154,35 @@ const post = new THREE.ShaderMaterial({
       }
       if (sky) ink = 0.0;
 
-      // ---- HATCHING from the normal buffer -----------------------
+      // ---- HATCHING from the normal buffer, laid ON the surface --
+      // Strokes get a per-surface frame (tangents from the world
+      // normal) and world-unit coordinates, so they stick to panels
+      // while orbiting and curve around pipes instead of sliding over
+      // them. Faceted normals give each plane its own consistent frame,
+      // and the frame seams land on face boundaries — under ink lines.
       if (hatchOn > 0.5 && !sky) {
         vec3 n = normalAt(uv);
         float shade = clamp(dot(n, normalize(lightDir)), 0.0, 1.0);
+        vec3 wn = normalize(viewToWorldN * n);
+        vec3 an = abs(wn);
+        // triplanar pick: stripe coordinates come from the two world axes
+        // spanning the surface's dominant plane. Constant per face and
+        // stable on curved surfaces — a continuously rotating tangent
+        // frame scrambles strokes wherever curvature is tight.
+        vec2 hp = an.x > an.y && an.x > an.z ? wp.yz
+                : (an.y > an.z ? wp.xz : wp.xy);
+        float wSpace = hatchSpacing * 0.04;      // spacing slider -> world units
+        // gentle surface-anchored wobble — amplitude well under the noise
+        // feature size, or the stripes fold over into stipple
+        hp += (vec2(vnoise3(wp * 0.35), vnoise3(wp * 0.35 + 40.0)) - 0.5) * wSpace * 0.6;
         float a = radians(hatchAngle);
-        vec2 sp = vUv * resolution;
-        // wobble the hatch too, coarser
-        sp += (vec2(vnoise(sp * .02), vnoise(sp * .02 + 40.0)) - .5) * 6.0;
-        float h1 = fract((sp.x * cos(a) + sp.y * sin(a)) / hatchSpacing);
-        float h2 = fract((sp.x * cos(a + 1.5708) + sp.y * sin(a + 1.5708)) / hatchSpacing);
-        float lineA = step(h1, hatchWidth);
-        float lineB = step(h2, hatchWidth);
-        if (shade < hatchThreshold) ink = max(ink, lineA * 0.85);
-        if (shade < crossThreshold) ink = max(ink, lineB * 0.85);
+        float h1 = fract((hp.x * cos(a) + hp.y * sin(a)) / wSpace);
+        float h2 = fract((hp.x * cos(a + 1.5708) + hp.y * sin(a + 1.5708)) / wSpace);
+        // fade strokes out as their on-screen spacing compresses toward
+        // pixel size in the distance, instead of aliasing into moire
+        float hFade = 0.85 * smoothstep(2.5, 6.0, wSpace / max(wpx, 1e-6));
+        if (shade < hatchThreshold) ink = max(ink, step(h1, hatchWidth) * hFade);
+        if (shade < crossThreshold) ink = max(ink, step(h2, hatchWidth) * hFade);
       }
 
       // falloff beyond 1: distance fade of ALL ink (edges + hatching)
@@ -2185,8 +2207,6 @@ const post = new THREE.ShaderMaterial({
         // mid mottle, fine granulation — each fading out as its features
         // shrink toward pixel size in the distance. wpx = world size of
         // one pixel at this depth.
-        vec3 wp = worldAt(uv);
-        float wpx = dC / (invFovScale * resolution.y);
         float m = pigment(wp, 0.45, wpx)              * 0.55
                 + pigment(wp + 13.7, 1.7, wpx)        * 0.30
                 + pigment(wp + 41.3, 6.0, wpx)        * 0.15;
@@ -2804,6 +2824,7 @@ function renderFrame(useHi) {
   // world reconstruction for pigment noise (pass 1 already refreshed
   // camera.matrixWorldInverse via renderer.render)
   u.invViewProj.value.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).invert();
+  u.viewToWorldN.value.setFromMatrix4(camera.matrixWorld);   // view-space normals -> world
   u.hatchOn.value = P.hatchOn ? 1 : 0;
   u.oneSided.value = P.oneSided ? 1 : 0;
   u.coverage.value = P.coverageAA ? 1 : 0;

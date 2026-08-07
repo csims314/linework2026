@@ -104,6 +104,10 @@ const P = {
   // hatching
   hatchOn: false, hatchThreshold: 0.0, crossThreshold: 0.02,
   hatchSpacing: 10.0, hatchWidth: 0.05, hatchAngle: 45,
+  // stroke breakup: displacement noise amount (past ~1 strokes start
+  // folding into stipple — allowed, it reads as dry-brush) and the
+  // world-space feature size of that noise
+  hatchNoise: 0.6, hatchNoiseScale: 1,
   // colors
   inkColor: '#1d1a17', paperColor: '#f6f2e6', paperGrain: 0.05,
   // watercolor (raster mode only): per-kind fills baked at rebuild,
@@ -1982,6 +1986,7 @@ const post = new THREE.ShaderMaterial({
     wobbleAmp: { value: 0 }, wobbleFreq: { value: 0 },
     hatchOn: { value: 1 }, hatchThreshold: { value: 0 }, crossThreshold: { value: 0 },
     hatchSpacing: { value: 0 }, hatchWidth: { value: 0 }, hatchAngle: { value: 0 },
+    hatchNoise: { value: 0 }, hatchNoiseScale: { value: 1 },
     paperGrain: { value: 0 }, oneSided: { value: 0 }, coverage: { value: 0 },
     minFeature: { value: 0 }, invFovScale: { value: 1 }, keepSil: { value: 0 },
     // watercolor
@@ -2006,8 +2011,8 @@ const post = new THREE.ShaderMaterial({
     uniform vec3 lightDir, inkColor, paperColor;
     uniform float idThreshold, lineWidth, distanceFalloff,
                   wobbleAmp, wobbleFreq, hatchOn, hatchThreshold, crossThreshold,
-                  hatchSpacing, hatchWidth, hatchAngle, paperGrain,
-                  oneSided, coverage, minFeature, invFovScale, keepSil;
+                  hatchSpacing, hatchWidth, hatchAngle, hatchNoise, hatchNoiseScale,
+                  paperGrain, oneSided, coverage, minFeature, invFovScale, keepSil;
     uniform sampler2D tPaint;
     uniform vec3 skyColor;
     uniform float colorOn, washAmount, washScale, poolAmount, inkTint, aerialFade;
@@ -2172,9 +2177,11 @@ const post = new THREE.ShaderMaterial({
         vec2 hp = an.x > an.y && an.x > an.z ? wp.yz
                 : (an.y > an.z ? wp.xz : wp.xy);
         float wSpace = hatchSpacing * 0.04;      // spacing slider -> world units
-        // gentle surface-anchored wobble — amplitude well under the noise
-        // feature size, or the stripes fold over into stipple
-        hp += (vec2(vnoise3(wp * 0.35), vnoise3(wp * 0.35 + 40.0)) - 0.5) * wSpace * 0.6;
+        // surface-anchored breakup: hatchNoise is displacement amount
+        // (low = wiggle, high = strokes tear into dry-brush stipple),
+        // hatchNoiseScale the world feature size of the displacement
+        float hnf = 0.35 / hatchNoiseScale;
+        hp += (vec2(vnoise3(wp * hnf), vnoise3(wp * hnf + 40.0)) - 0.5) * wSpace * hatchNoise;
         float a = radians(hatchAngle);
         float h1 = fract((hp.x * cos(a) + hp.y * sin(a)) / wSpace);
         float h2 = fract((hp.x * cos(a + 1.5708) + hp.y * sin(a + 1.5708)) / wSpace);
@@ -2562,6 +2569,8 @@ slider('crossThreshold', 'cross-hatch', 0, 1, 0.01);
 slider('hatchSpacing', 'spacing px', 3, 20, 0.5);
 slider('hatchWidth', 'stroke', 0.05, 0.9, 0.01);
 slider('hatchAngle', 'angle°', 0, 180, 1);
+slider('hatchNoise', 'noise', 0, 2, 0.02);
+slider('hatchNoiseScale', 'noise scale', 0.25, 4, 0.05);
 section('watercolor');
 colorPick('skyColor', 'sky');
 slider('regionJitter', 'region jitter', 0, 0.25, 0.005, () => buildScene());
@@ -2817,8 +2826,8 @@ function renderFrame(useHi) {
   u.paperColor.value.set(P.paperColor);
   for (const k of ['idThreshold','lineWidth','distanceFalloff',
     'wobbleAmp','wobbleFreq','hatchThreshold','crossThreshold',
-    'hatchSpacing','hatchWidth','hatchAngle','paperGrain',
-    'washAmount','washScale','poolAmount','inkTint','aerialFade']) u[k].value = P[k];
+    'hatchSpacing','hatchWidth','hatchAngle','hatchNoise','hatchNoiseScale',
+    'paperGrain','washAmount','washScale','poolAmount','inkTint','aerialFade']) u[k].value = P[k];
   // setRGB with raw bytes skips the linear conversion .set(hex) would do,
   // keeping the uniform in the same raw display space as the aPaint bytes
   const skyB = hex2u8(P.skyColor);

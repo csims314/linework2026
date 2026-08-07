@@ -110,6 +110,10 @@ const P = {
   // entirely where the surface noise dips below it: 0 = solid strokes,
   // 1 = almost fully eaten away.
   hatchNoise: 0.6, hatchNoiseScale: 1, hatchBreak: 0,
+  // shading style: 'hatch' draws strokes; 'hard'/'soft' darken the fill
+  // instead — flat cel step or smooth ramp, both reusing the shade
+  // thresholds (cross adds a deeper core shadow) and the noise sliders
+  shadeStyle: 'hatch', shadowAmount: 0.22,
   // colors
   inkColor: '#1d1a17', paperColor: '#f6f2e6', paperGrain: 0.05,
   // watercolor (raster mode only): per-kind fills baked at rebuild,
@@ -1989,6 +1993,7 @@ const post = new THREE.ShaderMaterial({
     hatchOn: { value: 1 }, hatchThreshold: { value: 0 }, crossThreshold: { value: 0 },
     hatchSpacing: { value: 0 }, hatchWidth: { value: 0 }, hatchAngle: { value: 0 },
     hatchNoise: { value: 0 }, hatchNoiseScale: { value: 1 }, hatchBreak: { value: 0 },
+    shadeMode: { value: 0 }, shadowAmount: { value: 0 },
     paperGrain: { value: 0 }, oneSided: { value: 0 }, coverage: { value: 0 },
     minFeature: { value: 0 }, invFovScale: { value: 1 }, keepSil: { value: 0 },
     // watercolor
@@ -2014,7 +2019,8 @@ const post = new THREE.ShaderMaterial({
     uniform float idThreshold, lineWidth, distanceFalloff,
                   wobbleAmp, wobbleFreq, hatchOn, hatchThreshold, crossThreshold,
                   hatchSpacing, hatchWidth, hatchAngle, hatchNoise, hatchNoiseScale,
-                  hatchBreak, paperGrain, oneSided, coverage, minFeature, invFovScale, keepSil;
+                  hatchBreak, shadeMode, shadowAmount,
+                  paperGrain, oneSided, coverage, minFeature, invFovScale, keepSil;
     uniform sampler2D tPaint;
     uniform vec3 skyColor;
     uniform float colorOn, washAmount, washScale, poolAmount, inkTint, aerialFade;
@@ -2167,9 +2173,23 @@ const post = new THREE.ShaderMaterial({
       // while orbiting and curve around pipes instead of sliding over
       // them. Faceted normals give each plane its own consistent frame,
       // and the frame seams land on face boundaries — under ink lines.
+      float shadow = 0.0;   // flat-shadow modes darken the fill at compose
       if (hatchOn > 0.5 && !sky) {
         vec3 n = normalAt(uv);
         float shade = clamp(dot(n, normalize(lightDir)), 0.0, 1.0);
+        float hnf = 0.35 / hatchNoiseScale;
+        if (shadeMode > 0.5) {
+          // hard/soft shadows in place of strokes: a flat cel step (hard)
+          // or wide ramp (soft) below the shade threshold, boundary pushed
+          // around by the same surface-anchored noise the strokes use.
+          // The cross threshold doubles as a deeper core-shadow step.
+          float sn = (vnoise3(wp * hnf) - 0.5) * hatchNoise * 0.3;
+          float ew = shadeMode > 1.5 ? 0.30 : 0.02;
+          shadow = shadowAmount *
+                   (1.0 - smoothstep(hatchThreshold - ew, hatchThreshold + ew, shade + sn));
+          shadow += shadowAmount * 0.6 *
+                   (1.0 - smoothstep(crossThreshold - ew, crossThreshold + ew, shade + sn));
+        } else {
         vec3 wn = normalize(viewToWorldN * n);
         vec3 an = abs(wn);
         // triplanar pick: stripe coordinates come from the two world axes
@@ -2182,7 +2202,6 @@ const post = new THREE.ShaderMaterial({
         // surface-anchored breakup: hatchNoise is displacement amount
         // (low = wiggle, high = strokes tear into dry-brush stipple),
         // hatchNoiseScale the world feature size of the displacement
-        float hnf = 0.35 / hatchNoiseScale;
         hp += (vec2(vnoise3(wp * hnf), vnoise3(wp * hnf + 40.0)) - 0.5) * wSpace * hatchNoise;
         float a = radians(hatchAngle);
         float h1 = fract((hp.x * cos(a) + hp.y * sin(a)) / wSpace);
@@ -2199,6 +2218,7 @@ const post = new THREE.ShaderMaterial({
         float k2 = smoothstep(hatchBreak - 0.15, hatchBreak, vnoise3(wp * hnf2 + 137.3));
         if (shade < hatchThreshold) ink = max(ink, step(h1, hatchWidth) * hFade * k1);
         if (shade < crossThreshold) ink = max(ink, step(h2, hatchWidth) * hFade * k2);
+        }
       }
 
       // falloff beyond 1: distance fade of ALL ink (edges + hatching)
@@ -2210,8 +2230,10 @@ const post = new THREE.ShaderMaterial({
       float grain = vnoise(vUv * resolution * 0.7);
       vec3 col;
       if (colorOn < 0.5) {
-        // legacy path — byte-identical to the pre-color renderer
+        // legacy path — byte-identical to the pre-color renderer when
+        // shading is off (shadow stays 0.0, so the multiply is exact)
         vec3 paper = paperColor * (1.0 - paperGrain * grain);
+        paper *= 1.0 - shadow;
         col = mix(paper, inkColor, clamp(ink, 0.0, 1.0));
       } else if (sky) {
         col = skyColor * (1.0 - paperGrain * 0.6 * grain);
@@ -2238,6 +2260,7 @@ const post = new THREE.ShaderMaterial({
           pool *= 0.55 + 0.45 * vnoise3(wp * 3.0 + 7.3);
           paint *= 1.0 - poolAmount * 0.30 * pool;
         }
+        paint *= 1.0 - shadow;                    // hard/soft shadow modes
         paint *= 1.0 - paperGrain * grain;        // grain hits fills like paper
         // ink as a dark version of the local hue (blue-violet biased)
         vec3 inkT = mix(inkColor, paint * vec3(0.32, 0.30, 0.48), inkTint);
@@ -2571,8 +2594,10 @@ slider('lineWidth', 'width px', 0.5, 4, 0.1);
 slider('distanceFalloff', 'dist falloff', 0, 3, 0.01);
 slider('wobbleAmp', 'wobble amp', 0, 4, 0.05);
 slider('wobbleFreq', 'wobble freq', 0.005, 0.2, 0.005);
-section('hatching');
+section('shading');
 checkbox('hatchOn', 'enabled');
+dropdown('shadeStyle', 'style', ['hatch', 'hard', 'soft']);
+slider('shadowAmount', 'shadow depth', 0, 0.6, 0.01);
 slider('hatchThreshold', 'shade start', 0, 1, 0.01);
 slider('crossThreshold', 'cross-hatch', 0, 1, 0.01);
 slider('hatchSpacing', 'spacing', 1, 60, 0.5);
@@ -2837,7 +2862,8 @@ function renderFrame(useHi) {
   for (const k of ['idThreshold','lineWidth','distanceFalloff',
     'wobbleAmp','wobbleFreq','hatchThreshold','crossThreshold',
     'hatchSpacing','hatchWidth','hatchAngle','hatchNoise','hatchNoiseScale',
-    'hatchBreak','paperGrain','washAmount','washScale','poolAmount','inkTint','aerialFade']) u[k].value = P[k];
+    'hatchBreak','shadowAmount','paperGrain','washAmount','washScale','poolAmount','inkTint','aerialFade']) u[k].value = P[k];
+  u.shadeMode.value = P.shadeStyle === 'hard' ? 1 : (P.shadeStyle === 'soft' ? 2 : 0);
   // setRGB with raw bytes skips the linear conversion .set(hex) would do,
   // keeping the uniform in the same raw display space as the aPaint bytes
   const skyB = hex2u8(P.skyColor);

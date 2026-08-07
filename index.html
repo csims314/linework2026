@@ -106,6 +106,11 @@ const P = {
   hatchSpacing: 10.0, hatchWidth: 0.05, hatchAngle: 45,
   // colors
   inkColor: '#1d1a17', paperColor: '#f6f2e6', paperGrain: 0.05,
+  // watercolor (raster mode only): per-kind fills baked at rebuild,
+  // wash/pooling/tint/fade applied in the compose step. colorOn off
+  // must render pixel-identical to the pre-color build.
+  colorOn: true, skyColor: '#d8efec',
+  washAmount: 0.12, poolAmount: 0.25, inkTint: 0.55, aerialFade: 0.35,
   // thin lines & AA
   oneSided: true, coverageAA: true, superSample: 1,
   msaa: true, fxaa: true, vectorMode: false, progressive: false,
@@ -134,6 +139,60 @@ let rng = mulberry32(P.seed);
 // rolled — per-quad, region grouping, similarity — also reshuffled the greeble
 // layout. Same seed, separate stream: color options now only change color.
 let crng = mulberry32(P.seed ^ 0x9e3779b9);
+// Paint jitter draws from a THIRD stream: it must consume neither rng
+// (greeble layout) nor crng (ID colors), or adding color would reshuffle
+// the scene and break the colorOn-off pixel-identity guarantee.
+let prng = mulberry32(P.seed ^ 0x5f356495);
+
+/* ============================================================
+   Watercolor palette — sampled from reference-watercolor.png
+   ============================================================ */
+// RAW hex bytes, deliberately bypassing THREE.Color: ColorManagement
+// would convert to linear-sRGB, but the post shader writes its output
+// unencoded, so raw display bytes are what come back out of the screen
+// unchanged. (Verified: routing through THREE.Color renders the sky
+// visibly darker/more saturated than the palette hex.)
+const hex2u8 = h => {
+  const n = parseInt(h.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+};
+const PAL = {
+  sky:       hex2u8('#D8EFEC'),  // pale ice — aerial fade target
+  sand:      hex2u8('#EDE6D4'),  // cream — ground, plates, dishes
+  pink:      hex2u8('#E0B4B0'),  // dusty pink — plinths, distance
+  rose:      hex2u8('#C98F94'),
+  mauve:     hex2u8('#C090A8'),  // tanks, soft forms
+  peri:      hex2u8('#8F9AC8'),  // periwinkle — machine bodies
+  slate:     hex2u8('#7890A8'),  // vents, grates, hardware
+  deepSlate: hex2u8('#7880B0'),  // rivets, bolts
+  cyan:      hex2u8('#6FBEDC'),  // secondary accent — portholes, glass
+  celadon:   hex2u8('#9CC4A4'),  // pipes
+  mint:      hex2u8('#BFD8B4'),  // AC boxes
+  red:       hex2u8('#C94F4A'),  // THE accent — one hero object per scene
+  shadow:    hex2u8('#4A4C6E'),  // cables, railings, ladders
+};
+// imported models: usemtl (or o/g) names -> palette, keyword match first
+const MTL_PAINT = [
+  [/glow|ember|neon|lamp/i,                      PAL.red],
+  [/phosphor|crt|screen|glass|window|canopy/i,   PAL.cyan],
+  [/wood|plank|floor|linen|plaster|paper|card/i, PAL.sand],
+  [/cloth|velour|sofa|jacket|fabric|curtain/i,   PAL.mauve],
+  [/duct|steel|iron|metal|fitting|pipe|vent/i,   PAL.slate],
+  [/cable|wire|rubber|tire|shadow/i,             PAL.shadow],
+  [/armor|plate|hull|panel/i,                    PAL.peri],
+  [/skin|face|hand|flesh/i,                      PAL.pink],
+  [/plant|leaf|moss|grass/i,                     PAL.celadon],
+  [/sky|city|backdrop/i,                         PAL.sky],
+];
+// hash fallback cycles the quiet hues only — red and cyan stay rare
+const MTL_FALLBACK = [PAL.pink, PAL.rose, PAL.mauve, PAL.peri,
+                      PAL.slate, PAL.celadon, PAL.mint, PAL.sand];
+function paintForName(name) {
+  for (const [re, c] of MTL_PAINT) if (re.test(name)) return c;
+  let h = 5381;
+  for (let i = 0; i < name.length; i++) h = (h * 33 ^ name.charCodeAt(i)) >>> 0;
+  return MTL_FALLBACK[h % MTL_FALLBACK.length];
+}
 
 // dirty-flag rendering: frames only render when something changed
 // (camera, sliders, rebuilds). Lets progressive supersampling slot
@@ -900,7 +959,7 @@ function sizeMetrics(geom, stride, regionOf, nUnit) {
   return { enc, obj: om.map(encodeSize) };
 }
 
-function faceIdColors(geometry, perQuad, variation = 1.0) {
+function faceIdColors(geometry, perQuad, variation = 1.0, paintCol = null) {
   const geom = geometry.index ? geometry.toNonIndexed() : geometry;
   const count = geom.attributes.position.count;
   const colors = new Float32Array(count * 3);
@@ -949,6 +1008,29 @@ function faceIdColors(geometry, perQuad, variation = 1.0) {
     geom.userData.regions = R;            // vector mode reuses this
   }
   geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+
+  // ---- watercolor paint -----------------------------------------
+  // Display color rides its own attribute: the ID colors above are
+  // detection-only. Filled per face; regions never span OBJ material
+  // groups, so per-face fill is per-region-consistent automatically.
+  const pnt = new Uint8Array(count * 3);
+  const gm = geometry.userData.groupMtl, fgp = geometry.userData.faceGroup;
+  let paintOf = null;
+  if (!paintCol && gm && fgp) {
+    const cache = [], tpf = step / 3;      // faceGroup entries are per-triangle
+    paintOf = f => cache[fgp[f * tpf]] ||
+      (cache[fgp[f * tpf]] = paintForName(gm[fgp[f * tpf]] || ''));
+  }
+  const flatPaint = paintCol || PAL.sand;
+  for (let f = 0, nf = Math.ceil(count / step); f < nf; f++) {
+    const c = paintOf ? paintOf(f) : flatPaint;
+    for (let j = 0; j < step; j++) {
+      const i = f * step + j;
+      if (i >= count) break;
+      pnt[i * 3] = c[0]; pnt[i * 3 + 1] = c[1]; pnt[i * 3 + 2] = c[2];
+    }
+  }
+  geom.setAttribute('aPaint', new THREE.BufferAttribute(pnt, 3, true));
 
   // ---- feature-LOD sizes ----------------------------------------
   // One size per unit, where a unit is a region (or a bare face when
@@ -1010,25 +1092,36 @@ const camera = new THREE.PerspectiveCamera(50, innerWidth / innerHeight, 0.1, 30
 // target is RGBA already, so this costs no extra pass or buffer).
 // DoubleSide so user-loaded OBJ models render regardless of winding.
 const idMaterial = new THREE.ShaderMaterial({
-  vertexColors: true,                     // makes three declare `attribute vec3 color`
+  vertexColors: true,                     // makes three declare `in vec3 color`
   side: THREE.DoubleSide,
+  glslVersion: THREE.GLSL3,               // MRT needs layout(location=N) outputs
   uniforms: { uMetric: { value: 0 }, uUnit: { value: 0 } },
   vertexShader: /* glsl */`
-    attribute vec3 aSizeRegion, aSizeObject;
+    in vec3 aSizeRegion;
+    in vec3 aSizeObject;
+    in vec3 aPaint;
     uniform float uMetric, uUnit;
-    varying vec3 vCol;
-    varying float vSize;
+    out vec3 vCol;
+    out vec3 vPaint;
+    out float vSize;
     void main() {
       vCol = color;
+      vPaint = aPaint;
       vec3 s = uUnit < 0.5 ? aSizeRegion : aSizeObject;
       vSize = uMetric < 0.5 ? s.x : (uMetric < 1.5 ? s.y : s.z);
       gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
     }`,
   fragmentShader: /* glsl */`
     precision highp float;
-    varying vec3 vCol;
-    varying float vSize;
-    void main() { gl_FragColor = vec4(vCol, vSize); }`,
+    in vec3 vCol;
+    in vec3 vPaint;
+    in float vSize;
+    layout(location = 0) out vec4 outID;     // ID color + encoded feature size
+    layout(location = 1) out vec4 outPaint;  // display color; alpha unused
+    void main() {
+      outID = vec4(vCol, vSize);
+      outPaint = vec4(vPaint, 1.0);
+    }`,
 });
 const normalMaterial = new THREE.MeshNormalMaterial({ side: THREE.DoubleSide });
 // vector mode: paper-colored fill occludes, real line geometry draws
@@ -1113,6 +1206,19 @@ let lastBuildMs = 0, lastFrameMs = 0;
 // makes it actionable rather than just a number.
 let tWeld = 0, tRegion = 0, tEdges = 0;
 
+// ---- watercolor kind -> color --------------------------------
+// Builders set this before their put() calls; nested helpers inherit
+// the caller's paint unless they set their own. null falls through to
+// material-name lookup (imports) or sand.
+let currentPaint = null;
+const setPaint = c => { currentPaint = c; };
+function withPaint(c, fn) {
+  const prev = currentPaint; currentPaint = c; fn(); currentPaint = prev;
+}
+// mix a palette byte triple toward white (k > 0) or black (k < 0)
+const tint = (c, k) => c.map(v => Math.max(0, Math.min(255,
+  Math.round(k > 0 ? v + (255 - v) * k : v * (1 + k)))));
+
 // ---- merge machinery -----------------------------------------
 let bag = [];
 const _one = new THREE.Vector3(1, 1, 1);
@@ -1125,7 +1231,7 @@ function frameOf(x, y, z, rx = 0, ry = 0, rz = 0) {
 function put(frame, geom, x, y, z, rx = 0, ry = 0, rz = 0, variation = 1) {
   // triangulated imports opt out of quad pairing (blind pairing on a
   // tri mesh merges unrelated triangles and eats their shared edges)
-  const g = faceIdColors(geom, P.perQuad && !geom.userData.forceTri, variation);
+  const g = faceIdColors(geom, P.perQuad && !geom.userData.forceTri, variation, currentPaint);
   g.applyMatrix4(frameOf(x, y, z, rx, ry, rz));
   if (frame) g.applyMatrix4(frame);
   bag.push(g);
@@ -1227,6 +1333,7 @@ function mergeBag() {
   for (const g of bag) total += g.attributes.position.count;
   const pos = new Float32Array(total * 3), nor = new Float32Array(total * 3), col = new Float32Array(total * 3);
   const szR = new Uint8Array(total * 3), szO = new Uint8Array(total * 3);
+  const pnt = new Uint8Array(total * 3);
   const store = { pos: [], seed: [], szR: [], szO: [], edges: 0, overshoot: P.overshoot };
   let o = 0, regions = 0;
   for (const g of bag) {
@@ -1235,6 +1342,7 @@ function mergeBag() {
     col.set(g.attributes.color.array, o * 3);
     szR.set(g.attributes.aSizeRegion.array, o * 3);
     szO.set(g.attributes.aSizeObject.array, o * 3);
+    pnt.set(g.attributes.aPaint.array, o * 3);
     o += g.attributes.position.count;
     if (g.userData.regions) regions += g.userData.regions.count;
     const te0 = performance.now();
@@ -1249,6 +1357,7 @@ function mergeBag() {
   merged.setAttribute('color', new THREE.BufferAttribute(col, 3));
   merged.setAttribute('aSizeRegion', new THREE.BufferAttribute(szR, 3, true));
   merged.setAttribute('aSizeObject', new THREE.BufferAttribute(szO, 3, true));
+  merged.setAttribute('aPaint', new THREE.BufferAttribute(pnt, 3, true));
   triCount = total / 3;
   edgeCount = store.edges;
   regionCount = regions;
@@ -1263,9 +1372,11 @@ function mergeBag() {
 
 // ---- small parts ---------------------------------------------
 function rivet(frame, x, y, z, r = 0.05) {
-  put(frame, new THREE.CylinderGeometry(r, r * 1.25, r * 1.2, 6, 1), x, y, z, Math.PI / 2, 0, 0, 0.7);
+  withPaint(PAL.deepSlate, () =>
+    put(frame, new THREE.CylinderGeometry(r, r * 1.25, r * 1.2, 6, 1), x, y, z, Math.PI / 2, 0, 0, 0.7));
 }
 function boltRing(frame, x, y, z, radius, n, boltR = 0.045, facePlane = false) {
+  const prevPaint = currentPaint; currentPaint = PAL.deepSlate;
   for (let i = 0; i < n; i++) {
     const a = (i / n) * Math.PI * 2;
     if (facePlane)   // ring in the x/y plane (wall-mounted, bolts point +z)
@@ -1275,6 +1386,7 @@ function boltRing(frame, x, y, z, radius, n, boltR = 0.045, facePlane = false) {
       put(frame, new THREE.CylinderGeometry(boltR, boltR, boltR * 2, 6, 1),
         x + Math.cos(a) * radius, y, z + Math.sin(a) * radius, 0, 0, 0, 0.7);
   }
+  currentPaint = prevPaint;
 }
 
 // recursive panel split of a rect [-w/2,w/2]x[-h/2,h/2]
@@ -1288,6 +1400,9 @@ function splitRect(u0, v0, u1, v1, depth, out) {
 // decorate one face of a block. faceFrame maps face-local
 // (u, v, out-of-face) -> block space. fw x fh is the face size.
 function panelFace(faceFrame, fw, fh, D) {
+  // plates read as a lighter tint of the block they sit on
+  const prevPaint = currentPaint;
+  const platePaint = tint(currentPaint || PAL.peri, 0.10);
   const cells = [];
   splitRect(-fw / 2 + .15, -fh / 2 + .15, fw / 2 - .15, fh / 2 - .15,
     2 + Math.round(D), cells);
@@ -1297,6 +1412,7 @@ function panelFace(faceFrame, fw, fh, D) {
     const m = 0.07;                             // inset margin
     const t = 0.04 + rng() * 0.09;              // plate thickness
     // the panel plate itself — low variation: fine lines
+    setPaint(platePaint);
     put(faceFrame, new THREE.BoxGeometry(cw - 2 * m, ch - 2 * m, t), uc, vc, t / 2, 0, 0, 0, 0.3);
     const deco = rng();
     if (deco < 0.22 * D && cw > .8 && ch > .8) {
@@ -1306,6 +1422,7 @@ function panelFace(faceFrame, fw, fh, D) {
       rivet(faceFrame, uc - ru, vc + rv, t); rivet(faceFrame, uc + ru, vc + rv, t);
     } else if (deco < 0.40 * D && cw > 1.0 && ch > .7) {
       // vent slats
+      setPaint(PAL.slate);
       const n = Math.min(11, Math.floor((ch - 2 * m) / 0.22));
       for (let i = 0; i < n; i++) {
         const vy = vc - (ch - 2 * m - .2) / 2 + i * ((ch - 2 * m - .2) / Math.max(1, n - 1));
@@ -1313,12 +1430,14 @@ function panelFace(faceFrame, fw, fh, D) {
       }
     } else if (deco < 0.52 * D && Math.min(cw, ch) > 1.0) {
       // porthole: disc + raised ring + bolts
+      setPaint(PAL.cyan);
       const pr = Math.min(cw, ch) * 0.28;
       put(faceFrame, new THREE.CylinderGeometry(pr, pr, 0.06, 16, 1), uc, vc, t + 0.03, Math.PI / 2, 0, 0, 0.4);
       put(faceFrame, new THREE.TorusGeometry(pr, 0.05, 6, 16), uc, vc, t + 0.06, 0, 0, 0, 0.6);
       boltRing(faceFrame, uc, vc, t + 0.05, pr + 0.14, 6, 0.045, true);
     } else if (deco < 0.66 * D && cw > .9) {
       // little box cluster (gauges / junctions)
+      setPaint(PAL.slate);
       const n = 1 + Math.floor(rng() * 3);
       for (let i = 0; i < n; i++) {
         const gw = .18 + rng() * .4, gh2 = .15 + rng() * .35, gt = .1 + rng() * .22;
@@ -1334,9 +1453,11 @@ function panelFace(faceFrame, fw, fh, D) {
         rivet(faceFrame, uc - (cw - 2 * m) / 2 + .2 + i * .4, v0 + m + .1, t, 0.04);
     }
   }
+  currentPaint = prevPaint;
 }
 
 function ladder(blockFrame, x, z, h, ry) {
+  const prevPaint = currentPaint; currentPaint = PAL.shadow;
   const f = frameOf(x, 0, z, 0, ry, 0);
   f.premultiply(blockFrame);
   for (const s of [-0.22, 0.22])
@@ -1344,9 +1465,11 @@ function ladder(blockFrame, x, z, h, ry) {
   const n = Math.floor(h / 0.38);
   for (let i = 1; i < n; i++)
     put(f, new THREE.CylinderGeometry(0.03, 0.03, 0.44, 5, 1), 0, i * 0.38, 0.1, 0, 0, Math.PI / 2, 0.6);
+  currentPaint = prevPaint;
 }
 
 function railing(blockFrame, w, d, topY) {
+  const prevPaint = currentPaint; currentPaint = PAL.shadow;
   const hw = w / 2 - .15, hd = d / 2 - .15, rh = 0.85;
   const edges = [
     [-hw, -hd, hw, -hd], [hw, -hd, hw, hd], [hw, hd, -hw, hd], [-hw, hd, -hw, -hd]];
@@ -1362,6 +1485,7 @@ function railing(blockFrame, w, d, topY) {
       put(blockFrame, new THREE.BoxGeometry(len, 0.045, 0.045),
         (x0 + x1) / 2, topY + ry2, (z0 + z1) / 2, 0, -ang, 0, 0.6);
   }
+  currentPaint = prevPaint;
 }
 
 function pipeRun(frame, x, z, baseY, pr, ph, D) {
@@ -1389,7 +1513,8 @@ function pipeRun(frame, x, z, baseY, pr, ph, D) {
 function cable(p1, p2, r = 0.07) {
   const mid = p1.clone().lerp(p2, 0.5); mid.y -= p1.distanceTo(p2) * (0.12 + rng() * 0.12);
   const curve = new THREE.CatmullRomCurve3([p1, mid, p2]);
-  put(null, new THREE.TubeGeometry(curve, 36, r, 6), 0, 0, 0, 0, 0, 0, 0.8);
+  withPaint(PAL.shadow, () =>
+    put(null, new THREE.TubeGeometry(curve, 36, r, 6), 0, 0, 0, 0, 0, 0, 0.8));
 }
 
 /* ---- the scene itself ---------------------------------------- */
@@ -1400,6 +1525,8 @@ function buildScene() {
   if (lineSegs) { lineSegs.geometry.dispose(); scene.remove(lineSegs); }
   rng = mulberry32(P.seed);
   crng = mulberry32(P.seed ^ 0x9e3779b9);
+  prng = mulberry32(P.seed ^ 0x5f356495);
+  currentPaint = null;                     // no paint state leaks across rebuilds
   bag = [];
   const D = P.density;
   if (P.scene === 'garden') buildGarden();
@@ -1421,7 +1548,9 @@ function buildScene() {
 function buildDirScene(i, only) {
   const sc = modelScenes[i];
   if (!sc) { buildYard(P.density); return; }
+  setPaint(PAL.sand);
   put(null, new THREE.PlaneGeometry(160, 160, 16, 16), 0, -0.02, 0, -Math.PI / 2, 0, 0, 0.10);
+  setPaint(null);   // imports color themselves by material name
   const solo = only >= 0 && only < sc.files.length;
   const list = solo ? [only] : sc.files.map((_, k) => k);
   const cols = Math.ceil(Math.sqrt(list.length));
@@ -1437,6 +1566,7 @@ function buildDirScene(i, only) {
 }
 
 function buildYard(D) {
+  setPaint(PAL.sand);
   // ground: base sheet + individual floor plates (real gaps = real lines)
   put(null, new THREE.PlaneGeometry(170, 170, 8, 8), 0, -0.02, 0, -Math.PI / 2, 0, 0, 0.06);
   const N = 8;
@@ -1444,21 +1574,28 @@ function buildYard(D) {
     put(null, new THREE.BoxGeometry(4.55, 0.12, 4.55), gx * 4.75, 0.06, gz * 4.75, 0, 0, 0, 0.14);
     const r = rng();
     if (r < 0.045 * D) {           // manhole
+      setPaint(PAL.slate);
       put(null, new THREE.CylinderGeometry(0.85, 0.85, 0.18, 14, 1), gx * 4.75, 0.14, gz * 4.75, 0, 0, 0, 0.35);
       boltRing(null, gx * 4.75, 0.24, gz * 4.75, 0.66, 6);
+      setPaint(PAL.sand);
     } else if (r < 0.085 * D) {    // floor grate
+      setPaint(PAL.slate);
       for (let i = 0; i < 8; i++)
         put(null, new THREE.BoxGeometry(3.4, 0.05, 0.16), gx * 4.75, 0.15, gz * 4.75 - 1.5 + i * 0.42, 0, 0, 0, 0.4);
+      setPaint(PAL.sand);
     }
   }
 
-  // machine blocks
+  // machine blocks — bodies cycle the quiet hues by cluster index (index-
+  // based so the balance survives any seed), prng jitters within the hue
   const blockTops = [];
   const clusters = 5;
+  const BLOCK_CYC = [PAL.peri, PAL.slate, PAL.deepSlate, PAL.mauve];
   for (let c = 0; c < clusters; c++) {
     const cx = (rng() - .5) * 46, cz = (rng() - .5) * 46;
     const bw = 4.5 + rng() * 6, bh = 3.5 + rng() * 9, bd = 4.5 + rng() * 6;
     const bf = frameOf(cx, 0, cz, 0, rng() < 0.25 ? rng() * 0.8 : 0, 0);
+    setPaint(tint(BLOCK_CYC[c % BLOCK_CYC.length], (prng() - 0.5) * 0.12));
     put(bf, new THREE.BoxGeometry(bw, bh, bd), 0, bh / 2, 0, 0, 0, 0, 0.9);
 
     // panelize the four sides + top
@@ -1472,10 +1609,12 @@ function buildYard(D) {
     for (const [ff, fw, fh] of faces) panelFace(ff, fw, fh, D);
 
     // rooftop machinery
+    setPaint(PAL.celadon);
     const pipes = 1 + Math.floor(rng() * 2 * D);
     for (let i = 0; i < pipes; i++)
       pipeRun(bf, (rng() - .5) * bw * .6, (rng() - .5) * bd * .6, bh, .22 + rng() * .42, 2 + rng() * 7, D);
     if (rng() < .55) {   // tank + saddle
+      setPaint(PAL.mauve);
       const tr = .9 + rng() * 1.4, tx = (rng() - .5) * bw * .5, tz = (rng() - .5) * bd * .5;
       put(bf, new THREE.SphereGeometry(tr, 16, 12), tx, bh + tr * .75, tz, 0, 0, 0, 0.45);
       put(bf, new THREE.CylinderGeometry(tr * .55, tr * .7, tr * .5, 10, 1), tx, bh + tr * .2, tz, 0, 0, 0, 0.55);
@@ -1485,6 +1624,7 @@ function buildYard(D) {
     if (rng() < .65) ladder(bf, (rng() - .5) * bw * .6, bd / 2, bh, 0);
 
     // AC-unit style boxes on the roof
+    setPaint(PAL.mint);
     const rn = Math.floor(rng() * 3 * D);
     for (let i = 0; i < rn; i++) {
       const gw = .6 + rng() * 1.6, gh2 = .4 + rng() * 1.2, gd2 = .6 + rng() * 1.6;
@@ -1498,13 +1638,15 @@ function buildYard(D) {
   }
 
   // ground-level pipe runs with support cradles
+  setPaint(PAL.celadon);
   for (let i = 0; i < Math.round(3 * D); i++) {
     const pr = .3 + rng() * .35, plen = 16 + rng() * 26;
     const px = (rng() - .5) * 40, pz = (rng() - .5) * 40, pa = rng() * Math.PI;
     const pf = frameOf(px, 0, pz, 0, pa, 0);
     put(pf, new THREE.CylinderGeometry(pr, pr, plen, 10, Math.floor(plen / 2.5)), 0, pr + .25, 0, 0, 0, Math.PI / 2, 0.5);
     for (let s = -plen / 2 + 1.5; s < plen / 2; s += 3.2) {
-      put(pf, new THREE.BoxGeometry(0.5, 0.28, pr * 2.4), s, 0.14, 0, 0, 0, 0, 0.55);
+      withPaint(PAL.slate, () =>
+        put(pf, new THREE.BoxGeometry(0.5, 0.28, pr * 2.4), s, 0.14, 0, 0, 0, 0, 0.55));
       put(pf, new THREE.TorusGeometry(pr * 1.12, .05, 6, 12), s, pr + .25, 0, 0, Math.PI / 2, 0, 0.6);
     }
     // inline flange pairs
@@ -1525,6 +1667,7 @@ function buildYard(D) {
   }
 
   // antenna masts
+  setPaint(PAL.cyan);
   for (let i = 0; i < Math.round(4 * D); i++) {
     const ah = 4 + rng() * 8, ax = (rng() - .5) * 58, az = (rng() - .5) * 58;
     const af = frameOf(ax, 0, az, 0, rng() * Math.PI, 0);
@@ -1537,17 +1680,23 @@ function buildYard(D) {
       put(af, new THREE.SphereGeometry(.09, 6, 5), -.8, by, 0, 0, 0, 0, 0.6);
     }
     if (rng() < .5)   // dish
-      put(af, new THREE.CylinderGeometry(.7, .55, .2, 12, 1), 0, ah - .5, .35, Math.PI / 2.6, 0, 0, 0.5);
+      withPaint(PAL.sand, () =>
+        put(af, new THREE.CylinderGeometry(.7, .55, .2, 12, 1), 0, ah - .5, .35, Math.PI / 2.6, 0, 0, 0.5));
     put(af, new THREE.ConeGeometry(.07, .8, 5, 1), 0, ah + .4, 0, 0, 0, 0, 0.6);
   }
 
-  // hero object — high-res torus knot, floating like a monument
-  put(null, new THREE.TorusKnotGeometry(3.1, 0.95, 220, 20), 0, 13.5, 0, 0, 0, 0, 0.5);
+  // hero object — high-res torus knot, floating like a monument.
+  // The scene's ONE red: the palette reads warm-with-an-accent only
+  // while red stays this rare.
+  withPaint(PAL.red, () =>
+    put(null, new THREE.TorusKnotGeometry(3.1, 0.95, 220, 20), 0, 13.5, 0, 0, 0, 0, 0.5));
 }
 
 /* ---- LOD garden: the same solids at three tessellation levels ---- */
 function buildGarden() {
+  setPaint(PAL.sand);
   put(null, new THREE.PlaneGeometry(140, 140, 14, 14), 0, -0.02, 0, -Math.PI / 2, 0, 0, 0.10);
+  const GARDEN_CYC = [PAL.peri, PAL.rose, PAL.celadon, PAL.mauve, PAL.slate];
   const rows = [
     [() => new THREE.SphereGeometry(3, 8, 6), () => new THREE.SphereGeometry(3, 16, 12), () => new THREE.SphereGeometry(3, 32, 24)],
     [() => new THREE.TorusKnotGeometry(2.1, 0.68, 48, 6), () => new THREE.TorusKnotGeometry(2.1, 0.68, 128, 12), () => new THREE.TorusKnotGeometry(2.1, 0.68, 256, 20)],
@@ -1558,19 +1707,27 @@ function buildGarden() {
   for (let r = 0; r < rows.length; r++) {
     for (let c2 = 0; c2 < 3; c2++) {
       const x = (c2 - 1) * 13, z = (r - 2) * 13;
-      put(null, new THREE.BoxGeometry(7, 1, 7), x, 0.5, z, 0, 0, 0, 0.35);   // plinth
-      put(null, rows[r][c2](), x, 4.6, z, 0, 0, 0, 0.6);
+      withPaint(PAL.pink, () =>
+        put(null, new THREE.BoxGeometry(7, 1, 7), x, 0.5, z, 0, 0, 0, 0.35));   // plinth
+      withPaint(GARDEN_CYC[r], () =>
+        put(null, rows[r][c2](), x, 4.6, z, 0, 0, 0, 0.6));
     }
   }
 }
 
 /* ---- primitives: a minimal debugging scene ---- */
 function buildPrims() {
+  setPaint(PAL.sand);
   put(null, new THREE.PlaneGeometry(120, 120, 12, 12), 0, -0.02, 0, -Math.PI / 2, 0, 0, 0.10);
+  setPaint(PAL.peri);
   put(null, new THREE.BoxGeometry(6, 6, 6), -14, 3, 0, 0, 0.5, 0, 0.8);
+  setPaint(PAL.rose);
   put(null, new THREE.SphereGeometry(3.6, 24, 18), 0, 3.6, 0, 0, 0, 0, 0.6);
+  setPaint(PAL.celadon);
   put(null, new THREE.CylinderGeometry(2.6, 2.6, 7, 16, 3), 14, 3.5, 0, 0, 0, 0, 0.6);
+  setPaint(PAL.mauve);
   put(null, new THREE.ConeGeometry(3, 7, 12, 3), 0, 3.5, -14, 0, 0, 0, 0.6);
+  setPaint(PAL.slate);
   put(null, new THREE.TorusGeometry(3, 1, 10, 24), 0, 4, 14, 0, 0, 0, 0.6);
 }
 
@@ -1580,10 +1737,12 @@ function buildPrims() {
    quads for per-quad coloring; lone triangle runs should come in
    even counts to keep pairing aligned. */
 function buildModel() {
+  setPaint(PAL.sand);
   put(null, new THREE.PlaneGeometry(120, 120, 12, 12), 0, -0.02, 0, -Math.PI / 2, 0, 0, 0.10);
   // one file, one model. This used to place a second copy further off to
   // show distance falloff, but that reads as a bug when you load your own
   // .obj — and it parsed the file twice, which is real work on a big one.
+  setPaint(null);   // imports color themselves by material name
   put(null, parseOBJ(currentObjText), 0, 0, 0, 0, 0.5, 0, 0.55);
 }
 
@@ -1594,10 +1753,12 @@ function parseOBJ(text) {
   // merely touch — or two materials meeting on a flat panel — must
   // never merge into one region no matter how well their normals agree
   const gIds = new Map();
+  const gMtl = [];   // gid -> semantic name for palette keywording; falls
+                     // back to the o/g part name when the file has no usemtl
   let part = '', mtl = '', gid = 0;
   const regroup = () => {
     const k = part + '\u0000' + mtl;
-    if (!gIds.has(k)) gIds.set(k, gIds.size);
+    if (!gIds.has(k)) { gIds.set(k, gIds.size); gMtl.push(mtl || part); }
     gid = gIds.get(k);
   };
   regroup();
@@ -1711,6 +1872,7 @@ function parseOBJ(text) {
   // mostly-triangulated models opt out of quad pairing (see put())
   geo.userData.forceTri = quadFaces < triFaces;
   geo.userData.faceGroup = Int32Array.from(faceGroup);
+  geo.userData.groupMtl = gMtl;
   return geo;
 }
 
@@ -1745,7 +1907,11 @@ function makeTargetSet(scale) {
   depthTexture.type = THREE.UnsignedIntType;
   return {
     scale,
-    rtID: new THREE.WebGLRenderTarget(w, h, {
+    // MRT: attachment 0 = face-ID + size, attachment 1 = paint (watercolor).
+    // WebGLMultipleRenderTargets is the r160 API (pinned by the importmap);
+    // WebGLRenderTarget({count: 2}) is the newer form and silently yields
+    // zero textures on r160 — do not switch until three is upgraded.
+    rtID: new THREE.WebGLMultipleRenderTargets(w, h, 2, {
       minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
       depthTexture, depthBuffer: true,
       samples: P.msaa ? 4 : 0,
@@ -1795,6 +1961,12 @@ const post = new THREE.ShaderMaterial({
     hatchSpacing: { value: 0 }, hatchWidth: { value: 0 }, hatchAngle: { value: 0 },
     paperGrain: { value: 0 }, oneSided: { value: 0 }, coverage: { value: 0 },
     minFeature: { value: 0 }, invFovScale: { value: 1 }, keepSil: { value: 0 },
+    // watercolor
+    tPaint:     { value: null },
+    skyColor:   { value: new THREE.Color(P.skyColor) },
+    colorOn:    { value: 1 },
+    washAmount: { value: 0 }, poolAmount: { value: 0 },
+    inkTint: { value: 0 }, aerialFade: { value: 0 },
   },
   vertexShader: /* glsl */`
     varying vec2 vUv;
@@ -1811,6 +1983,9 @@ const post = new THREE.ShaderMaterial({
                   wobbleAmp, wobbleFreq, hatchOn, hatchThreshold, crossThreshold,
                   hatchSpacing, hatchWidth, hatchAngle, paperGrain,
                   oneSided, coverage, minFeature, invFovScale, keepSil;
+    uniform sampler2D tPaint;
+    uniform vec3 skyColor;
+    uniform float colorOn, washAmount, poolAmount, inkTint, aerialFade;
 
     // ---- helpers -------------------------------------------------
     float hash(vec2 p) {
@@ -1944,8 +2119,39 @@ const post = new THREE.ShaderMaterial({
         ink *= clamp(mix(1.0, clamp(14.0 / dC, 0.0, 1.0), fExtra), 0.0, 1.0);
 
       // ---- compose on paper --------------------------------------
-      vec3 paper = paperColor * (1.0 - paperGrain * vnoise(vUv * resolution * 0.7));
-      vec3 col = mix(paper, inkColor, clamp(ink, 0.0, 1.0));
+      float grain = vnoise(vUv * resolution * 0.7);
+      vec3 col;
+      if (colorOn < 0.5) {
+        // legacy path — byte-identical to the pre-color renderer
+        vec3 paper = paperColor * (1.0 - paperGrain * grain);
+        col = mix(paper, inkColor, clamp(ink, 0.0, 1.0));
+      } else if (sky) {
+        col = skyColor * (1.0 - paperGrain * 0.6 * grain);
+      } else {
+        vec3 paint = texture2D(tPaint, uv).rgb;   // same wobbled uv as tID
+        // wash mottling: two octaves of zero-mean value noise, so the
+        // slider changes texture without shifting overall value
+        float m = vnoise(vUv * resolution * 0.006)        * 0.65
+                + vnoise(vUv * resolution * 0.017 + 31.7) * 0.35 - 0.5;
+        paint *= 1.0 - washAmount * m * 2.0;
+        // pigment pooling: the detector itself at ~3.5x line radius says
+        // "near an edge"; mid-frequency noise breaks the band up so it
+        // reads as settled pigment rather than a halo. Inherits the
+        // threshold, one-sided and LOD logic for free.
+        if (poolAmount > 0.0) {
+          float pool = inkTest(uv, o * 3.5, dC);
+          pool *= 0.55 + 0.45 * vnoise(vUv * resolution * 0.05 + 7.3);
+          paint *= 1.0 - poolAmount * 0.30 * pool;
+        }
+        paint *= 1.0 - paperGrain * grain;        // grain hits fills like paper
+        // ink as a dark version of the local hue (blue-violet biased)
+        vec3 inkT = mix(inkColor, paint * vec3(0.32, 0.30, 0.48), inkTint);
+        col = mix(paint, inkT, clamp(ink, 0.0, 1.0));
+        // aerial perspective: distance dissolves everything toward the
+        // sky. cameraFar hugs the scene sphere, so this is scene-relative.
+        col = mix(col, skyColor,
+                  aerialFade * smoothstep(cameraFar * 0.18, cameraFar * 0.9, dC));
+      }
       gl_FragColor = vec4(col, 1.0);
     }
   `,
@@ -2232,6 +2438,7 @@ function buttons(defs) {
 
 // ---- always visible -------------------------------------------------
 checkbox('showIDs', 'show face colors');
+checkbox('colorOn', 'watercolor');
 slider('superSample', 'supersample ×', 1, 2, 0.25, () => makeTargets());
 
 // ---- everything else, behind the expander ---------------------------
@@ -2276,6 +2483,12 @@ slider('crossThreshold', 'cross-hatch', 0, 1, 0.01);
 slider('hatchSpacing', 'spacing px', 3, 20, 0.5);
 slider('hatchWidth', 'stroke', 0.05, 0.9, 0.01);
 slider('hatchAngle', 'angle°', 0, 180, 1);
+section('watercolor');
+colorPick('skyColor', 'sky');
+slider('washAmount', 'wash mottle', 0, 0.5, 0.01);
+slider('poolAmount', 'edge pooling', 0, 1, 0.01);
+slider('inkTint', 'ink tint', 0, 1, 0.01);
+slider('aerialFade', 'aerial fade', 0, 1, 0.01);
 section('paper & ink');
 colorPick('inkColor', 'ink');
 colorPick('paperColor', 'paper');
@@ -2338,8 +2551,9 @@ function shaderLoad() {
 // live render target. Targets scale with supersample squared, so they can
 // quietly outweigh the geometry at high settings.
 function gpuBytes() {
-  let b = triCount * 3 * 42 + lineVertCount * 22;   // see mergeBag attributes
-  const tgt = t => t ? t.rtID.width * t.rtID.height * (4 * (P.msaa ? 4 : 1) + 12) : 0;
+  let b = triCount * 3 * 45 + lineVertCount * 22;   // see mergeBag attributes
+  // rtID has two color attachments (ID + paint) since the watercolor branch
+  const tgt = t => t ? t.rtID.width * t.rtID.height * (4 * 2 * (P.msaa ? 4 : 1) + 12) : 0;
   b += tgt(targetsLo) + tgt(targetsHi);
   if (rtScreen) b += rtScreen.width * rtScreen.height * 4;
   return b;
@@ -2492,7 +2706,8 @@ function renderFrame(useHi) {
   // culling and overlapping geometry all become directly visible — a flat
   // block of colour is one region, and speckle is surfaces fighting.
   if (P.showIDs) {
-    copyMat.uniforms.tDiffuse.value = T.rtID.texture;
+    // window.__showPaint = true in the console blits the paint attachment instead
+    copyMat.uniforms.tDiffuse.value = T.rtID.texture[window.__showPaint ? 1 : 0];
     blitQuad.material = copyMat;
     renderer.setRenderTarget(null);
     renderer.render(blitScene, postCamera);
@@ -2511,7 +2726,8 @@ function renderFrame(useHi) {
 
   // pass 3: ink
   const u = post.uniforms;
-  u.tID.value = T.rtID.texture;
+  u.tID.value = T.rtID.texture[0];
+  u.tPaint.value = T.rtID.texture[1];
   u.tNormal.value = T.rtNormal.texture;
   u.tDepth.value = T.rtID.depthTexture;
   u.resolution.value.set(T.rtID.width, T.rtID.height);
@@ -2520,7 +2736,13 @@ function renderFrame(useHi) {
   u.paperColor.value.set(P.paperColor);
   for (const k of ['idThreshold','lineWidth','distanceFalloff',
     'wobbleAmp','wobbleFreq','hatchThreshold','crossThreshold',
-    'hatchSpacing','hatchWidth','hatchAngle','paperGrain']) u[k].value = P[k];
+    'hatchSpacing','hatchWidth','hatchAngle','paperGrain',
+    'washAmount','poolAmount','inkTint','aerialFade']) u[k].value = P[k];
+  // setRGB with raw bytes skips the linear conversion .set(hex) would do,
+  // keeping the uniform in the same raw display space as the aPaint bytes
+  const skyB = hex2u8(P.skyColor);
+  u.skyColor.value.setRGB(skyB[0] / 255, skyB[1] / 255, skyB[2] / 255);
+  u.colorOn.value = P.colorOn ? 1 : 0;
   u.hatchOn.value = P.hatchOn ? 1 : 0;
   u.oneSided.value = P.oneSided ? 1 : 0;
   u.coverage.value = P.coverageAA ? 1 : 0;

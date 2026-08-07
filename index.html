@@ -111,6 +111,9 @@ const P = {
   // must render pixel-identical to the pre-color build.
   colorOn: true, skyColor: '#d8efec',
   washAmount: 0.09, poolAmount: 0.01, inkTint: 1, aerialFade: 0.81,
+  // per-region value drift baked into aPaint — adjacent panels read as
+  // separately mixed brush pools (rebuilds on change)
+  regionJitter: 0.07,
   // thin lines & AA
   oneSided: false, coverageAA: true, superSample: 1,
   msaa: true, fxaa: true, vectorMode: false, progressive: false,
@@ -192,6 +195,15 @@ function paintForName(name) {
   let h = 5381;
   for (let i = 0; i < name.length; i++) h = (h * 33 ^ name.charCodeAt(i)) >>> 0;
   return MTL_FALLBACK[h % MTL_FALLBACK.length];
+}
+// deterministic per-region wash drift in [-1, 1) — an integer hash, not
+// a stream, so it can never disturb the rng/crng call ordering
+function washJitter(i) {
+  let x = (i + Math.imul(P.seed, 131071) + 1) | 0;
+  x = Math.imul(x ^ (x >>> 16), 0x45d9f3b);
+  x = Math.imul(x ^ (x >>> 16), 0x45d9f3b);
+  x ^= x >>> 16;
+  return ((x >>> 0) / 4294967296) * 2 - 1;
 }
 
 // dirty-flag rendering: frames only render when something changed
@@ -1022,8 +1034,19 @@ function faceIdColors(geometry, perQuad, variation = 1.0, paintCol = null) {
       (cache[fgp[f * tpf]] = paintForName(gm[fgp[f * tpf]] || ''));
   }
   const flatPaint = paintCol || PAL.sand;
+  // per-region wash drift: every region reads as its own brush pool.
+  // Keyed on region id, so all faces of a region agree; a region never
+  // spans OBJ material groups, so the cache stays color-consistent.
+  const regJ = geom.userData.regions;
+  const jAmt = P.regionJitter, jCache = new Map();
   for (let f = 0, nf = Math.ceil(count / step); f < nf; f++) {
-    const c = paintOf ? paintOf(f) : flatPaint;
+    let c = paintOf ? paintOf(f) : flatPaint;
+    if (jAmt > 0) {
+      const u = regJ ? regJ.region[f] : f;
+      let jc = jCache.get(u);
+      if (!jc) { jc = tint(c, washJitter(u) * jAmt); jCache.set(u, jc); }
+      c = jc;
+    }
     for (let j = 0; j < step; j++) {
       const i = f * step + j;
       if (i >= count) break;
@@ -1967,6 +1990,7 @@ const post = new THREE.ShaderMaterial({
     colorOn:    { value: 1 },
     washAmount: { value: 0 }, poolAmount: { value: 0 },
     inkTint: { value: 0 }, aerialFade: { value: 0 },
+    invViewProj: { value: new THREE.Matrix4() },
   },
   vertexShader: /* glsl */`
     varying vec2 vUv;
@@ -1986,6 +2010,7 @@ const post = new THREE.ShaderMaterial({
     uniform sampler2D tPaint;
     uniform vec3 skyColor;
     uniform float colorOn, washAmount, poolAmount, inkTint, aerialFade;
+    uniform mat4 invViewProj;
 
     // ---- helpers -------------------------------------------------
     float hash(vec2 p) {
@@ -1996,6 +2021,31 @@ const post = new THREE.ShaderMaterial({
       vec2 u = f * f * (3.0 - 2.0 * f);
       return mix(mix(hash(i), hash(i + vec2(1,0)), u.x),
                  mix(hash(i + vec2(0,1)), hash(i + vec2(1,1)), u.x), u.y);
+    }
+    float hash3(vec3 p) {
+      return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453123);
+    }
+    float vnoise3(vec3 p) {             // 3D value noise, for world-anchored pigment
+      vec3 i = floor(p), f = fract(p);
+      vec3 u = f * f * (3.0 - 2.0 * f);
+      float a = mix(mix(hash3(i), hash3(i + vec3(1,0,0)), u.x),
+                    mix(hash3(i + vec3(0,1,0)), hash3(i + vec3(1,1,0)), u.x), u.y);
+      float b = mix(mix(hash3(i + vec3(0,0,1)), hash3(i + vec3(1,0,1)), u.x),
+                    mix(hash3(i + vec3(0,1,1)), hash3(i + vec3(1,1,1)), u.x), u.y);
+      return mix(a, b, u.z);
+    }
+    // world position from the depth buffer — pigment must live ON the
+    // surfaces, not on the picture plane, or it swims when the camera moves
+    vec3 worldAt(vec2 uv) {
+      float z = texture2D(tDepth, uv).x;
+      vec4 w = invViewProj * vec4(uv * 2.0 - 1.0, z * 2.0 - 1.0, 1.0);
+      return w.xyz / w.w;
+    }
+    // one octave of zero-mean pigment noise, faded out once its features
+    // shrink below a few pixels so distant surfaces don't shimmer
+    float pigment(vec3 wp, float freq, float wpx) {
+      return (vnoise3(wp * freq) - 0.5) *
+             smoothstep(3.0, 10.0, 1.0 / max(freq * wpx, 1e-6));
     }
     float linDepth(vec2 uv) {           // linear view-space distance
       float z = texture2D(tDepth, uv).x;
@@ -2129,18 +2179,25 @@ const post = new THREE.ShaderMaterial({
         col = skyColor * (1.0 - paperGrain * 0.6 * grain);
       } else {
         vec3 paint = texture2D(tPaint, uv).rgb;   // same wobbled uv as tID
-        // wash mottling: two octaves of zero-mean value noise, so the
-        // slider changes texture without shifting overall value
-        float m = vnoise(vUv * resolution * 0.006)        * 0.65
-                + vnoise(vUv * resolution * 0.017 + 31.7) * 0.35 - 0.5;
+        // wash mottling: pigment noise anchored in WORLD space (via the
+        // depth buffer), so it sits in the fills and stays put while the
+        // camera moves. Three zero-mean octaves — broad wash unevenness,
+        // mid mottle, fine granulation — each fading out as its features
+        // shrink toward pixel size in the distance. wpx = world size of
+        // one pixel at this depth.
+        vec3 wp = worldAt(uv);
+        float wpx = dC / (invFovScale * resolution.y);
+        float m = pigment(wp, 0.45, wpx)              * 0.55
+                + pigment(wp + 13.7, 1.7, wpx)        * 0.30
+                + pigment(wp + 41.3, 6.0, wpx)        * 0.15;
         paint *= 1.0 - washAmount * m * 2.0;
         // pigment pooling: the detector itself at ~3.5x line radius says
-        // "near an edge"; mid-frequency noise breaks the band up so it
+        // "near an edge"; world-anchored noise breaks the band up so it
         // reads as settled pigment rather than a halo. Inherits the
         // threshold, one-sided and LOD logic for free.
         if (poolAmount > 0.0) {
           float pool = inkTest(uv, o * 3.5, dC);
-          pool *= 0.55 + 0.45 * vnoise(vUv * resolution * 0.05 + 7.3);
+          pool *= 0.55 + 0.45 * vnoise3(wp * 3.0 + 7.3);
           paint *= 1.0 - poolAmount * 0.30 * pool;
         }
         paint *= 1.0 - paperGrain * grain;        // grain hits fills like paper
@@ -2485,6 +2542,7 @@ slider('hatchWidth', 'stroke', 0.05, 0.9, 0.01);
 slider('hatchAngle', 'angle°', 0, 180, 1);
 section('watercolor');
 colorPick('skyColor', 'sky');
+slider('regionJitter', 'region jitter', 0, 0.25, 0.005, () => buildScene());
 slider('washAmount', 'wash mottle', 0, 0.5, 0.01);
 slider('poolAmount', 'edge pooling', 0, 1, 0.01);
 slider('inkTint', 'ink tint', 0, 1, 0.01);
@@ -2743,6 +2801,9 @@ function renderFrame(useHi) {
   const skyB = hex2u8(P.skyColor);
   u.skyColor.value.setRGB(skyB[0] / 255, skyB[1] / 255, skyB[2] / 255);
   u.colorOn.value = P.colorOn ? 1 : 0;
+  // world reconstruction for pigment noise (pass 1 already refreshed
+  // camera.matrixWorldInverse via renderer.render)
+  u.invViewProj.value.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).invert();
   u.hatchOn.value = P.hatchOn ? 1 : 0;
   u.oneSided.value = P.oneSided ? 1 : 0;
   u.coverage.value = P.coverageAA ? 1 : 0;

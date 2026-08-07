@@ -110,7 +110,7 @@ const P = {
   // wash/pooling/tint/fade applied in the compose step. colorOn off
   // must render pixel-identical to the pre-color build.
   colorOn: true, skyColor: '#d8efec',
-  washAmount: 0.09, poolAmount: 0.01, inkTint: 1, aerialFade: 0.81,
+  washAmount: 0.09, washScale: 1, poolAmount: 0.01, inkTint: 1, aerialFade: 0.81,
   // per-region value drift baked into aPaint — adjacent panels read as
   // separately mixed brush pools (rebuilds on change)
   regionJitter: 0.07,
@@ -1988,7 +1988,7 @@ const post = new THREE.ShaderMaterial({
     tPaint:     { value: null },
     skyColor:   { value: new THREE.Color(P.skyColor) },
     colorOn:    { value: 1 },
-    washAmount: { value: 0 }, poolAmount: { value: 0 },
+    washAmount: { value: 0 }, washScale: { value: 1 }, poolAmount: { value: 0 },
     inkTint: { value: 0 }, aerialFade: { value: 0 },
     invViewProj: { value: new THREE.Matrix4() },
     viewToWorldN: { value: new THREE.Matrix3() },
@@ -2010,7 +2010,7 @@ const post = new THREE.ShaderMaterial({
                   oneSided, coverage, minFeature, invFovScale, keepSil;
     uniform sampler2D tPaint;
     uniform vec3 skyColor;
-    uniform float colorOn, washAmount, poolAmount, inkTint, aerialFade;
+    uniform float colorOn, washAmount, washScale, poolAmount, inkTint, aerialFade;
     uniform mat4 invViewProj;
     uniform mat3 viewToWorldN;
 
@@ -2207,9 +2207,11 @@ const post = new THREE.ShaderMaterial({
         // mid mottle, fine granulation — each fading out as its features
         // shrink toward pixel size in the distance. wpx = world size of
         // one pixel at this depth.
-        float m = pigment(wp, 0.45, wpx)              * 0.55
-                + pigment(wp + 13.7, 1.7, wpx)        * 0.30
-                + pigment(wp + 41.3, 6.0, wpx)        * 0.15;
+        // washScale stretches all three octaves together: >1 = broader
+        // blotches, <1 = tighter grain
+        float m = pigment(wp, 0.45 / washScale, wpx)       * 0.55
+                + pigment(wp + 13.7, 1.7 / washScale, wpx) * 0.30
+                + pigment(wp + 41.3, 6.0 / washScale, wpx) * 0.15;
         paint *= 1.0 - washAmount * m * 2.0;
         // pigment pooling: the detector itself at ~3.5x line radius says
         // "near an edge"; world-anchored noise breaks the band up so it
@@ -2564,6 +2566,7 @@ section('watercolor');
 colorPick('skyColor', 'sky');
 slider('regionJitter', 'region jitter', 0, 0.25, 0.005, () => buildScene());
 slider('washAmount', 'wash mottle', 0, 0.5, 0.01);
+slider('washScale', 'mottle scale', 0.25, 4, 0.05);
 slider('poolAmount', 'edge pooling', 0, 1, 0.01);
 slider('inkTint', 'ink tint', 0, 1, 0.01);
 slider('aerialFade', 'aerial fade', 0, 1, 0.01);
@@ -2815,7 +2818,7 @@ function renderFrame(useHi) {
   for (const k of ['idThreshold','lineWidth','distanceFalloff',
     'wobbleAmp','wobbleFreq','hatchThreshold','crossThreshold',
     'hatchSpacing','hatchWidth','hatchAngle','paperGrain',
-    'washAmount','poolAmount','inkTint','aerialFade']) u[k].value = P[k];
+    'washAmount','washScale','poolAmount','inkTint','aerialFade']) u[k].value = P[k];
   // setRGB with raw bytes skips the linear conversion .set(hex) would do,
   // keeping the uniform in the same raw display space as the aPaint bytes
   const skyB = hex2u8(P.skyColor);

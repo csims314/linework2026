@@ -87,7 +87,7 @@ const P = {
   // edge extraction — face-ID only: every face boundary is a line
   idThreshold: 0.005,
   // region grouping: neighbors that share a color draw no line between them
-  regionGroup: true, similarity: 0.5,
+  regionGroup: true, similarity: 0.1,
   // debug: draw the face-ID buffer itself instead of the ink
   showIDs: false,
   // feature LOD: fade a line when the shapes it separates are small on screen.
@@ -116,7 +116,7 @@ const P = {
   shadeStyle: 'hard', shadowAmount: 0.22,
   // ink along shadow boundaries (0 = off) and its width as a multiple
   // of the regular line radius
-  shadowLine: 0, shadowLineWidth: 1,
+  shadowLine: 0.46, shadowLineWidth: 1.65,
   // colors
   inkColor: '#1d1a17', paperColor: '#f6f2e6', paperGrain: 0.05,
   // watercolor (raster mode only): per-kind fills baked at rebuild,

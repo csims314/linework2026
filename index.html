@@ -2179,16 +2179,19 @@ const post = new THREE.ShaderMaterial({
         float shade = clamp(dot(n, normalize(lightDir)), 0.0, 1.0);
         float hnf = 0.35 / hatchNoiseScale;
         if (shadeMode > 0.5) {
-          // hard/soft shadows in place of strokes: a flat cel step (hard)
-          // or wide ramp (soft) below the shade threshold, boundary pushed
-          // around by the same surface-anchored noise the strokes use.
-          // The cross threshold doubles as a deeper core-shadow step.
+          // shadows in place of strokes, boundary pushed around by the
+          // same surface-anchored noise the strokes use
           float sn = (vnoise3(wp * hnf) - 0.5) * hatchNoise * 0.3;
-          float ew = shadeMode > 1.5 ? 0.30 : 0.02;
-          shadow = shadowAmount *
-                   (1.0 - smoothstep(hatchThreshold - ew, hatchThreshold + ew, shade + sn));
-          shadow += shadowAmount * 0.6 *
-                   (1.0 - smoothstep(crossThreshold - ew, crossThreshold + ew, shade + sn));
+          if (shadeMode > 1.5) {
+            // soft: wide ramp, with the cross threshold as a deeper core
+            shadow = shadowAmount *
+                     (1.0 - smoothstep(hatchThreshold - 0.30, hatchThreshold + 0.30, shade + sn));
+            shadow += shadowAmount * 0.6 *
+                     (1.0 - smoothstep(crossThreshold - 0.30, crossThreshold + 0.30, shade + sn));
+          } else {
+            // hard: binary — a pixel is shadowed or it is not, one flat level
+            shadow = shadowAmount * step(shade + sn, hatchThreshold);
+          }
         } else {
         vec3 wn = normalize(viewToWorldN * n);
         vec3 an = abs(wn);

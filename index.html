@@ -101,19 +101,19 @@ const P = {
   // line look
   lineWidth: 0.5, distanceFalloff: 1.25,
   wobbleAmp: 1.1, wobbleFreq: 0.08,
-  // hatching
-  hatchOn: false, hatchThreshold: 0.0, crossThreshold: 0.02,
+  // shading (hatch strokes or flat shadows)
+  hatchOn: true, hatchThreshold: 0.45, crossThreshold: 0.02,
   hatchSpacing: 10.0, hatchWidth: 0.05, hatchAngle: 45,
   // stroke breakup: displacement noise amount (past ~1 strokes start
   // folding into stipple — allowed, it reads as dry-brush) and the
   // world-space feature size of that noise. hatchBreak erodes strokes
   // entirely where the surface noise dips below it: 0 = solid strokes,
   // 1 = almost fully eaten away.
-  hatchNoise: 0.6, hatchNoiseScale: 1, hatchBreak: 0,
+  hatchNoise: 0, hatchNoiseScale: 1, hatchBreak: 0,
   // shading style: 'hatch' draws strokes; 'hard'/'soft' darken the fill
   // instead — flat cel step or smooth ramp, both reusing the shade
   // thresholds (cross adds a deeper core shadow) and the noise sliders
-  shadeStyle: 'hatch', shadowAmount: 0.22,
+  shadeStyle: 'hard', shadowAmount: 0.22,
   // colors
   inkColor: '#1d1a17', paperColor: '#f6f2e6', paperGrain: 0.05,
   // watercolor (raster mode only): per-kind fills baked at rebuild,
@@ -2192,6 +2192,7 @@ const post = new THREE.ShaderMaterial({
             // hard: binary — a pixel is shadowed or it is not, one flat level
             shadow = shadowAmount * step(shade + sn, hatchThreshold);
           }
+          shadow = min(shadow, 1.0);   // intensity 1 = pitch black, never past it
         } else {
         vec3 wn = normalize(viewToWorldN * n);
         vec3 an = abs(wn);
@@ -2600,7 +2601,7 @@ slider('wobbleFreq', 'wobble freq', 0.005, 0.2, 0.005);
 section('shading');
 checkbox('hatchOn', 'enabled');
 dropdown('shadeStyle', 'style', ['hatch', 'hard', 'soft']);
-slider('shadowAmount', 'shadow depth', 0, 0.6, 0.01);
+slider('shadowAmount', 'intensity', 0, 1, 0.01);
 slider('hatchThreshold', 'shade start', 0, 1, 0.01);
 slider('crossThreshold', 'cross-hatch', 0, 1, 0.01);
 slider('hatchSpacing', 'spacing', 1, 60, 0.5);

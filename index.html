@@ -106,8 +106,10 @@ const P = {
   hatchSpacing: 10.0, hatchWidth: 0.05, hatchAngle: 45,
   // stroke breakup: displacement noise amount (past ~1 strokes start
   // folding into stipple — allowed, it reads as dry-brush) and the
-  // world-space feature size of that noise
-  hatchNoise: 0.6, hatchNoiseScale: 1,
+  // world-space feature size of that noise. hatchBreak erodes strokes
+  // entirely where the surface noise dips below it: 0 = solid strokes,
+  // 1 = almost fully eaten away.
+  hatchNoise: 0.6, hatchNoiseScale: 1, hatchBreak: 0,
   // colors
   inkColor: '#1d1a17', paperColor: '#f6f2e6', paperGrain: 0.05,
   // watercolor (raster mode only): per-kind fills baked at rebuild,
@@ -1986,7 +1988,7 @@ const post = new THREE.ShaderMaterial({
     wobbleAmp: { value: 0 }, wobbleFreq: { value: 0 },
     hatchOn: { value: 1 }, hatchThreshold: { value: 0 }, crossThreshold: { value: 0 },
     hatchSpacing: { value: 0 }, hatchWidth: { value: 0 }, hatchAngle: { value: 0 },
-    hatchNoise: { value: 0 }, hatchNoiseScale: { value: 1 },
+    hatchNoise: { value: 0 }, hatchNoiseScale: { value: 1 }, hatchBreak: { value: 0 },
     paperGrain: { value: 0 }, oneSided: { value: 0 }, coverage: { value: 0 },
     minFeature: { value: 0 }, invFovScale: { value: 1 }, keepSil: { value: 0 },
     // watercolor
@@ -2012,7 +2014,7 @@ const post = new THREE.ShaderMaterial({
     uniform float idThreshold, lineWidth, distanceFalloff,
                   wobbleAmp, wobbleFreq, hatchOn, hatchThreshold, crossThreshold,
                   hatchSpacing, hatchWidth, hatchAngle, hatchNoise, hatchNoiseScale,
-                  paperGrain, oneSided, coverage, minFeature, invFovScale, keepSil;
+                  hatchBreak, paperGrain, oneSided, coverage, minFeature, invFovScale, keepSil;
     uniform sampler2D tPaint;
     uniform vec3 skyColor;
     uniform float colorOn, washAmount, washScale, poolAmount, inkTint, aerialFade;
@@ -2188,8 +2190,15 @@ const post = new THREE.ShaderMaterial({
         // fade strokes out as their on-screen spacing compresses toward
         // pixel size in the distance, instead of aliasing into moire
         float hFade = 0.85 * smoothstep(2.5, 6.0, wSpace / max(wpx, 1e-6));
-        if (shade < hatchThreshold) ink = max(ink, step(h1, hatchWidth) * hFade);
-        if (shade < crossThreshold) ink = max(ink, step(h2, hatchWidth) * hFade);
+        // erosion: whole segments vanish where surface noise dips below
+        // hatchBreak. At 0 this is a no-op (noise never goes negative);
+        // each direction erodes independently so segments break up
+        // rather than both directions tearing in the same patches.
+        float hnf2 = 1.2 / hatchNoiseScale;
+        float k1 = smoothstep(hatchBreak - 0.15, hatchBreak, vnoise3(wp * hnf2 + 91.7));
+        float k2 = smoothstep(hatchBreak - 0.15, hatchBreak, vnoise3(wp * hnf2 + 137.3));
+        if (shade < hatchThreshold) ink = max(ink, step(h1, hatchWidth) * hFade * k1);
+        if (shade < crossThreshold) ink = max(ink, step(h2, hatchWidth) * hFade * k2);
       }
 
       // falloff beyond 1: distance fade of ALL ink (edges + hatching)
@@ -2566,11 +2575,12 @@ section('hatching');
 checkbox('hatchOn', 'enabled');
 slider('hatchThreshold', 'shade start', 0, 1, 0.01);
 slider('crossThreshold', 'cross-hatch', 0, 1, 0.01);
-slider('hatchSpacing', 'spacing px', 3, 20, 0.5);
+slider('hatchSpacing', 'spacing', 1, 60, 0.5);
 slider('hatchWidth', 'stroke', 0.05, 0.9, 0.01);
 slider('hatchAngle', 'angle°', 0, 180, 1);
 slider('hatchNoise', 'noise', 0, 2, 0.02);
 slider('hatchNoiseScale', 'noise scale', 0.25, 4, 0.05);
+slider('hatchBreak', 'gaps', 0, 1, 0.01);
 section('watercolor');
 colorPick('skyColor', 'sky');
 slider('regionJitter', 'region jitter', 0, 0.25, 0.005, () => buildScene());
@@ -2827,7 +2837,7 @@ function renderFrame(useHi) {
   for (const k of ['idThreshold','lineWidth','distanceFalloff',
     'wobbleAmp','wobbleFreq','hatchThreshold','crossThreshold',
     'hatchSpacing','hatchWidth','hatchAngle','hatchNoise','hatchNoiseScale',
-    'paperGrain','washAmount','washScale','poolAmount','inkTint','aerialFade']) u[k].value = P[k];
+    'hatchBreak','paperGrain','washAmount','washScale','poolAmount','inkTint','aerialFade']) u[k].value = P[k];
   // setRGB with raw bytes skips the linear conversion .set(hex) would do,
   // keeping the uniform in the same raw display space as the aPaint bytes
   const skyB = hex2u8(P.skyColor);

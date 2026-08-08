@@ -2231,7 +2231,7 @@ const post = new THREE.ShaderMaterial({
       d = max(d, distance(c, texture2D(tGlassID, p - vec2(o.x, 0.)).rgb));
       d = max(d, distance(c, texture2D(tGlassID, p + vec2(0., o.y)).rgb));
       d = max(d, distance(c, texture2D(tGlassID, p - vec2(0., o.y)).rgb));
-      return smoothstep(idThreshold, idThreshold * 2.0, d);
+      return smoothstep(idThreshold, idThreshold * 3.0, d);
     }
     float glassInkB(vec2 p, vec2 o) {   // same test on the back-face layer
       vec3 c = texture2D(tGlassBackID, p).rgb;
@@ -2239,7 +2239,21 @@ const post = new THREE.ShaderMaterial({
       d = max(d, distance(c, texture2D(tGlassBackID, p - vec2(o.x, 0.)).rgb));
       d = max(d, distance(c, texture2D(tGlassBackID, p + vec2(0., o.y)).rgb));
       d = max(d, distance(c, texture2D(tGlassBackID, p - vec2(0., o.y)).rgb));
-      return smoothstep(idThreshold, idThreshold * 2.0, d);
+      return smoothstep(idThreshold, idThreshold * 3.0, d);
+    }
+    // coverage versions: same 4-sub-pixel averaging the main detector
+    // uses — a wobble-induced miss becomes partial ink instead of a gap
+    float glassInkC(vec2 p, vec2 o, vec2 px) {
+      if (coverage < 0.5) return glassInk(p, o);
+      vec2 q = px * 0.25;
+      return 0.25 * (glassInk(p + vec2(-q.x, -q.y), o) + glassInk(p + vec2( q.x, -q.y), o)
+                   + glassInk(p + vec2(-q.x,  q.y), o) + glassInk(p + vec2( q.x,  q.y), o));
+    }
+    float glassInkBC(vec2 p, vec2 o, vec2 px) {
+      if (coverage < 0.5) return glassInkB(p, o);
+      vec2 q = px * 0.25;
+      return 0.25 * (glassInkB(p + vec2(-q.x, -q.y), o) + glassInkB(p + vec2( q.x, -q.y), o)
+                   + glassInkB(p + vec2(-q.x,  q.y), o) + glassInkB(p + vec2( q.x,  q.y), o));
     }
     float lum(vec3 c) { return c.r + c.g + c.b; }
 
@@ -2497,8 +2511,8 @@ const post = new THREE.ShaderMaterial({
         // by opaque geometry sitting inside it
         float gbD = linDepthGB(uv);
         if (gbD > gD * 1.001 && gbD < dC * 0.999)
-          col = mix(col, gInk, glassInkB(uv, o) * glassBackLine);
-        col = mix(col, gInk, glassInk(uv, o) * glassLine);
+          col = mix(col, gInk, glassInkBC(uv, o, px) * glassBackLine);
+        col = mix(col, gInk, glassInkC(uv, o, px) * glassLine);
       }
       // ---- GLOW HALO — emission bleeds past the geometry ---------
       // pull surrounding pixels toward the lamp's hue: pure screen

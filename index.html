@@ -111,7 +111,7 @@ const P = {
   // cast shadows: one directional sun. Direction sliders re-render the
   // shadow map only on change; orbit animates the azimuth.
   castShadow: true, lightAzimuth: 303, lightElevation: 50,
-  lightOrbit: false, shadowBias: 0.0015,
+  lightOrbit: false, shadowBias: 0.0015, shadowRes: '2048',
   // stroke breakup: displacement noise amount (past ~1 strokes start
   // folding into stipple — allowed, it reads as dry-brush) and the
   // world-space feature size of that noise. hatchBreak erodes strokes
@@ -2116,17 +2116,22 @@ function makeTargets() {
 }
 makeTargets();
 
-// cast-shadow map: fixed-size, screen-resolution independent, cached
-// until shadowDirty. Depth-only content; the color attachment is unused.
-const rtShadow = new THREE.WebGLRenderTarget(2048, 2048, {
-  minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
-  depthTexture: (() => {
-    const d = new THREE.DepthTexture(2048, 2048);
-    d.type = THREE.UnsignedIntType;
-    return d;
-  })(),
-  depthBuffer: true,
-});
+// cast-shadow map: screen-resolution independent, cached until
+// shadowDirty. Depth-only content; the color attachment is unused.
+let rtShadow = null;
+function makeShadowTarget() {
+  if (rtShadow) rtShadow.dispose();
+  const res = +P.shadowRes;
+  const d = new THREE.DepthTexture(res, res);
+  d.type = THREE.UnsignedIntType;
+  rtShadow = new THREE.WebGLRenderTarget(res, res, {
+    minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+    depthTexture: d, depthBuffer: true,
+  });
+  shadowDirty = true;
+  markDirty();
+}
+makeShadowTarget();
 const lightCam = new THREE.OrthographicCamera();
 const lightVPmat = new THREE.Matrix4();
 const depthOnlyMat = new THREE.MeshDepthMaterial({ side: THREE.DoubleSide });
@@ -2171,7 +2176,7 @@ const post = new THREE.ShaderMaterial({
     glowLift: { value: 0 }, haloStrength: { value: 0 },
     contourLine: { value: 0 }, contourCos: { value: 0 },
     tShadow: { value: null }, lightVP: { value: new THREE.Matrix4() },
-    castOn: { value: 0 }, shadowBias: { value: 0 },
+    castOn: { value: 0 }, shadowBias: { value: 0 }, shadowRes: { value: 2048 },
   },
   vertexShader: /* glsl */`
     varying vec2 vUv;
@@ -2200,7 +2205,7 @@ const post = new THREE.ShaderMaterial({
     uniform float contourLine, contourCos;
     uniform sampler2D tShadow;
     uniform mat4 lightVP;
-    uniform float castOn, shadowBias;
+    uniform float castOn, shadowBias, shadowRes;
 
     // ---- helpers -------------------------------------------------
     float hash(vec2 p) {
@@ -2369,7 +2374,7 @@ const post = new THREE.ShaderMaterial({
         return 0.0;
       float hnf = 0.35 / hatchNoiseScale;
       sc.xy += (vec2(vnoise3(w * hnf), vnoise3(w * hnf + 40.0)) - 0.5)
-               * hatchNoise * 8.0 / 2048.0;
+               * hatchNoise * 8.0 / shadowRes;
       return step(texture2D(tShadow, sc.xy).x + shadowBias, sc.z);
     }
 
@@ -2964,6 +2969,7 @@ slider('lightAzimuth', 'light azimuth°', 0, 360, 1);
 slider('lightElevation', 'light elev°', 10, 80, 1);
 checkbox('lightOrbit', 'orbit light');
 slider('shadowBias', 'shadow bias', 0.0005, 0.01, 0.0005);
+dropdown('shadowRes', 'shadow map', ['1024', '2048', '4096'], makeShadowTarget);
 slider('shadowAmount', 'intensity', 0, 1, 0.01);
 slider('shadowLine', 'shadow lines', 0, 1, 0.01);
 slider('shadowLineWidth', 'shadow line w', 0.5, 3, 0.05);
@@ -3059,7 +3065,7 @@ function gpuBytes() {
     (4 * 2 * (P.msaa ? 4 : 1) * 3 + 12 + 8 + 0.5) : 0;
   b += tgt(targetsLo) + tgt(targetsHi);
   if (rtScreen) b += rtScreen.width * rtScreen.height * 4;
-  if (P.castShadow) b += 2048 * 2048 * 8;   // shadow map color + depth
+  if (P.castShadow) b += (+P.shadowRes) * (+P.shadowRes) * 8;   // shadow map color + depth
   return b;
 }
 // Geometry draws only — the fullscreen post passes aren't the interesting
@@ -3341,6 +3347,7 @@ function renderFrame(useHi) {
   u.tShadow.value = rtShadow.depthTexture;
   u.lightVP.value.copy(lightVPmat);
   u.castOn.value = P.castShadow && P.hatchOn ? 1 : 0;
+  u.shadowRes.value = +P.shadowRes;
   u.shadeMode.value = P.shadeStyle === 'hard' ? 1 : (P.shadeStyle === 'soft' ? 2 : 0);
   // setRGB with raw bytes skips the linear conversion .set(hex) would do,
   // keeping the uniform in the same raw display space as the aPaint bytes

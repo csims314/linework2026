@@ -108,6 +108,10 @@ const P = {
   // shading (hatch strokes or flat shadows)
   hatchOn: true, hatchThreshold: 0.45, crossThreshold: 0.02,
   hatchSpacing: 10.0, hatchWidth: 0.05, hatchAngle: 45,
+  // cast shadows: one directional sun. Direction sliders re-render the
+  // shadow map only on change; orbit animates the azimuth.
+  castShadow: true, lightAzimuth: 303, lightElevation: 50,
+  lightOrbit: false, shadowBias: 0.0015,
   // stroke breakup: displacement noise amount (past ~1 strokes start
   // folding into stipple — allowed, it reads as dry-brush) and the
   // world-space feature size of that noise. hatchBreak erodes strokes
@@ -237,6 +241,9 @@ function washJitter(i) {
 // in a refined frame when you stop moving, and idles the GPU at rest.
 let dirty = true;
 function markDirty() { dirty = true; }
+// the cast-shadow map re-renders only when this is set: on rebuilds and
+// light moves. A still sun is as cheap as a baked shadow map.
+let shadowDirty = true;
 
 // the OBJ model scene's current model (starts as the embedded speeder;
 // replaced when the user drops or loads an .obj)
@@ -1650,6 +1657,7 @@ function buildScene() {
   prng = mulberry32(P.seed ^ 0x5f356495);
   currentPaint = null;                     // no material state leaks across rebuilds
   currentAlpha = 1; currentGlow = 0;
+  shadowDirty = true;
   bag = [];
   const D = P.density;
   if (P.scene === 'garden') buildGarden();
@@ -2108,6 +2116,21 @@ function makeTargets() {
 }
 makeTargets();
 
+// cast-shadow map: fixed-size, screen-resolution independent, cached
+// until shadowDirty. Depth-only content; the color attachment is unused.
+const rtShadow = new THREE.WebGLRenderTarget(2048, 2048, {
+  minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+  depthTexture: (() => {
+    const d = new THREE.DepthTexture(2048, 2048);
+    d.type = THREE.UnsignedIntType;
+    return d;
+  })(),
+  depthBuffer: true,
+});
+const lightCam = new THREE.OrthographicCamera();
+const lightVPmat = new THREE.Matrix4();
+const depthOnlyMat = new THREE.MeshDepthMaterial({ side: THREE.DoubleSide });
+
 /* ============================================================
    Post pass — where the ink happens
    ============================================================ */
@@ -2147,6 +2170,8 @@ const post = new THREE.ShaderMaterial({
     glassTint: { value: 0 }, glassLine: { value: 0 }, glassBackLine: { value: 0 },
     glowLift: { value: 0 }, haloStrength: { value: 0 },
     contourLine: { value: 0 }, contourCos: { value: 0 },
+    tShadow: { value: null }, lightVP: { value: new THREE.Matrix4() },
+    castOn: { value: 0 }, shadowBias: { value: 0 },
   },
   vertexShader: /* glsl */`
     varying vec2 vUv;
@@ -2173,6 +2198,9 @@ const post = new THREE.ShaderMaterial({
     uniform sampler2D tGlassBackID, tGlassBackDepth;
     uniform float glassTint, glassLine, glassBackLine, glowLift, haloStrength;
     uniform float contourLine, contourCos;
+    uniform sampler2D tShadow;
+    uniform mat4 lightVP;
+    uniform float castOn, shadowBias;
 
     // ---- helpers -------------------------------------------------
     float hash(vec2 p) {
@@ -2330,13 +2358,30 @@ const post = new THREE.ShaderMaterial({
       return d;
     }
 
+    // cast-shadow test in the sun's orthographic light space. Edges are
+    // wobbled by the same surface-anchored noise the strokes use, so
+    // cast shadow shapes read as hand-painted. Returns 1 = blocked.
+    float castAt(vec3 w) {
+      if (castOn < 0.5) return 0.0;
+      vec4 lp = lightVP * vec4(w, 1.0);
+      vec3 sc = lp.xyz * 0.5 + 0.5;      // ortho: no perspective divide
+      if (sc.x <= 0.0 || sc.x >= 1.0 || sc.y <= 0.0 || sc.y >= 1.0 || sc.z >= 1.0)
+        return 0.0;
+      float hnf = 0.35 / hatchNoiseScale;
+      sc.xy += (vec2(vnoise3(w * hnf), vnoise3(w * hnf + 40.0)) - 0.5)
+               * hatchNoise * 8.0 / 2048.0;
+      return step(texture2D(tShadow, sc.xy).x + shadowBias, sc.z);
+    }
+
     // the shading test as a reusable mask, so shadow boundaries can be
     // edge-detected exactly like the face-ID buffer: evaluate at neighbor
-    // taps, any disagreement is a line
+    // taps, any disagreement is a line. Includes the cast term, so cast
+    // shadow shapes get ink outlines from the same detector.
     float shadowMaskAt(vec2 p) {
       vec3 n = normalAt(p);
       float shade = clamp(dot(n, normalize(lightDir)), 0.0, 1.0);
       vec3 w = worldAt(p);
+      shade = min(shade, 1.0 - castAt(w));
       float sn = (vnoise3(w * (0.35 / hatchNoiseScale)) - 0.5) * hatchNoise * 0.3;
       return step(shade + sn, hatchThreshold);
     }
@@ -2394,6 +2439,10 @@ const post = new THREE.ShaderMaterial({
       if (hatchOn > 0.5 && !sky) {
         vec3 n = normalAt(uv);
         float shade = clamp(dot(n, normalize(lightDir)), 0.0, 1.0);
+        // cast shadows: a blocked pixel is fully in shadow, and every
+        // style downstream (hard step, soft ramp, hatch strokes) treats
+        // it that way automatically
+        shade = min(shade, 1.0 - castAt(wp));
         float glowS = 1.0 - texture2D(tPaint, uv).a;   // emissive: no shading
         float hnf = 0.35 / hatchNoiseScale;
         if (shadeMode > 0.5) {
@@ -2753,6 +2802,10 @@ function updateCamera() {
   const nowT = performance.now();
   const dt = Math.min(0.1, (nowT - lastCamT) / 1000);   // cap so a stall can't teleport
   lastCamT = nowT;
+  if (P.lightOrbit) {
+    P.lightAzimuth = (P.lightAzimuth + dt * 12) % 360;  // slow sweep for staging
+    markDirty();
+  }
 
   if (P.flyMode) {
     flyForward(_fwd);
@@ -2906,6 +2959,11 @@ slider('wobbleFreq', 'wobble freq', 0.005, 0.2, 0.005);
 section('shading');
 checkbox('hatchOn', 'enabled');
 dropdown('shadeStyle', 'style', ['hatch', 'hard', 'soft']);
+checkbox('castShadow', 'cast shadows');
+slider('lightAzimuth', 'light azimuth°', 0, 360, 1);
+slider('lightElevation', 'light elev°', 10, 80, 1);
+checkbox('lightOrbit', 'orbit light');
+slider('shadowBias', 'shadow bias', 0.0005, 0.01, 0.0005);
 slider('shadowAmount', 'intensity', 0, 1, 0.01);
 slider('shadowLine', 'shadow lines', 0, 1, 0.01);
 slider('shadowLineWidth', 'shadow line w', 0.5, 3, 0.05);
@@ -3001,6 +3059,7 @@ function gpuBytes() {
     (4 * 2 * (P.msaa ? 4 : 1) * 3 + 12 + 8 + 0.5) : 0;
   b += tgt(targetsLo) + tgt(targetsHi);
   if (rtScreen) b += rtScreen.width * rtScreen.height * 4;
+  if (P.castShadow) b += 2048 * 2048 * 8;   // shadow map color + depth
   return b;
 }
 // Geometry draws only — the fullscreen post passes aren't the interesting
@@ -3095,7 +3154,15 @@ function updateBudget(frameCount, elapsed) {
 /* ============================================================
    Main loop
    ============================================================ */
-const lightWorld = new THREE.Vector3(-0.55, 0.8, 0.35).normalize();
+// sun direction from the azimuth/elevation sliders (defaults match the
+// old hardcoded vector); points from the scene TOWARD the light
+const lightWorld = new THREE.Vector3();
+function updateLightDir() {
+  const az = THREE.MathUtils.degToRad(P.lightAzimuth);
+  const el = THREE.MathUtils.degToRad(P.lightElevation);
+  lightWorld.set(Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el));
+}
+let prevLightAz = -1, prevLightEl = -1;
 const _lv = new THREE.Vector3();
 let frames = 0, lastStats = performance.now();
 let refinePending = false, lastChange = 0, lastRender = 0;
@@ -3111,6 +3178,7 @@ function lodIndices() {
 
 function renderFrame(useHi) {
   updateCamera();
+  updateLightDir();
   const [mi, ui] = lodIndices();
 
   if (P.vectorMode && !P.showIDs) {
@@ -3188,6 +3256,34 @@ function renderFrame(useHi) {
     return;
   }
 
+  // cast-shadow map: cached — re-rendered only when the light moved or
+  // the scene rebuilt. Glass and lines are already hidden; glass casts
+  // nothing. The map is depth-only, taken from an orthographic camera
+  // fitted to the scene's bounding sphere.
+  if (P.castShadow && P.hatchOn) {
+    if (P.lightAzimuth !== prevLightAz || P.lightElevation !== prevLightEl)
+      shadowDirty = true;
+    if (shadowDirty) {
+      prevLightAz = P.lightAzimuth; prevLightEl = P.lightElevation;
+      const c = sceneSphere.center, r = Math.max(1, sceneSphere.radius);
+      lightCam.left = -r; lightCam.right = r; lightCam.top = r; lightCam.bottom = -r;
+      lightCam.near = 0.1; lightCam.far = 3 * r;
+      lightCam.position.copy(c).addScaledVector(lightWorld, r * 1.5);
+      lightCam.lookAt(c);
+      lightCam.updateProjectionMatrix();
+      lightCam.updateMatrixWorld();
+      lightCam.matrixWorldInverse.copy(lightCam.matrixWorld).invert();
+      lightVPmat.multiplyMatrices(lightCam.projectionMatrix, lightCam.matrixWorldInverse);
+      renderer.setRenderTarget(rtShadow);
+      renderer.setClearColor(0xffffff, 1);
+      renderer.clear();
+      scene.overrideMaterial = depthOnlyMat;
+      renderer.render(scene, lightCam);
+      scene.overrideMaterial = null;
+      shadowDirty = false;
+    }
+  }
+
   // pass 2: view-space normals — needed by hatching/shadows and by the
   // self-overlap contour detector (glass is invisible here: the
   // translucent layer takes no shading and no contours)
@@ -3239,8 +3335,12 @@ function renderFrame(useHi) {
     'hatchSpacing','hatchWidth','hatchAngle','hatchNoise','hatchNoiseScale',
     'hatchBreak','shadowAmount','shadowLine','shadowLineWidth',
     'paperGrain','washAmount','washScale','poolAmount','inkTint','aerialFade',
-    'glassTint','glassLine','glassBackLine','glowLift','contourLine']) u[k].value = P[k];
+    'glassTint','glassLine','glassBackLine','glowLift','contourLine',
+    'shadowBias']) u[k].value = P[k];
   u.contourCos.value = Math.cos(THREE.MathUtils.degToRad(P.contourAngle));
+  u.tShadow.value = rtShadow.depthTexture;
+  u.lightVP.value.copy(lightVPmat);
+  u.castOn.value = P.castShadow && P.hatchOn ? 1 : 0;
   u.shadeMode.value = P.shadeStyle === 'hard' ? 1 : (P.shadeStyle === 'soft' ? 2 : 0);
   // setRGB with raw bytes skips the linear conversion .set(hex) would do,
   // keeping the uniform in the same raw display space as the aPaint bytes

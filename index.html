@@ -88,6 +88,10 @@ const P = {
   idThreshold: 0.005,
   // region grouping: neighbors that share a color draw no line between them
   regionGroup: true, similarity: 0.1,
+  // self-overlap contours from the normal buffer: ink where visible
+  // surface orientation jumps discontinuously (a fold crossing itself),
+  // which the ID detector can't see inside a single region. 0 = off.
+  contourLine: 0.85, contourAngle: 55,
   // debug: draw the face-ID buffer itself instead of the ink
   showIDs: false,
   // feature LOD: fade a line when the shapes it separates are small on screen.
@@ -2142,6 +2146,7 @@ const post = new THREE.ShaderMaterial({
     tGlow: { value: null },
     glassTint: { value: 0 }, glassLine: { value: 0 }, glassBackLine: { value: 0 },
     glowLift: { value: 0 }, haloStrength: { value: 0 },
+    contourLine: { value: 0 }, contourCos: { value: 0 },
   },
   vertexShader: /* glsl */`
     varying vec2 vUv;
@@ -2167,6 +2172,7 @@ const post = new THREE.ShaderMaterial({
     uniform sampler2D tGlassID, tGlassPaint, tGlassDepth, tGlow;
     uniform sampler2D tGlassBackID, tGlassBackDepth;
     uniform float glassTint, glassLine, glassBackLine, glowLift, haloStrength;
+    uniform float contourLine, contourCos;
 
     // ---- helpers -------------------------------------------------
     float hash(vec2 p) {
@@ -2296,6 +2302,18 @@ const post = new THREE.ShaderMaterial({
       }
       return ink;
     }
+    // self-overlap contour: inside a single region the ID colors agree
+    // across a fold, but the visible surface orientation jumps
+    // discontinuously — smooth interiors step by fractions of a degree
+    // per pixel and never reach the angle threshold
+    float contourTest(vec2 uv, vec2 o) {
+      vec3 n = normalAt(uv);
+      float dmin = dot(n, normalAt(uv + vec2(o.x, 0.)));
+      dmin = min(dmin, dot(n, normalAt(uv - vec2(o.x, 0.))));
+      dmin = min(dmin, dot(n, normalAt(uv + vec2(0., o.y))));
+      dmin = min(dmin, dot(n, normalAt(uv - vec2(0., o.y))));
+      return smoothstep(contourCos, contourCos - 0.15, dmin);
+    }
     // the whole face-ID detector, callable at sub-pixel offsets.
     // smoothstep is monotonic, so thresholding per direction and then
     // taking the max is identical to the other order — it just lets
@@ -2307,6 +2325,8 @@ const post = new THREE.ShaderMaterial({
       d = max(d, dirInk(c, uv - vec2(o.x, 0.), dC, gC));
       d = max(d, dirInk(c, uv + vec2(0., o.y), dC, gC));
       d = max(d, dirInk(c, uv - vec2(0., o.y), dC, gC));
+      // self-overlap contours ride the same LOD gain as the region's lines
+      if (contourLine > 0.0) d = max(d, contourTest(uv, o) * contourLine * gC);
       return d;
     }
 
@@ -2854,6 +2874,8 @@ uiTarget = advanced;
 
 section('face-id edges');
 slider('idThreshold', 'threshold', 0.001, 0.3, 0.001);
+slider('contourLine', 'contour', 0, 1, 0.01);
+slider('contourAngle', 'contour angle°', 20, 90, 1);
 checkbox('perQuad', 'per-quad colors', () => buildScene());
 checkbox('regionGroup', 'region grouping', () => buildScene());
 slider('similarity', 'similarity', 0.1, 1, 0.005, () => buildScene());
@@ -2985,7 +3007,8 @@ function gpuBytes() {
 // number. One merged mesh, plus the normal pass or the vector line pass.
 function drawCalls() {
   const glass = glassVertCount ? (P.vectorMode ? 1 : 2) : 0;   // front + back layers
-  return (P.vectorMode ? 2 : (P.hatchOn ? 2 : 1)) + glass;
+  const normals = P.hatchOn || P.contourLine > 0 ? 1 : 0;
+  return (P.vectorMode ? 2 : 1 + normals) + glass;
 }
 const budgetList = document.getElementById('budgetList');
 for (const b of BUDGETS) {
@@ -3165,9 +3188,10 @@ function renderFrame(useHi) {
     return;
   }
 
-  // pass 2: view-space normals — only needed while hatching is on
-  // (glass is invisible here: the translucent layer takes no shading)
-  if (P.hatchOn) {
+  // pass 2: view-space normals — needed by hatching/shadows and by the
+  // self-overlap contour detector (glass is invisible here: the
+  // translucent layer takes no shading and no contours)
+  if (P.hatchOn || P.contourLine > 0) {
     renderer.setRenderTarget(T.rtNormal);
     renderer.setClearColor(0x8080ff, 1);
     renderer.clear();
@@ -3215,7 +3239,8 @@ function renderFrame(useHi) {
     'hatchSpacing','hatchWidth','hatchAngle','hatchNoise','hatchNoiseScale',
     'hatchBreak','shadowAmount','shadowLine','shadowLineWidth',
     'paperGrain','washAmount','washScale','poolAmount','inkTint','aerialFade',
-    'glassTint','glassLine','glassBackLine','glowLift']) u[k].value = P[k];
+    'glassTint','glassLine','glassBackLine','glowLift','contourLine']) u[k].value = P[k];
+  u.contourCos.value = Math.cos(THREE.MathUtils.degToRad(P.contourAngle));
   u.shadeMode.value = P.shadeStyle === 'hard' ? 1 : (P.shadeStyle === 'soft' ? 2 : 0);
   // setRGB with raw bytes skips the linear conversion .set(hex) would do,
   // keeping the uniform in the same raw display space as the aPaint bytes

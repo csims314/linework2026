@@ -127,6 +127,10 @@ const P = {
   // per-region value drift baked into aPaint — adjacent panels read as
   // separately mixed brush pools (rebuilds on change)
   regionJitter: 0.07,
+  // glass & glow: translucent-layer fill/line strength, emissive
+  // brightness lift, and the halo bleeding past lamp silhouettes
+  glassTint: 0.85, glassLine: 0.7, glowLift: 0.25,
+  haloStrength: 0.55, haloSize: 1,
   // thin lines & AA
   oneSided: false, coverageAA: true, superSample: 1,
   msaa: true, fxaa: true, vectorMode: false, progressive: false,
@@ -186,28 +190,33 @@ const PAL = {
   mint:      hex2u8('#BFD8B4'),  // AC boxes
   red:       hex2u8('#C94F4A'),  // THE accent — one hero object per scene
   shadow:    hex2u8('#4A4C6E'),  // cables, railings, ladders
+  amber:     hex2u8('#E8A33D'),  // emissive — lamps, glow, embers
 };
-// imported models: usemtl (or o/g) names -> palette, keyword match first
+// imported models: usemtl (or o/g) names -> material, keyword match
+// first. Entries are {c, a?, e?}: a < 1 routes to the translucent
+// layer, e > 0 marks emissive (translucent + emissive unsupported —
+// the keyword sets are kept disjoint on purpose).
 const MTL_PAINT = [
-  [/glow|ember|neon|lamp/i,                      PAL.red],
-  [/phosphor|crt|screen|glass|window|canopy/i,   PAL.cyan],
-  [/wood|plank|floor|linen|plaster|paper|card/i, PAL.sand],
-  [/cloth|velour|sofa|jacket|fabric|curtain/i,   PAL.mauve],
-  [/duct|steel|iron|metal|fitting|pipe|vent/i,   PAL.slate],
-  [/cable|wire|rubber|tire|shadow/i,             PAL.shadow],
-  [/armor|plate|hull|panel/i,                    PAL.peri],
-  [/skin|face|hand|flesh/i,                      PAL.pink],
-  [/plant|leaf|moss|grass/i,                     PAL.celadon],
-  [/sky|city|backdrop/i,                         PAL.sky],
+  [/glow|ember|neon|lamp/i,                      { c: PAL.amber, e: 1 }],
+  [/phosphor|crt|screen/i,                       { c: PAL.cyan, e: 1 }],
+  [/glass|window|canopy/i,                       { c: PAL.cyan, a: 0.45 }],
+  [/wood|plank|floor|linen|plaster|paper|card/i, { c: PAL.sand }],
+  [/cloth|velour|sofa|jacket|fabric|curtain/i,   { c: PAL.mauve }],
+  [/duct|steel|iron|metal|fitting|pipe|vent/i,   { c: PAL.slate }],
+  [/cable|wire|rubber|tire|shadow/i,             { c: PAL.shadow }],
+  [/armor|plate|hull|panel/i,                    { c: PAL.peri }],
+  [/skin|face|hand|flesh/i,                      { c: PAL.pink }],
+  [/plant|leaf|moss|grass/i,                     { c: PAL.celadon }],
+  [/sky|city|backdrop/i,                         { c: PAL.sky }],
 ];
 // hash fallback cycles the quiet hues only — red and cyan stay rare
 const MTL_FALLBACK = [PAL.pink, PAL.rose, PAL.mauve, PAL.peri,
                       PAL.slate, PAL.celadon, PAL.mint, PAL.sand];
 function paintForName(name) {
-  for (const [re, c] of MTL_PAINT) if (re.test(name)) return c;
+  for (const [re, m] of MTL_PAINT) if (re.test(name)) return m;
   let h = 5381;
   for (let i = 0; i < name.length; i++) h = (h * 33 ^ name.charCodeAt(i)) >>> 0;
-  return MTL_FALLBACK[h % MTL_FALLBACK.length];
+  return { c: MTL_FALLBACK[h % MTL_FALLBACK.length] };
 }
 // deterministic per-region wash drift in [-1, 1) — an integer hash, not
 // a stream, so it can never disturb the rng/crng call ordering
@@ -984,7 +993,8 @@ function sizeMetrics(geom, stride, regionOf, nUnit) {
   return { enc, obj: om.map(encodeSize) };
 }
 
-function faceIdColors(geometry, perQuad, variation = 1.0, paintCol = null) {
+function faceIdColors(geometry, perQuad, variation = 1.0, paintCol = null,
+                      matAlpha = 1, matGlow = 0) {
   const geom = geometry.index ? geometry.toNonIndexed() : geometry;
   const count = geom.attributes.position.count;
   const colors = new Float32Array(count * 3);
@@ -1034,11 +1044,16 @@ function faceIdColors(geometry, perQuad, variation = 1.0, paintCol = null) {
   }
   geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
 
-  // ---- watercolor paint -----------------------------------------
-  // Display color rides its own attribute: the ID colors above are
-  // detection-only. Filled per face; regions never span OBJ material
-  // groups, so per-face fill is per-region-consistent automatically.
-  const pnt = new Uint8Array(count * 3);
+  // ---- watercolor paint + material properties -------------------
+  // Display color rides its own RGBA attribute: the ID colors above
+  // are detection-only. The A byte's meaning depends on which mesh
+  // the face lands in — translucent faces carry blend alpha, opaque
+  // faces carry 255 - glow*255 (so MSAA resolve interpolates glow
+  // linearly at boundaries). faceTrans records the routing, since the
+  // byte alone can't distinguish glass from glow.
+  const pnt = new Uint8Array(count * 4);
+  const nFacePaint = Math.ceil(count / step);
+  const faceTrans = new Uint8Array(nFacePaint);
   const gm = geometry.userData.groupMtl, fgp = geometry.userData.faceGroup;
   let paintOf = null;
   if (!paintCol && gm && fgp) {
@@ -1046,27 +1061,38 @@ function faceIdColors(geometry, perQuad, variation = 1.0, paintCol = null) {
     paintOf = f => cache[fgp[f * tpf]] ||
       (cache[fgp[f * tpf]] = paintForName(gm[fgp[f * tpf]] || ''));
   }
-  const flatPaint = paintCol || PAL.sand;
   // per-region wash drift: every region reads as its own brush pool.
   // Keyed on region id, so all faces of a region agree; a region never
   // spans OBJ material groups, so the cache stays color-consistent.
   const regJ = geom.userData.regions;
   const jAmt = P.regionJitter, jCache = new Map();
-  for (let f = 0, nf = Math.ceil(count / step); f < nf; f++) {
-    let c = paintOf ? paintOf(f) : flatPaint;
+  for (let f = 0; f < nFacePaint; f++) {
+    let c, ma, mg;
+    if (paintOf) {
+      const m = paintOf(f);
+      c = m.c; ma = m.a !== undefined ? m.a : 1; mg = m.e || 0;
+    } else {
+      c = paintCol || PAL.sand; ma = matAlpha; mg = matGlow;
+    }
     if (jAmt > 0) {
       const u = regJ ? regJ.region[f] : f;
       let jc = jCache.get(u);
       if (!jc) { jc = tint(c, washJitter(u) * jAmt); jCache.set(u, jc); }
       c = jc;
     }
+    const trans = ma < 1;
+    faceTrans[f] = trans ? 1 : 0;
+    const ab = trans ? Math.round(ma * 255) : 255 - Math.round(mg * 255);
     for (let j = 0; j < step; j++) {
       const i = f * step + j;
       if (i >= count) break;
-      pnt[i * 3] = c[0]; pnt[i * 3 + 1] = c[1]; pnt[i * 3 + 2] = c[2];
+      pnt[i * 4] = c[0]; pnt[i * 4 + 1] = c[1];
+      pnt[i * 4 + 2] = c[2]; pnt[i * 4 + 3] = ab;
     }
   }
-  geom.setAttribute('aPaint', new THREE.BufferAttribute(pnt, 3, true));
+  geom.userData.faceTrans = faceTrans;
+  geom.userData.step = step;             // mergeBag re-walks faces with this
+  geom.setAttribute('aPaint', new THREE.BufferAttribute(pnt, 4, true));
 
   // ---- feature-LOD sizes ----------------------------------------
   // One size per unit, where a unit is a region (or a bare face when
@@ -1135,10 +1161,10 @@ const idMaterial = new THREE.ShaderMaterial({
   vertexShader: /* glsl */`
     in vec3 aSizeRegion;
     in vec3 aSizeObject;
-    in vec3 aPaint;
+    in vec4 aPaint;
     uniform float uMetric, uUnit;
     out vec3 vCol;
-    out vec3 vPaint;
+    out vec4 vPaint;
     out float vSize;
     void main() {
       vCol = color;
@@ -1150,13 +1176,13 @@ const idMaterial = new THREE.ShaderMaterial({
   fragmentShader: /* glsl */`
     precision highp float;
     in vec3 vCol;
-    in vec3 vPaint;
+    in vec4 vPaint;
     in float vSize;
     layout(location = 0) out vec4 outID;     // ID color + encoded feature size
-    layout(location = 1) out vec4 outPaint;  // display color; alpha unused
+    layout(location = 1) out vec4 outPaint;  // color + alpha/glow byte
     void main() {
       outID = vec4(vCol, vSize);
-      outPaint = vec4(vPaint, 1.0);
+      outPaint = vPaint;
     }`,
 });
 const normalMaterial = new THREE.MeshNormalMaterial({ side: THREE.DoubleSide });
@@ -1233,6 +1259,7 @@ const lineMaterial = new THREE.ShaderMaterial({
    call), so tens of thousands of parts render like one object.
    ============================================================ */
 let sceneRoot = null, lineSegs = null, sceneSphere = null;
+let glassRoot = null, glassVertCount = 0, hasGlow = false;
 let triCount = 0, edgeCount = 0, regionCount = 0, lineVertCount = 0;
 // declared here, not with the budget meters: buildScene() runs at module
 // top-level well before that point and would hit the temporal dead zone
@@ -1254,6 +1281,15 @@ function withPaint(c, fn) {
 // mix a palette byte triple toward white (k > 0) or black (k < 0)
 const tint = (c, k) => c.map(v => Math.max(0, Math.min(255,
   Math.round(k > 0 ? v + (255 - v) * k : v * (1 + k)))));
+// material properties riding alongside currentPaint: alpha < 1 routes
+// geometry to the translucent layer, glow > 0 marks it emissive
+let currentAlpha = 1, currentGlow = 0;
+function withMat(c, alpha, glow, fn) {
+  const pc = currentPaint, pa = currentAlpha, pg = currentGlow;
+  currentPaint = c; currentAlpha = alpha; currentGlow = glow;
+  fn();
+  currentPaint = pc; currentAlpha = pa; currentGlow = pg;
+}
 
 // ---- merge machinery -----------------------------------------
 let bag = [];
@@ -1267,7 +1303,8 @@ function frameOf(x, y, z, rx = 0, ry = 0, rz = 0) {
 function put(frame, geom, x, y, z, rx = 0, ry = 0, rz = 0, variation = 1) {
   // triangulated imports opt out of quad pairing (blind pairing on a
   // tri mesh merges unrelated triangles and eats their shared edges)
-  const g = faceIdColors(geom, P.perQuad && !geom.userData.forceTri, variation, currentPaint);
+  const g = faceIdColors(geom, P.perQuad && !geom.userData.forceTri, variation,
+                         currentPaint, currentAlpha, currentGlow);
   g.applyMatrix4(frameOf(x, y, z, rx, ry, rz));
   if (frame) g.applyMatrix4(frame);
   bag.push(g);
@@ -1365,21 +1402,45 @@ function extractEdges(g, perQuad, store) {
 }
 
 function mergeBag() {
-  let total = 0;
-  for (const g of bag) total += g.attributes.position.count;
-  const pos = new Float32Array(total * 3), nor = new Float32Array(total * 3), col = new Float32Array(total * 3);
-  const szR = new Uint8Array(total * 3), szO = new Uint8Array(total * 3);
-  const pnt = new Uint8Array(total * 3);
-  const store = { pos: [], seed: [], szR: [], szO: [], edges: 0, overshoot: P.overshoot };
-  let o = 0, regions = 0;
+  // faces route to the opaque or translucent mesh by faceTrans — size
+  // the two destinations first (faces are contiguous runs of `step`
+  // vertices, so runs of same-destination faces copy in one set())
+  let totO = 0, totG = 0;
   for (const g of bag) {
-    pos.set(g.attributes.position.array, o * 3);
-    nor.set(g.attributes.normal.array, o * 3);
-    col.set(g.attributes.color.array, o * 3);
-    szR.set(g.attributes.aSizeRegion.array, o * 3);
-    szO.set(g.attributes.aSizeObject.array, o * 3);
-    pnt.set(g.attributes.aPaint.array, o * 3);
-    o += g.attributes.position.count;
+    const n = g.attributes.position.count, st = g.userData.step, ft = g.userData.faceTrans;
+    for (let f = 0, nf = Math.ceil(n / st); f < nf; f++) {
+      const vN = Math.min(st, n - f * st);
+      if (ft[f]) totG += vN; else totO += vN;
+    }
+  }
+  const mkDest = tot => ({
+    pos: new Float32Array(tot * 3), nor: new Float32Array(tot * 3),
+    col: new Float32Array(tot * 3), szR: new Uint8Array(tot * 3),
+    szO: new Uint8Array(tot * 3), pnt: new Uint8Array(tot * 4), o: 0,
+  });
+  const dO = mkDest(totO), dG = mkDest(totG);
+  const store = { pos: [], seed: [], szR: [], szO: [], edges: 0, overshoot: P.overshoot };
+  let regions = 0;
+  for (const g of bag) {
+    const n = g.attributes.position.count, st = g.userData.step, ft = g.userData.faceTrans;
+    const gp = g.attributes.position.array, gn = g.attributes.normal.array,
+          gc = g.attributes.color.array, gr = g.attributes.aSizeRegion.array,
+          go = g.attributes.aSizeObject.array, ga = g.attributes.aPaint.array;
+    for (let f = 0, nf = Math.ceil(n / st); f < nf;) {
+      const t = ft[f];
+      let f2 = f;
+      while (f2 < nf && ft[f2] === t) f2++;
+      const v0 = f * st, v1 = Math.min(f2 * st, n), vN = v1 - v0;
+      const d = t ? dG : dO;
+      d.pos.set(gp.subarray(v0 * 3, v1 * 3), d.o * 3);
+      d.nor.set(gn.subarray(v0 * 3, v1 * 3), d.o * 3);
+      d.col.set(gc.subarray(v0 * 3, v1 * 3), d.o * 3);
+      d.szR.set(gr.subarray(v0 * 3, v1 * 3), d.o * 3);
+      d.szO.set(go.subarray(v0 * 3, v1 * 3), d.o * 3);
+      d.pnt.set(ga.subarray(v0 * 4, v1 * 4), d.o * 4);
+      d.o += vN;
+      f = f2;
+    }
     if (g.userData.regions) regions += g.userData.regions.count;
     const te0 = performance.now();
     extractEdges(g, P.perQuad && !g.userData.forceTri, store);
@@ -1387,14 +1448,23 @@ function mergeBag() {
     g.dispose();
   }
   bag = [];
-  const merged = new THREE.BufferGeometry();
-  merged.setAttribute('position', new THREE.BufferAttribute(pos, 3));
-  merged.setAttribute('normal', new THREE.BufferAttribute(nor, 3));
-  merged.setAttribute('color', new THREE.BufferAttribute(col, 3));
-  merged.setAttribute('aSizeRegion', new THREE.BufferAttribute(szR, 3, true));
-  merged.setAttribute('aSizeObject', new THREE.BufferAttribute(szO, 3, true));
-  merged.setAttribute('aPaint', new THREE.BufferAttribute(pnt, 3, true));
-  triCount = total / 3;
+  // an opaque A byte below 255 marks emissive faces — gates the halo pass
+  hasGlow = false;
+  for (let i = 3; i < dO.pnt.length; i += 4)
+    if (dO.pnt[i] < 255) { hasGlow = true; break; }
+  const buildGeo = d => {
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(d.pos, 3));
+    geo.setAttribute('normal', new THREE.BufferAttribute(d.nor, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(d.col, 3));
+    geo.setAttribute('aSizeRegion', new THREE.BufferAttribute(d.szR, 3, true));
+    geo.setAttribute('aSizeObject', new THREE.BufferAttribute(d.szO, 3, true));
+    geo.setAttribute('aPaint', new THREE.BufferAttribute(d.pnt, 4, true));
+    return geo;
+  };
+  const merged = buildGeo(dO), mergedGlass = buildGeo(dG);
+  glassVertCount = totG;
+  triCount = (totO + totG) / 3;
   edgeCount = store.edges;
   regionCount = regions;
   lineVertCount = store.pos.length / 3;
@@ -1403,7 +1473,7 @@ function mergeBag() {
   lineGeom.setAttribute('aSeed', new THREE.BufferAttribute(new Float32Array(store.seed), 1));
   lineGeom.setAttribute('aSizeRegion', new THREE.BufferAttribute(new Uint8Array(store.szR), 3, true));
   lineGeom.setAttribute('aSizeObject', new THREE.BufferAttribute(new Uint8Array(store.szO), 3, true));
-  return { merged, lineGeom };
+  return { merged, mergedGlass, lineGeom };
 }
 
 // ---- small parts ---------------------------------------------
@@ -1553,16 +1623,29 @@ function cable(p1, p2, r = 0.07) {
     put(null, new THREE.TubeGeometry(curve, 36, r, 6), 0, 0, 0, 0, 0, 0, 0.8));
 }
 
+// demo pair every scene gets: a translucent cube and an emissive
+// sphere. Called LAST in each builder — put() consumes no rng, and
+// placing them after everything else keeps the crng color stream of
+// the existing geometry untouched.
+function demoMaterials(x, z) {
+  withMat(PAL.cyan, 0.45, 0, () =>
+    put(null, new THREE.BoxGeometry(3, 3, 3), x, 1.62, z, 0, 0.4, 0, 0.6));
+  withMat(PAL.amber, 1, 1, () =>
+    put(null, new THREE.SphereGeometry(1.6, 24, 18), x + 4.5, 1.72, z, 0, 0, 0, 0.6));
+}
+
 /* ---- the scene itself ---------------------------------------- */
 function buildScene() {
   const buildT0 = performance.now();
   tWeld = tRegion = tEdges = 0;
   if (sceneRoot) { sceneRoot.geometry.dispose(); scene.remove(sceneRoot); }
+  if (glassRoot) { glassRoot.geometry.dispose(); scene.remove(glassRoot); }
   if (lineSegs) { lineSegs.geometry.dispose(); scene.remove(lineSegs); }
   rng = mulberry32(P.seed);
   crng = mulberry32(P.seed ^ 0x9e3779b9);
   prng = mulberry32(P.seed ^ 0x5f356495);
-  currentPaint = null;                     // no paint state leaks across rebuilds
+  currentPaint = null;                     // no material state leaks across rebuilds
+  currentAlpha = 1; currentGlow = 0;
   bag = [];
   const D = P.density;
   if (P.scene === 'garden') buildGarden();
@@ -1726,6 +1809,7 @@ function buildYard(D) {
   // while red stays this rare.
   withPaint(PAL.red, () =>
     put(null, new THREE.TorusKnotGeometry(3.1, 0.95, 220, 20), 0, 13.5, 0, 0, 0, 0, 0.5));
+  if (!window.__noDemo) demoMaterials(26, -8);
 }
 
 /* ---- LOD garden: the same solids at three tessellation levels ---- */
@@ -1749,6 +1833,7 @@ function buildGarden() {
         put(null, rows[r][c2](), x, 4.6, z, 0, 0, 0, 0.6));
     }
   }
+  if (!window.__noDemo) demoMaterials(26, -8);
 }
 
 /* ---- primitives: a minimal debugging scene ---- */
@@ -1765,6 +1850,7 @@ function buildPrims() {
   put(null, new THREE.ConeGeometry(3, 7, 12, 3), 0, 3.5, -14, 0, 0, 0, 0.6);
   setPaint(PAL.slate);
   put(null, new THREE.TorusGeometry(3, 1, 10, 24), 0, 4, 14, 0, 0, 0, 0.6);
+  if (!window.__noDemo) demoMaterials(-16, -14);
 }
 
 /* ---- OBJ model scene: an actual editable model file ------------
@@ -1780,6 +1866,7 @@ function buildModel() {
   // .obj — and it parsed the file twice, which is real work on a big one.
   setPaint(null);   // imports color themselves by material name
   put(null, parseOBJ(currentObjText), 0, 0, 0, 0, 0.5, 0, 0.55);
+  if (!window.__noDemo) demoMaterials(14, 10);
 }
 
 function parseOBJ(text) {
@@ -1913,12 +2000,24 @@ function parseOBJ(text) {
 }
 
 function finishScene() {
-  const { merged, lineGeom } = mergeBag();
+  const { merged, mergedGlass, lineGeom } = mergeBag();
   merged.computeBoundingSphere();
   sceneSphere = merged.boundingSphere;   // drives the adaptive far plane
+  if (glassVertCount) {                  // expand it to cover the glass mesh
+    mergedGlass.computeBoundingSphere();
+    const gs = mergedGlass.boundingSphere;
+    if (merged.attributes.position.count === 0) sceneSphere = gs;
+    else {
+      const reach = sceneSphere.center.distanceTo(gs.center) + gs.radius;
+      if (reach > sceneSphere.radius) sceneSphere.radius = reach;
+    }
+  }
   sceneRoot = new THREE.Mesh(merged, idMaterial);
   sceneRoot.frustumCulled = false;
   scene.add(sceneRoot);
+  glassRoot = new THREE.Mesh(mergedGlass, idMaterial);
+  glassRoot.frustumCulled = false;
+  scene.add(glassRoot);
   lineSegs = new THREE.LineSegments(lineGeom, lineMaterial);
   lineSegs.frustumCulled = false;
   lineSegs.visible = false;
@@ -1941,6 +2040,8 @@ function makeTargetSet(scale) {
   const h = Math.floor(innerHeight * s);
   const depthTexture = new THREE.DepthTexture(w, h);
   depthTexture.type = THREE.UnsignedIntType;
+  const glassDepth = new THREE.DepthTexture(w, h);
+  glassDepth.type = THREE.UnsignedIntType;
   return {
     scale,
     // MRT: attachment 0 = face-ID + size, attachment 1 = paint (watercolor).
@@ -1952,15 +2053,34 @@ function makeTargetSet(scale) {
       depthTexture, depthBuffer: true,
       samples: P.msaa ? 4 : 0,
     }),
+    // the translucent layer: same shape, its OWN depth so the compose
+    // step can decide per pixel whether glass sits in front
+    rtGlass: new THREE.WebGLMultipleRenderTargets(w, h, 2, {
+      minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+      depthTexture: glassDepth, depthBuffer: true,
+      samples: P.msaa ? 4 : 0,
+    }),
     rtNormal: new THREE.WebGLRenderTarget(w, h, {
       minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
     }),
     rtInk: new THREE.WebGLRenderTarget(w, h, {
       minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
     }),
+    // quarter-res ping-pong pair for the emissive halo blur
+    rtGlowA: new THREE.WebGLRenderTarget(w >> 2, h >> 2, {
+      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+    }),
+    rtGlowB: new THREE.WebGLRenderTarget(w >> 2, h >> 2, {
+      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+    }),
   };
 }
-function disposeSet(t) { if (t) { t.rtID.dispose(); t.rtNormal.dispose(); t.rtInk.dispose(); } }
+function disposeSet(t) {
+  if (t) {
+    t.rtID.dispose(); t.rtGlass.dispose(); t.rtNormal.dispose();
+    t.rtInk.dispose(); t.rtGlowA.dispose(); t.rtGlowB.dispose();
+  }
+}
 function makeTargets() {
   disposeSet(targetsLo); disposeSet(targetsHi);
   if (rtScreen) rtScreen.dispose();
@@ -2008,6 +2128,11 @@ const post = new THREE.ShaderMaterial({
     inkTint: { value: 0 }, aerialFade: { value: 0 },
     invViewProj: { value: new THREE.Matrix4() },
     viewToWorldN: { value: new THREE.Matrix3() },
+    // glass & glow
+    tGlassID: { value: null }, tGlassPaint: { value: null }, tGlassDepth: { value: null },
+    tGlow: { value: null },
+    glassTint: { value: 0 }, glassLine: { value: 0 },
+    glowLift: { value: 0 }, haloStrength: { value: 0 },
   },
   vertexShader: /* glsl */`
     varying vec2 vUv;
@@ -2030,6 +2155,8 @@ const post = new THREE.ShaderMaterial({
     uniform float colorOn, washAmount, washScale, poolAmount, inkTint, aerialFade;
     uniform mat4 invViewProj;
     uniform mat3 viewToWorldN;
+    uniform sampler2D tGlassID, tGlassPaint, tGlassDepth, tGlow;
+    uniform float glassTint, glassLine, glowLift, haloStrength;
 
     // ---- helpers -------------------------------------------------
     float hash(vec2 p) {
@@ -2073,6 +2200,23 @@ const post = new THREE.ShaderMaterial({
              (cameraFar + cameraNear - ndc * (cameraFar - cameraNear));
     }
     vec3 normalAt(vec2 uv) { return texture2D(tNormal, uv).xyz * 2.0 - 1.0; }
+    float linDepthG(vec2 uv) {          // same, for the glass layer's depth
+      float z = texture2D(tGlassDepth, uv).x;
+      float ndc = z * 2.0 - 1.0;
+      return (2.0 * cameraNear * cameraFar) /
+             (cameraFar + cameraNear - ndc * (cameraFar - cameraNear));
+    }
+    // lean detector for the glass layer's own ID buffer: 4-direction
+    // color-step test (no LOD/one-sided/coverage — glass linework is
+    // sparse enough that the full machinery isn't worth its taps)
+    float glassInk(vec2 p, vec2 o) {
+      vec3 c = texture2D(tGlassID, p).rgb;
+      float d =        distance(c, texture2D(tGlassID, p + vec2(o.x, 0.)).rgb);
+      d = max(d, distance(c, texture2D(tGlassID, p - vec2(o.x, 0.)).rgb));
+      d = max(d, distance(c, texture2D(tGlassID, p + vec2(0., o.y)).rgb));
+      d = max(d, distance(c, texture2D(tGlassID, p - vec2(0., o.y)).rgb));
+      return smoothstep(idThreshold, idThreshold * 2.0, d);
+    }
     float lum(vec3 c) { return c.r + c.g + c.b; }
 
     // ---- feature LOD --------------------------------------------
@@ -2192,6 +2336,7 @@ const post = new THREE.ShaderMaterial({
       if (hatchOn > 0.5 && !sky) {
         vec3 n = normalAt(uv);
         float shade = clamp(dot(n, normalize(lightDir)), 0.0, 1.0);
+        float glowS = 1.0 - texture2D(tPaint, uv).a;   // emissive: no shading
         float hnf = 0.35 / hatchNoiseScale;
         if (shadeMode > 0.5) {
           // shadows in place of strokes, boundary pushed around by the
@@ -2207,7 +2352,8 @@ const post = new THREE.ShaderMaterial({
             // hard: binary — a pixel is shadowed or it is not, one flat level
             shadow = shadowAmount * step(shade + sn, hatchThreshold);
           }
-          shadow = min(shadow, 1.0);   // intensity 1 = pitch black, never past it
+          // intensity 1 = pitch black, never past it; lamps take none
+          shadow = min(shadow, 1.0) * (1.0 - glowS);
         } else {
         vec3 wn = normalize(viewToWorldN * n);
         vec3 an = abs(wn);
@@ -2226,8 +2372,9 @@ const post = new THREE.ShaderMaterial({
         float h1 = fract((hp.x * cos(a) + hp.y * sin(a)) / wSpace);
         float h2 = fract((hp.x * cos(a + 1.5708) + hp.y * sin(a + 1.5708)) / wSpace);
         // fade strokes out as their on-screen spacing compresses toward
-        // pixel size in the distance, instead of aliasing into moire
-        float hFade = 0.85 * smoothstep(2.5, 6.0, wSpace / max(wpx, 1e-6));
+        // pixel size in the distance, instead of aliasing into moire;
+        // emissive surfaces take no strokes at all
+        float hFade = 0.85 * smoothstep(2.5, 6.0, wSpace / max(wpx, 1e-6)) * (1.0 - glowS);
         // erosion: whole segments vanish where surface noise dips below
         // hatchBreak. At 0 this is a no-op (noise never goes negative);
         // each direction erodes independently so segments break up
@@ -2251,7 +2398,8 @@ const post = new THREE.ShaderMaterial({
         sl = max(sl, abs(shadowMaskAt(uv - vec2(so.x, 0.0)) - m0));
         sl = max(sl, abs(shadowMaskAt(uv + vec2(0.0, so.y)) - m0));
         sl = max(sl, abs(shadowMaskAt(uv - vec2(0.0, so.y)) - m0));
-        ink = max(ink, sl * shadowLine);
+        // lamps have no terminator to outline
+        ink = max(ink, sl * shadowLine * texture2D(tPaint, uv).a);
       }
 
       // falloff beyond 1: distance fade of ALL ink (edges + hatching)
@@ -2271,7 +2419,10 @@ const post = new THREE.ShaderMaterial({
       } else if (sky) {
         col = skyColor * (1.0 - paperGrain * 0.6 * grain);
       } else {
-        vec3 paint = texture2D(tPaint, uv).rgb;   // same wobbled uv as tID
+        vec4 pp = texture2D(tPaint, uv);          // same wobbled uv as tID
+        vec3 paint = pp.rgb;
+        float glow = 1.0 - pp.a;                  // emissive strength
+        float lit = 1.0 - glow;                   // pigment effects skip lamps
         // wash mottling: pigment noise anchored in WORLD space (via the
         // depth buffer), so it sits in the fills and stays put while the
         // camera moves. Three zero-mean octaves — broad wash unevenness,
@@ -2283,7 +2434,7 @@ const post = new THREE.ShaderMaterial({
         float m = pigment(wp, 0.45 / washScale, wpx)       * 0.55
                 + pigment(wp + 13.7, 1.7 / washScale, wpx) * 0.30
                 + pigment(wp + 41.3, 6.0 / washScale, wpx) * 0.15;
-        paint *= 1.0 - washAmount * m * 2.0;
+        paint *= 1.0 - washAmount * m * 2.0 * lit;
         // pigment pooling: the detector itself at ~3.5x line radius says
         // "near an edge"; world-anchored noise breaks the band up so it
         // reads as settled pigment rather than a halo. Inherits the
@@ -2291,17 +2442,46 @@ const post = new THREE.ShaderMaterial({
         if (poolAmount > 0.0) {
           float pool = inkTest(uv, o * 3.5, dC);
           pool *= 0.55 + 0.45 * vnoise3(wp * 3.0 + 7.3);
-          paint *= 1.0 - poolAmount * 0.30 * pool;
+          paint *= 1.0 - poolAmount * 0.30 * pool * lit;
         }
-        paint *= 1.0 - shadow;                    // hard/soft shadow modes
+        paint *= 1.0 - shadow;                    // hard/soft (already glow-gated)
         paint *= 1.0 - paperGrain * grain;        // grain hits fills like paper
+        // emissive lift toward a brighter version of the material's hue
+        // (mix, not clamp-always: glow 0 must leave paint bit-exact)
+        paint = mix(paint, min(paint * (1.0 + glowLift), vec3(1.0)), glow);
         // ink as a dark version of the local hue (blue-violet biased)
         vec3 inkT = mix(inkColor, paint * vec3(0.32, 0.30, 0.48), inkTint);
         col = mix(paint, inkT, clamp(ink, 0.0, 1.0));
         // aerial perspective: distance dissolves everything toward the
-        // sky. cameraFar hugs the scene sphere, so this is scene-relative.
+        // sky — except lamps, which keep glowing through the haze.
         col = mix(col, skyColor,
-                  aerialFade * smoothstep(cameraFar * 0.18, cameraFar * 0.9, dC));
+                  aerialFade * smoothstep(cameraFar * 0.18, cameraFar * 0.9, dC) * lit);
+      }
+
+      // ---- GLASS LAYER -------------------------------------------
+      // The translucent mesh lives in its own MRT so detection stays
+      // exact in both layers. Where its depth is nearer, blend its
+      // fill over everything (sky included) and draw its own lines.
+      float gD = linDepthG(uv);
+      if (gD < dC * 0.999) {
+        vec4 gp = texture2D(tGlassPaint, uv);
+        if (colorOn > 0.5) col = mix(col, gp.rgb, gp.a * glassTint);
+        vec3 gInk = colorOn > 0.5
+          ? mix(inkColor, gp.rgb * vec3(0.32, 0.30, 0.48), inkTint) : inkColor;
+        col = mix(col, gInk, glassInk(uv, o) * glassLine);
+      }
+      // ---- GLOW HALO — emission bleeds past the geometry ---------
+      // pull surrounding pixels toward the lamp's hue: pure screen
+      // blending has no headroom against light paper, but a colored
+      // light wash reads as glow on any background. haloStrength is
+      // forced to 0 by the JS side when no emissive faces exist.
+      if (haloStrength > 0.0 && colorOn > 0.5) {
+        vec3 halo = texture2D(tGlow, vUv).rgb;
+        float hMax = max(halo.r, max(halo.g, halo.b));
+        if (hMax > 0.003) {
+          vec3 hue = halo / hMax;                 // the lamp's own color
+          col = mix(col, hue, min(hMax * haloStrength, 1.0) * 0.85);
+        }
       }
       gl_FragColor = vec4(col, 1.0);
     }
@@ -2359,6 +2539,36 @@ const fxaaMat = new THREE.ShaderMaterial({
                                      + texture2D(tDiffuse, vUv + dir *  0.5).rgb);
       float lumaB = dot(rgbB, luma);
       gl_FragColor = vec4((lumaB < lumaMin || lumaB > lumaMax) ? rgbA : rgbB, 1.0);
+    }`,
+  depthTest: false, depthWrite: false,
+});
+// glow halo stages: pull emissive pixels out of the paint attachment
+// (A < 1 marks them), then a separable gaussian at quarter res
+const glowExtractMat = new THREE.ShaderMaterial({
+  uniforms: { tDiffuse: { value: null } },
+  vertexShader: blitVert,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    varying vec2 vUv; uniform sampler2D tDiffuse;
+    void main() {
+      vec4 p = texture2D(tDiffuse, vUv);
+      gl_FragColor = vec4(p.rgb * (1.0 - p.a), 1.0);
+    }`,
+  depthTest: false, depthWrite: false,
+});
+const blurMat = new THREE.ShaderMaterial({
+  uniforms: { tDiffuse: { value: null }, uDir: { value: new THREE.Vector2() } },
+  vertexShader: blitVert,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    varying vec2 vUv; uniform sampler2D tDiffuse; uniform vec2 uDir;
+    void main() {
+      vec3 c = texture2D(tDiffuse, vUv).rgb * 0.227;
+      c += (texture2D(tDiffuse, vUv + uDir).rgb       + texture2D(tDiffuse, vUv - uDir).rgb)       * 0.194;
+      c += (texture2D(tDiffuse, vUv + uDir * 2.0).rgb + texture2D(tDiffuse, vUv - uDir * 2.0).rgb) * 0.121;
+      c += (texture2D(tDiffuse, vUv + uDir * 3.0).rgb + texture2D(tDiffuse, vUv - uDir * 3.0).rgb) * 0.054;
+      c += (texture2D(tDiffuse, vUv + uDir * 4.0).rgb + texture2D(tDiffuse, vUv - uDir * 4.0).rgb) * 0.016;
+      gl_FragColor = vec4(c, 1.0);
     }`,
   depthTest: false, depthWrite: false,
 });
@@ -2641,6 +2851,12 @@ slider('hatchAngle', 'angle°', 0, 180, 1);
 slider('hatchNoise', 'noise', 0, 2, 0.02);
 slider('hatchNoiseScale', 'noise scale', 0.25, 4, 0.05);
 slider('hatchBreak', 'gaps', 0, 1, 0.01);
+section('glass & glow');
+slider('glassTint', 'glass tint', 0, 1, 0.01);
+slider('glassLine', 'glass lines', 0, 1, 0.01);
+slider('glowLift', 'glow lift', 0, 1, 0.01);
+slider('haloStrength', 'halo', 0, 1, 0.01);
+slider('haloSize', 'halo size', 0.25, 3, 0.05);
 section('watercolor');
 colorPick('skyColor', 'sky');
 slider('regionJitter', 'region jitter', 0, 0.25, 0.005, () => buildScene());
@@ -2711,9 +2927,11 @@ function shaderLoad() {
 // live render target. Targets scale with supersample squared, so they can
 // quietly outweigh the geometry at high settings.
 function gpuBytes() {
-  let b = triCount * 3 * 45 + lineVertCount * 22;   // see mergeBag attributes
-  // rtID has two color attachments (ID + paint) since the watercolor branch
-  const tgt = t => t ? t.rtID.width * t.rtID.height * (4 * 2 * (P.msaa ? 4 : 1) + 12) : 0;
+  let b = triCount * 3 * 46 + lineVertCount * 22;   // see mergeBag attributes
+  // two MRTs (ID + glass, 2 attachments each, msaa'd) + 2 depths +
+  // normal + ink + the 1/16-area glow pair
+  const tgt = t => t ? t.rtID.width * t.rtID.height *
+    (4 * 2 * (P.msaa ? 4 : 1) * 2 + 8 + 8 + 0.5) : 0;
   b += tgt(targetsLo) + tgt(targetsHi);
   if (rtScreen) b += rtScreen.width * rtScreen.height * 4;
   return b;
@@ -2721,7 +2939,8 @@ function gpuBytes() {
 // Geometry draws only — the fullscreen post passes aren't the interesting
 // number. One merged mesh, plus the normal pass or the vector line pass.
 function drawCalls() {
-  return P.vectorMode ? 2 : (P.hatchOn ? 2 : 1);
+  const glass = glassVertCount ? 1 : 0;
+  return P.vectorMode ? 2 + glass : (P.hatchOn ? 2 : 1) + glass;
 }
 const budgetList = document.getElementById('budgetList');
 for (const b of BUDGETS) {
@@ -2829,6 +3048,8 @@ function renderFrame(useHi) {
   if (P.vectorMode && !P.showIDs) {
     // ---- VECTOR PATH: paper fill occludes, real line geometry ----
     sceneRoot.material = fillMaterial;
+    glassRoot.material = fillMaterial;   // glass occludes as paper here
+    glassRoot.visible = true;
     fillMaterial.color.set(P.paperColor);
     const lu = lineMaterial.uniforms;
     lu.uInk.value.set(P.inkColor);
@@ -2848,26 +3069,42 @@ function renderFrame(useHi) {
     return;
   }
   sceneRoot.material = idMaterial;
+  glassRoot.material = idMaterial;
   idMaterial.uniforms.uMetric.value = mi;
   idMaterial.uniforms.uUnit.value = ui;
   lineSegs.visible = false;
+  glassRoot.visible = false;   // opaque passes never see the glass mesh
 
   const T = (useHi && targetsHi) ? targetsHi : targetsLo;
 
-  // pass 1: face-ID colors + depth
+  // pass 1a: face-ID colors + depth (opaque layer)
   renderer.setRenderTarget(T.rtID);
   renderer.setClearColor(0xffffff, 1);
   renderer.clear();
   scene.overrideMaterial = null;
   renderer.render(scene, camera);
 
+  // pass 1b: the translucent layer into its own MRT. Empty scenes just
+  // clear, which keeps the compose branches exact no-ops.
+  renderer.setRenderTarget(T.rtGlass);
+  renderer.clear();
+  if (glassVertCount) {
+    sceneRoot.visible = false;
+    glassRoot.visible = true;
+    renderer.render(scene, camera);
+    sceneRoot.visible = true;
+    glassRoot.visible = false;
+  }
+
   // debug view: show the ID buffer itself instead of inking it. This is what
   // the detector actually sees, so region grouping, similarity, buried-face
   // culling and overlapping geometry all become directly visible — a flat
   // block of colour is one region, and speckle is surfaces fighting.
   if (P.showIDs) {
-    // window.__showPaint = true in the console blits the paint attachment instead
-    copyMat.uniforms.tDiffuse.value = T.rtID.texture[window.__showPaint ? 1 : 0];
+    // window.__showPaint = true in the console blits the paint attachment
+    // instead; window.__showGlass = true swaps to the glass layer's MRT
+    const rt = window.__showGlass ? T.rtGlass : T.rtID;
+    copyMat.uniforms.tDiffuse.value = rt.texture[window.__showPaint ? 1 : 0];
     blitQuad.material = copyMat;
     renderer.setRenderTarget(null);
     renderer.render(blitScene, postCamera);
@@ -2875,6 +3112,7 @@ function renderFrame(useHi) {
   }
 
   // pass 2: view-space normals — only needed while hatching is on
+  // (glass is invisible here: the translucent layer takes no shading)
   if (P.hatchOn) {
     renderer.setRenderTarget(T.rtNormal);
     renderer.setClearColor(0x8080ff, 1);
@@ -2884,12 +3122,34 @@ function renderFrame(useHi) {
     scene.overrideMaterial = null;
   }
 
+  // pass 2b: glow halo — extract emissive pixels, blur at quarter res
+  if (hasGlow) {
+    glowExtractMat.uniforms.tDiffuse.value = T.rtID.texture[1];
+    blitQuad.material = glowExtractMat;
+    renderer.setRenderTarget(T.rtGlowA);
+    renderer.render(blitScene, postCamera);
+    blurMat.uniforms.tDiffuse.value = T.rtGlowA.texture;
+    blurMat.uniforms.uDir.value.set(P.haloSize / T.rtGlowA.width, 0);
+    blitQuad.material = blurMat;
+    renderer.setRenderTarget(T.rtGlowB);
+    renderer.render(blitScene, postCamera);
+    blurMat.uniforms.tDiffuse.value = T.rtGlowB.texture;
+    blurMat.uniforms.uDir.value.set(0, P.haloSize / T.rtGlowA.height);
+    renderer.setRenderTarget(T.rtGlowA);
+    renderer.render(blitScene, postCamera);
+  }
+
   // pass 3: ink
   const u = post.uniforms;
   u.tID.value = T.rtID.texture[0];
   u.tPaint.value = T.rtID.texture[1];
   u.tNormal.value = T.rtNormal.texture;
   u.tDepth.value = T.rtID.depthTexture;
+  u.tGlassID.value = T.rtGlass.texture[0];
+  u.tGlassPaint.value = T.rtGlass.texture[1];
+  u.tGlassDepth.value = T.rtGlass.depthTexture;
+  u.tGlow.value = T.rtGlowA.texture;
+  u.haloStrength.value = hasGlow ? P.haloStrength : 0;   // exact no-op without lamps
   u.resolution.value.set(T.rtID.width, T.rtID.height);
   u.lightDir.value.copy(_lv.copy(lightWorld).transformDirection(camera.matrixWorldInverse));
   u.inkColor.value.set(P.inkColor);
@@ -2898,7 +3158,8 @@ function renderFrame(useHi) {
     'wobbleAmp','wobbleFreq','hatchThreshold','crossThreshold',
     'hatchSpacing','hatchWidth','hatchAngle','hatchNoise','hatchNoiseScale',
     'hatchBreak','shadowAmount','shadowLine','shadowLineWidth',
-    'paperGrain','washAmount','washScale','poolAmount','inkTint','aerialFade']) u[k].value = P[k];
+    'paperGrain','washAmount','washScale','poolAmount','inkTint','aerialFade',
+    'glassTint','glassLine','glowLift']) u[k].value = P[k];
   u.shadeMode.value = P.shadeStyle === 'hard' ? 1 : (P.shadeStyle === 'soft' ? 2 : 0);
   // setRGB with raw bytes skips the linear conversion .set(hex) would do,
   // keeping the uniform in the same raw display space as the aPaint bytes

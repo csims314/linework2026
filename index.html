@@ -129,7 +129,7 @@ const P = {
   regionJitter: 0.07,
   // glass & glow: translucent-layer fill/line strength, emissive
   // brightness lift, and the halo bleeding past lamp silhouettes
-  glassTint: 0.51, glassLine: 1, glowLift: 0.5,
+  glassTint: 0.51, glassLine: 1, glassBackLine: 0.4, glowLift: 0.5,
   haloStrength: 1.9, haloSize: 3.75,
   // thin lines & AA
   oneSided: false, coverageAA: true, superSample: 1,
@@ -2060,6 +2060,14 @@ function makeTargetSet(scale) {
       depthTexture: glassDepth, depthBuffer: true,
       samples: P.msaa ? 4 : 0,
     }),
+    // glass again with front faces culled: the nearest BACK faces, so
+    // interior edges can be drawn through the glass
+    rtGlassBack: new THREE.WebGLMultipleRenderTargets(w, h, 2, {
+      minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+      depthTexture: (() => { const d = new THREE.DepthTexture(w, h); d.type = THREE.UnsignedIntType; return d; })(),
+      depthBuffer: true,
+      samples: P.msaa ? 4 : 0,
+    }),
     rtNormal: new THREE.WebGLRenderTarget(w, h, {
       minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
     }),
@@ -2077,8 +2085,8 @@ function makeTargetSet(scale) {
 }
 function disposeSet(t) {
   if (t) {
-    t.rtID.dispose(); t.rtGlass.dispose(); t.rtNormal.dispose();
-    t.rtInk.dispose(); t.rtGlowA.dispose(); t.rtGlowB.dispose();
+    t.rtID.dispose(); t.rtGlass.dispose(); t.rtGlassBack.dispose();
+    t.rtNormal.dispose(); t.rtInk.dispose(); t.rtGlowA.dispose(); t.rtGlowB.dispose();
   }
 }
 function makeTargets() {
@@ -2130,8 +2138,9 @@ const post = new THREE.ShaderMaterial({
     viewToWorldN: { value: new THREE.Matrix3() },
     // glass & glow
     tGlassID: { value: null }, tGlassPaint: { value: null }, tGlassDepth: { value: null },
+    tGlassBackID: { value: null }, tGlassBackDepth: { value: null },
     tGlow: { value: null },
-    glassTint: { value: 0 }, glassLine: { value: 0 },
+    glassTint: { value: 0 }, glassLine: { value: 0 }, glassBackLine: { value: 0 },
     glowLift: { value: 0 }, haloStrength: { value: 0 },
   },
   vertexShader: /* glsl */`
@@ -2156,7 +2165,8 @@ const post = new THREE.ShaderMaterial({
     uniform mat4 invViewProj;
     uniform mat3 viewToWorldN;
     uniform sampler2D tGlassID, tGlassPaint, tGlassDepth, tGlow;
-    uniform float glassTint, glassLine, glowLift, haloStrength;
+    uniform sampler2D tGlassBackID, tGlassBackDepth;
+    uniform float glassTint, glassLine, glassBackLine, glowLift, haloStrength;
 
     // ---- helpers -------------------------------------------------
     float hash(vec2 p) {
@@ -2206,6 +2216,12 @@ const post = new THREE.ShaderMaterial({
       return (2.0 * cameraNear * cameraFar) /
              (cameraFar + cameraNear - ndc * (cameraFar - cameraNear));
     }
+    float linDepthGB(vec2 uv) {         // and the glass BACK-face layer
+      float z = texture2D(tGlassBackDepth, uv).x;
+      float ndc = z * 2.0 - 1.0;
+      return (2.0 * cameraNear * cameraFar) /
+             (cameraFar + cameraNear - ndc * (cameraFar - cameraNear));
+    }
     // lean detector for the glass layer's own ID buffer: 4-direction
     // color-step test (no LOD/one-sided/coverage — glass linework is
     // sparse enough that the full machinery isn't worth its taps)
@@ -2215,6 +2231,14 @@ const post = new THREE.ShaderMaterial({
       d = max(d, distance(c, texture2D(tGlassID, p - vec2(o.x, 0.)).rgb));
       d = max(d, distance(c, texture2D(tGlassID, p + vec2(0., o.y)).rgb));
       d = max(d, distance(c, texture2D(tGlassID, p - vec2(0., o.y)).rgb));
+      return smoothstep(idThreshold, idThreshold * 2.0, d);
+    }
+    float glassInkB(vec2 p, vec2 o) {   // same test on the back-face layer
+      vec3 c = texture2D(tGlassBackID, p).rgb;
+      float d =        distance(c, texture2D(tGlassBackID, p + vec2(o.x, 0.)).rgb);
+      d = max(d, distance(c, texture2D(tGlassBackID, p - vec2(o.x, 0.)).rgb));
+      d = max(d, distance(c, texture2D(tGlassBackID, p + vec2(0., o.y)).rgb));
+      d = max(d, distance(c, texture2D(tGlassBackID, p - vec2(0., o.y)).rgb));
       return smoothstep(idThreshold, idThreshold * 2.0, d);
     }
     float lum(vec3 c) { return c.r + c.g + c.b; }
@@ -2468,6 +2492,12 @@ const post = new THREE.ShaderMaterial({
         if (colorOn > 0.5) col = mix(col, gp.rgb, gp.a * glassTint);
         vec3 gInk = colorOn > 0.5
           ? mix(inkColor, gp.rgb * vec3(0.32, 0.30, 0.48), inkTint) : inkColor;
+        // interior back-face edges, drawn first and dimmer: visible only
+        // through the glass (behind its front surface) and not blocked
+        // by opaque geometry sitting inside it
+        float gbD = linDepthGB(uv);
+        if (gbD > gD * 1.001 && gbD < dC * 0.999)
+          col = mix(col, gInk, glassInkB(uv, o) * glassBackLine);
         col = mix(col, gInk, glassInk(uv, o) * glassLine);
       }
       // ---- GLOW HALO — emission bleeds past the geometry ---------
@@ -2854,6 +2884,7 @@ slider('hatchBreak', 'gaps', 0, 1, 0.01);
 section('glass & glow');
 slider('glassTint', 'glass tint', 0, 1, 0.01);
 slider('glassLine', 'glass lines', 0, 1, 0.01);
+slider('glassBackLine', 'back edges', 0, 1, 0.01);
 slider('glowLift', 'glow lift', 0, 10, 0.05);
 slider('haloStrength', 'halo', 0, 10, 0.05);
 slider('haloSize', 'halo size', 0.25, 30, 0.25);
@@ -2928,10 +2959,10 @@ function shaderLoad() {
 // quietly outweigh the geometry at high settings.
 function gpuBytes() {
   let b = triCount * 3 * 46 + lineVertCount * 22;   // see mergeBag attributes
-  // two MRTs (ID + glass, 2 attachments each, msaa'd) + 2 depths +
-  // normal + ink + the 1/16-area glow pair
+  // three MRTs (ID, glass, glass-back; 2 attachments each, msaa'd) +
+  // 3 depths + normal + ink + the 1/16-area glow pair
   const tgt = t => t ? t.rtID.width * t.rtID.height *
-    (4 * 2 * (P.msaa ? 4 : 1) * 2 + 8 + 8 + 0.5) : 0;
+    (4 * 2 * (P.msaa ? 4 : 1) * 3 + 12 + 8 + 0.5) : 0;
   b += tgt(targetsLo) + tgt(targetsHi);
   if (rtScreen) b += rtScreen.width * rtScreen.height * 4;
   return b;
@@ -2939,8 +2970,8 @@ function gpuBytes() {
 // Geometry draws only — the fullscreen post passes aren't the interesting
 // number. One merged mesh, plus the normal pass or the vector line pass.
 function drawCalls() {
-  const glass = glassVertCount ? 1 : 0;
-  return P.vectorMode ? 2 + glass : (P.hatchOn ? 2 : 1) + glass;
+  const glass = glassVertCount ? (P.vectorMode ? 1 : 2) : 0;   // front + back layers
+  return (P.vectorMode ? 2 : (P.hatchOn ? 2 : 1)) + glass;
 }
 const budgetList = document.getElementById('budgetList');
 for (const b of BUDGETS) {
@@ -3084,14 +3115,23 @@ function renderFrame(useHi) {
   scene.overrideMaterial = null;
   renderer.render(scene, camera);
 
-  // pass 1b: the translucent layer into its own MRT. Empty scenes just
-  // clear, which keeps the compose branches exact no-ops.
+  // pass 1b/1c: the translucent layer into its own MRT — once as-is
+  // (nearest surface) and once with front faces culled (nearest BACK
+  // face), so interior edges can draw through the glass. Empty scenes
+  // just clear, which keeps the compose branches exact no-ops.
   renderer.setRenderTarget(T.rtGlass);
+  renderer.clear();
+  renderer.setRenderTarget(T.rtGlassBack);
   renderer.clear();
   if (glassVertCount) {
     sceneRoot.visible = false;
     glassRoot.visible = true;
+    renderer.setRenderTarget(T.rtGlass);
     renderer.render(scene, camera);
+    idMaterial.side = THREE.BackSide;
+    renderer.setRenderTarget(T.rtGlassBack);
+    renderer.render(scene, camera);
+    idMaterial.side = THREE.DoubleSide;
     sceneRoot.visible = true;
     glassRoot.visible = false;
   }
@@ -3148,6 +3188,8 @@ function renderFrame(useHi) {
   u.tGlassID.value = T.rtGlass.texture[0];
   u.tGlassPaint.value = T.rtGlass.texture[1];
   u.tGlassDepth.value = T.rtGlass.depthTexture;
+  u.tGlassBackID.value = T.rtGlassBack.texture[0];
+  u.tGlassBackDepth.value = T.rtGlassBack.depthTexture;
   u.tGlow.value = T.rtGlowA.texture;
   u.haloStrength.value = hasGlow ? P.haloStrength : 0;   // exact no-op without lamps
   u.resolution.value.set(T.rtID.width, T.rtID.height);
@@ -3159,7 +3201,7 @@ function renderFrame(useHi) {
     'hatchSpacing','hatchWidth','hatchAngle','hatchNoise','hatchNoiseScale',
     'hatchBreak','shadowAmount','shadowLine','shadowLineWidth',
     'paperGrain','washAmount','washScale','poolAmount','inkTint','aerialFade',
-    'glassTint','glassLine','glowLift']) u[k].value = P[k];
+    'glassTint','glassLine','glassBackLine','glowLift']) u[k].value = P[k];
   u.shadeMode.value = P.shadeStyle === 'hard' ? 1 : (P.shadeStyle === 'soft' ? 2 : 0);
   // setRGB with raw bytes skips the linear conversion .set(hex) would do,
   // keeping the uniform in the same raw display space as the aPaint bytes

@@ -87,7 +87,7 @@ const P = {
   // edge extraction — face-ID only: every face boundary is a line
   idThreshold: 0.005,
   // region grouping: neighbors that share a color draw no line between them
-  regionGroup: true, similarity: 0.1,
+  regionGroup: true, similarity: 0.7,
   // self-overlap contours from the normal buffer: ink where visible
   // surface orientation jumps discontinuously (a fold crossing itself),
   // which the ID detector can't see inside a single region. 0 = off.
@@ -104,14 +104,19 @@ const P = {
   cullBuried: false,
   // line look
   lineWidth: 0.5, distanceFalloff: 1.25,
-  wobbleAmp: 1.1, wobbleFreq: 0.08,
+  wobbleAmp: 0, wobbleFreq: 0.08,
   // shading (hatch strokes or flat shadows)
   hatchOn: true, hatchThreshold: 0.45, crossThreshold: 0.02,
   hatchSpacing: 10.0, hatchWidth: 0.05, hatchAngle: 45,
-  // cast shadows: one directional sun. Direction sliders re-render the
-  // shadow map only on change; orbit animates the azimuth.
+  // cast shadows: one directional sun. The map re-renders only when the
+  // light moves or the camera shifts its fitted light window; a still
+  // view is as cheap as a baked map. Orbit animates the azimuth.
   castShadow: true, lightAzimuth: 303, lightElevation: 50,
-  lightOrbit: false, shadowBias: 0.0015, shadowRes: '2048',
+  // shadowSmoothPx simplifies the cast-shadow silhouette: the shadow
+  // mask is blurred by this many screen pixels and re-thresholded at
+  // 50%, twice — features smaller than the radius vanish and corners
+  // round into painted lobes. 0 = exact geometry (single-tap path).
+  lightOrbit: false, shadowBias: 0.0015, shadowRes: '2048', shadowSmoothPx: 12,
   // stroke breakup: displacement noise amount (past ~1 strokes start
   // folding into stipple — allowed, it reads as dry-brush) and the
   // world-space feature size of that noise. hatchBreak erodes strokes
@@ -141,11 +146,14 @@ const P = {
   haloStrength: 1.9, haloSize: 3.75,
   // thin lines & AA
   oneSided: false, coverageAA: true, superSample: 1,
-  msaa: true, fxaa: true, vectorMode: false, progressive: false,
+  msaa: false, fxaa: true, vectorMode: false, progressive: false,
   // vector style (only affects vector mode)
   overshoot: 0.05, inkVary: 0.3,
   // camera: orbit around a target, or free-floating WASD/QE flight
   flyMode: false, flySpeed: 1,
+  // player: third-person character + rideable hoverbike
+  playerMode: false, walkSpeed: 1, driveSpeed: 1,
+  camDist: 9, camHeight: 1.6, collision: false,
   // scene
   scene: 'yard', perQuad: false, autoRotate: false, seed: 7, density: 2.5,
 };
@@ -199,6 +207,7 @@ const PAL = {
   red:       hex2u8('#C94F4A'),  // THE accent — one hero object per scene
   shadow:    hex2u8('#4A4C6E'),  // cables, railings, ladders
   amber:     hex2u8('#E8A33D'),  // emissive — lamps, glow, embers
+  emerald:   hex2u8('#5FD98A'),  // emissive — reactors, power cells
 };
 // imported models: usemtl (or o/g) names -> material, keyword match
 // first. Entries are {c, a?, e?}: a < 1 routes to the translucent
@@ -207,6 +216,7 @@ const PAL = {
 const MTL_PAINT = [
   [/glow|ember|neon|lamp/i,                      { c: PAL.amber, e: 1 }],
   [/phosphor|crt|screen/i,                       { c: PAL.cyan, e: 1 }],
+  [/energy|reactor|plasma|fusion|cell/i,         { c: PAL.emerald, e: 1 }],
   [/glass|window|canopy/i,                       { c: PAL.cyan, a: 0.45 }],
   [/wood|plank|floor|linen|plaster|paper|card/i, { c: PAL.sand }],
   [/cloth|velour|sofa|jacket|fabric|curtain/i,   { c: PAL.mauve }],
@@ -1412,12 +1422,15 @@ function extractEdges(g, perQuad, store) {
   }
 }
 
-function mergeBag() {
+// core of the scene merge, reusable for dynamic actors: consumes an
+// explicit list (disposing its geometries) and reports counters via
+// stats instead of writing the module-level budget globals.
+function mergeBagArray(list, opts = {}) {
   // faces route to the opaque or translucent mesh by faceTrans — size
   // the two destinations first (faces are contiguous runs of `step`
   // vertices, so runs of same-destination faces copy in one set())
   let totO = 0, totG = 0;
-  for (const g of bag) {
+  for (const g of list) {
     const n = g.attributes.position.count, st = g.userData.step, ft = g.userData.faceTrans;
     for (let f = 0, nf = Math.ceil(n / st); f < nf; f++) {
       const vN = Math.min(st, n - f * st);
@@ -1432,7 +1445,7 @@ function mergeBag() {
   const dO = mkDest(totO), dG = mkDest(totG);
   const store = { pos: [], seed: [], szR: [], szO: [], edges: 0, overshoot: P.overshoot };
   let regions = 0;
-  for (const g of bag) {
+  for (const g of list) {
     const n = g.attributes.position.count, st = g.userData.step, ft = g.userData.faceTrans;
     const gp = g.attributes.position.array, gn = g.attributes.normal.array,
           gc = g.attributes.color.array, gr = g.attributes.aSizeRegion.array,
@@ -1455,14 +1468,13 @@ function mergeBag() {
     if (g.userData.regions) regions += g.userData.regions.count;
     const te0 = performance.now();
     extractEdges(g, P.perQuad && !g.userData.forceTri, store);
-    tEdges += performance.now() - te0;
+    if (opts.timing !== false) tEdges += performance.now() - te0;
     g.dispose();
   }
-  bag = [];
   // an opaque A byte below 255 marks emissive faces — gates the halo pass
-  hasGlow = false;
+  let glow = false;
   for (let i = 3; i < dO.pnt.length; i += 4)
-    if (dO.pnt[i] < 255) { hasGlow = true; break; }
+    if (dO.pnt[i] < 255) { glow = true; break; }
   const buildGeo = d => {
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.BufferAttribute(d.pos, 3));
@@ -1474,17 +1486,16 @@ function mergeBag() {
     return geo;
   };
   const merged = buildGeo(dO), mergedGlass = buildGeo(dG);
-  glassVertCount = totG;
-  triCount = (totO + totG) / 3;
-  edgeCount = store.edges;
-  regionCount = regions;
-  lineVertCount = store.pos.length / 3;
   const lineGeom = new THREE.BufferGeometry();
   lineGeom.setAttribute('position', new THREE.BufferAttribute(new Float32Array(store.pos), 3));
   lineGeom.setAttribute('aSeed', new THREE.BufferAttribute(new Float32Array(store.seed), 1));
   lineGeom.setAttribute('aSizeRegion', new THREE.BufferAttribute(new Uint8Array(store.szR), 3, true));
   lineGeom.setAttribute('aSizeObject', new THREE.BufferAttribute(new Uint8Array(store.szO), 3, true));
-  return { merged, mergedGlass, lineGeom };
+  const stats = {
+    glassVerts: totG, tris: (totO + totG) / 3, edges: store.edges,
+    regions, lineVerts: store.pos.length / 3, hasGlow: glow,
+  };
+  return { merged, mergedGlass, lineGeom, stats };
 }
 
 // ---- small parts ---------------------------------------------
@@ -1669,6 +1680,9 @@ function buildScene() {
   }
   else buildYard(D);
   finishScene();
+  // yard floor plates top out at 0.12; every other scene walks at 0
+  groundDatum = P.scene === 'yard' ? 0.12 : 0;
+  regroundActors();
   lastBuildMs = performance.now() - buildT0;
 }
 
@@ -2012,7 +2026,14 @@ function parseOBJ(text) {
 }
 
 function finishScene() {
-  const { merged, mergedGlass, lineGeom } = mergeBag();
+  const { merged, mergedGlass, lineGeom, stats } = mergeBagArray(bag);
+  bag = [];
+  glassVertCount = stats.glassVerts;
+  triCount = stats.tris;
+  edgeCount = stats.edges;
+  regionCount = stats.regions;
+  lineVertCount = stats.lineVerts;
+  hasGlow = stats.hasGlow;
   merged.computeBoundingSphere();
   sceneSphere = merged.boundingSphere;   // drives the adaptive far plane
   if (glassVertCount) {                  // expand it to cover the glass mesh
@@ -2036,6 +2057,216 @@ function finishScene() {
   scene.add(lineSegs);
   markDirty();
 }
+
+/* ============================================================
+   Player + hoverbike: dynamic actors on top of the merged scene.
+   Actors are built with put() so they carry the baked face-ID /
+   size / paint attributes idMaterial needs, then merged into their
+   OWN mesh and moved as normal Object3Ds — the shaders transform by
+   modelViewMatrix, so only the scene merge required world-space
+   baking, not the materials.
+   ============================================================ */
+// ---- ground query: swappable flat-vs-raycast implementations ----
+let groundDatum = 0;               // per-scene walk height, set by buildScene()
+const _rayDown = new THREE.Vector3(0, -1, 0);
+const _rayOrg = new THREE.Vector3(), _rayDir = new THREE.Vector3();
+const _ray = new THREE.Raycaster();
+function groundHeightFlat(x, z, curY) { return groundDatum; }
+// full collision: rays against the merged scene mesh. O(triangles) per ray
+// (no BVH), so it's opt-in; this hook is the seam where a baked heightfield
+// or three-mesh-bvh drops in if it ever gets too slow.
+function groundHeightRay(x, z, curY) {
+  if (!sceneRoot) return groundDatum;
+  _ray.set(_rayOrg.set(x, curY + 2.5, z), _rayDown);
+  const hit = _ray.intersectObject(sceneRoot, false)[0];
+  return hit ? hit.point.y : groundDatum;
+}
+let groundHeight = groundHeightFlat;
+function resolveMoveFree(pos, dx, dz, out) { return out.set(dx, 0, dz); }
+function resolveMoveBlocked(pos, dx, dz, out) {
+  out.set(dx, 0, dz);
+  const len = Math.hypot(dx, dz);
+  if (!sceneRoot || len < 1e-6) return out;
+  // knee-height ray along the move: stop at walls and machinery
+  _ray.set(_rayOrg.set(pos.x, pos.y + 0.45, pos.z),
+           _rayDir.set(dx / len, 0, dz / len));
+  _ray.far = len + 0.4;
+  const hit = _ray.intersectObject(sceneRoot, false)[0];
+  _ray.far = Infinity;
+  if (hit) out.set(0, 0, 0);
+  return out;
+}
+let resolveMove = resolveMoveFree;
+function swapGroundImpl() {
+  groundHeight = P.collision ? groundHeightRay : groundHeightFlat;
+  resolveMove = P.collision ? resolveMoveBlocked : resolveMoveFree;
+}
+
+// ---- dynamic actor factory ----
+const actors = [];
+function buildActor(builderFn, seed) {
+  // swap the merge globals out so the scene's bag/crng/paint streams
+  // are untouched no matter when an actor gets built
+  const prevBag = bag, prevCrng = crng;
+  const pc = currentPaint, pa = currentAlpha, pg = currentGlow;
+  bag = []; crng = mulberry32(seed);
+  builderFn();
+  const mine = bag;
+  bag = prevBag; crng = prevCrng;
+  currentPaint = pc; currentAlpha = pa; currentGlow = pg;
+  const { merged, mergedGlass, lineGeom } = mergeBagArray(mine, { timing: false });
+  mergedGlass.dispose();               // actors are opaque-only
+  const group = new THREE.Group();
+  const mesh = new THREE.Mesh(merged, idMaterial);
+  mesh.frustumCulled = false;
+  // vector-mode line verts intentionally uncounted in the budget meter
+  const lines = new THREE.LineSegments(lineGeom, lineMaterial);
+  lines.frustumCulled = false;
+  lines.visible = false;
+  group.add(mesh, lines);
+  scene.add(group);
+  const a = { group, mesh, lines };
+  actors.push(a);
+  return a;
+}
+
+// ---- the two actors + their state ----
+// player state machine: 'onFoot' <-> 'riding', transitions only in
+// tryMountToggle(). yaw 0 faces -z, matching the fly convention.
+const player = { state: 'onFoot', pos: new THREE.Vector3(6, 0, 8), yaw: 0, speed: 0, bobT: 0 };
+const bike = { pos: new THREE.Vector3(10, 0, 2), yaw: 0.6, speed: 0, hoverT: 0 };
+let playerActor = null, bikeActor = null;
+const _mv = new THREE.Vector3(), _seat = new THREE.Vector3();
+const UP_Y = new THREE.Vector3(0, 1, 0);
+const BIKE_HOVER = 0.55;
+
+// primitive placeholder robot: ~1.8 units tall, feet at y=0, facing -z
+function buildPlayerGeom() {
+  const B = (w, h, d) => new THREE.BoxGeometry(w, h, d);
+  withPaint(PAL.slate, () => {
+    put(null, B(0.20, 0.72, 0.26), -0.14, 0.36, 0, 0, 0, 0, 0.7);      // legs
+    put(null, B(0.20, 0.72, 0.26), 0.14, 0.36, 0, 0, 0, 0, 0.7);
+    put(null, B(0.15, 0.55, 0.18), -0.43, 1.12, 0, 0, 0, 0.08, 0.7);   // arms
+    put(null, B(0.15, 0.55, 0.18), 0.43, 1.12, 0, 0, 0, -0.08, 0.7);
+  });
+  withPaint(PAL.deepSlate, () => {
+    put(null, B(0.46, 0.20, 0.30), 0, 0.82, 0, 0, 0, 0, 0.7);          // hips
+    put(null, B(0.24, 0.10, 0.36), -0.14, 0.05, -0.03, 0, 0, 0, 0.7);  // feet
+    put(null, B(0.24, 0.10, 0.36), 0.14, 0.05, -0.03, 0, 0, 0, 0.7);
+  });
+  withPaint(PAL.peri, () => {
+    put(null, B(0.54, 0.60, 0.32), 0, 1.24, 0, 0, 0, 0, 0.8);          // torso
+    put(null, new THREE.SphereGeometry(0.13, 10, 8), -0.36, 1.5, 0, 0, 0, 0, 0.6);
+    put(null, new THREE.SphereGeometry(0.13, 10, 8), 0.36, 1.5, 0, 0, 0, 0, 0.6);
+  });
+  withPaint(PAL.sand, () => {
+    put(null, B(0.40, 0.32, 0.05), 0, 1.28, -0.17, 0, 0, 0, 0.65);     // chest plate
+    put(null, new THREE.SphereGeometry(0.17, 12, 9), 0, 1.70, 0, 0, 0, 0, 0.65); // head
+  });
+  withPaint(PAL.cyan, () =>
+    put(null, B(0.24, 0.07, 0.06), 0, 1.72, -0.15, 0, 0, 0, 0.6));     // visor
+}
+// the embedded desert speeder (modeled nose -x after import centering),
+// scaled from its 16-unit import size to hoverbike scale and rotated so
+// the nose faces -z like every other actor
+function buildBikeGeom() {
+  setPaint(null);                       // color by material name
+  const g = parseOBJ(EMBEDDED_OBJ);
+  g.applyMatrix4(new THREE.Matrix4().makeScale(0.28, 0.28, 0.28));
+  put(null, g, 0, 0, 0, 0, -Math.PI / 2, 0, 0.55);
+}
+
+function applyActorTransforms() {
+  if (!playerActor) return;
+  bikeActor.group.position.copy(bike.pos);
+  bikeActor.group.rotation.set(0, bike.yaw, 0);
+  if (player.state === 'riding') {
+    _seat.set(0, 0.85, 0.35).applyAxisAngle(UP_Y, bike.yaw);
+    playerActor.group.position.copy(bike.pos).add(_seat);
+    playerActor.group.rotation.set(0, bike.yaw, 0);
+  } else {
+    const bob = Math.sin(player.bobT * 8) * 0.05 * Math.min(1, player.speed / 2);
+    playerActor.group.position.set(player.pos.x, player.pos.y + bob, player.pos.z);
+    playerActor.group.rotation.set(0, player.yaw, 0);
+  }
+}
+
+// the greebled scenes have machinery on many plates and the layout moves
+// with the seed, so no fixed spawn is safe: spiral outward probing with a
+// down-ray until the probe lands at walk height instead of on a roof.
+// One-time cost (spawn / rebuild only) — never per frame.
+function findClearSpot(x, z) {
+  for (let ring = 0; ring < 6; ring++) {
+    const n = Math.max(1, ring * 8);
+    for (let i = 0; i < n; i++) {
+      const a = (i / n) * Math.PI * 2;
+      const cx = x + Math.cos(a) * ring * 4.75, cz = z + Math.sin(a) * ring * 4.75;
+      if (groundHeightRay(cx, cz, 40) <= groundDatum + 0.3) return { x: cx, z: cz };
+    }
+  }
+  return { x, z };
+}
+
+function placeActorsAtSpawn() {
+  const ps = findClearSpot(6, 8);
+  player.pos.set(ps.x, groundDatum, ps.z);
+  player.state = 'onFoot';
+  const bs = findClearSpot(ps.x + 4.75, ps.z - 4.75);
+  bike.pos.set(bs.x, groundDatum + BIKE_HOVER, bs.z);
+  bike.speed = 0;
+  bike.yaw = Math.atan2(-(bs.x - ps.x), -(bs.z - ps.z)) + Math.PI / 2; // parked side-on
+  applyActorTransforms();
+  shadowDirty = true;
+}
+
+function regroundActors() {
+  if (!playerActor) return;
+  // scene changed under us: if the old spot is now inside machinery,
+  // respawn somewhere clear; otherwise just re-seat on the new datum
+  // while riding, player.pos is stale (transforms come from the bike) —
+  // keep the pair together before probing
+  if (player.state === 'riding') { player.pos.x = bike.pos.x; player.pos.z = bike.pos.z; }
+  if (groundHeightRay(player.pos.x, player.pos.z, 40) > groundDatum + 0.3) {
+    placeActorsAtSpawn();               // respawns on foot at a clear spot
+    return;
+  }
+  if (player.state !== 'riding' &&
+      groundHeightRay(bike.pos.x, bike.pos.z, 40) > groundDatum + 0.3) {
+    const bs = findClearSpot(player.pos.x + 4.75, player.pos.z - 4.75);
+    bike.pos.set(bs.x, groundDatum + BIKE_HOVER, bs.z);
+  }
+  player.pos.y = groundHeight(player.pos.x, player.pos.z, player.pos.y + 1);
+  bike.speed = 0;
+  bike.pos.y = groundHeight(bike.pos.x, bike.pos.z, bike.pos.y + 1) + BIKE_HOVER;
+  applyActorTransforms();
+  shadowDirty = true;
+}
+
+function spawnActors() {
+  if (playerActor) return;
+  playerActor = buildActor(buildPlayerGeom, 0xB0B0 ^ P.seed);
+  bikeActor = buildActor(buildBikeGeom, 0x51CE ^ P.seed);
+  placeActorsAtSpawn();
+}
+
+function tryMountToggle() {
+  if (!playerActor) return;
+  if (player.state === 'riding') {
+    player.state = 'onFoot';
+    // dismount to the bike's right side
+    player.pos.set(bike.pos.x + Math.cos(bike.yaw) * 2, 0,
+                   bike.pos.z - Math.sin(bike.yaw) * 2);
+    player.pos.y = groundHeight(player.pos.x, player.pos.z, bike.pos.y);
+    player.yaw = bike.yaw;
+    player.speed = 0;
+  } else if (player.pos.distanceTo(bike.pos) < 3.5) {
+    player.state = 'riding';
+  }
+  applyActorTransforms();
+  shadowDirty = true;
+  markDirty();
+}
+
 buildScene();
 
 /* ============================================================
@@ -2093,12 +2324,22 @@ function makeTargetSet(scale) {
     rtGlowB: new THREE.WebGLRenderTarget(w >> 2, h >> 2, {
       minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
     }),
+    // half-res ping-pong pair for the cast-shadow silhouette smoothing
+    // (mask -> blur -> re-threshold); linear filter so the main pass
+    // upsamples the final field smoothly
+    rtMaskA: new THREE.WebGLRenderTarget(w >> 1, h >> 1, {
+      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+    }),
+    rtMaskB: new THREE.WebGLRenderTarget(w >> 1, h >> 1, {
+      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+    }),
   };
 }
 function disposeSet(t) {
   if (t) {
     t.rtID.dispose(); t.rtGlass.dispose(); t.rtGlassBack.dispose();
     t.rtNormal.dispose(); t.rtInk.dispose(); t.rtGlowA.dispose(); t.rtGlowB.dispose();
+    t.rtMaskA.dispose(); t.rtMaskB.dispose();
   }
 }
 function makeTargets() {
@@ -2124,6 +2365,11 @@ function makeShadowTarget() {
   const res = +P.shadowRes;
   const d = new THREE.DepthTexture(res, res);
   d.type = THREE.UnsignedIntType;
+  // compare mode + linear filtering = hardware PCF: each lookup is a
+  // bilinear 4-tap depth comparison (sampler2DShadow in the post shader)
+  d.compareFunction = THREE.LessCompare;
+  d.minFilter = THREE.LinearFilter;
+  d.magFilter = THREE.LinearFilter;
   rtShadow = new THREE.WebGLRenderTarget(res, res, {
     minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
     depthTexture: d, depthBuffer: true,
@@ -2176,7 +2422,9 @@ const post = new THREE.ShaderMaterial({
     glowLift: { value: 0 }, haloStrength: { value: 0 },
     contourLine: { value: 0 }, contourCos: { value: 0 },
     tShadow: { value: null }, lightVP: { value: new THREE.Matrix4() },
-    castOn: { value: 0 }, shadowBias: { value: 0 }, shadowRes: { value: 2048 },
+    castOn: { value: 0 }, shadowBias: { value: 0 },
+    shadowWobUv: { value: new THREE.Vector2() },
+    tCastMask: { value: null }, castSmoothOn: { value: 0 }, castBand: { value: 0.2 },
   },
   vertexShader: /* glsl */`
     varying vec2 vUv;
@@ -2203,9 +2451,12 @@ const post = new THREE.ShaderMaterial({
     uniform sampler2D tGlassBackID, tGlassBackDepth;
     uniform float glassTint, glassLine, glassBackLine, glowLift, haloStrength;
     uniform float contourLine, contourCos;
-    uniform sampler2D tShadow;
+    uniform highp sampler2DShadow tShadow;
     uniform mat4 lightVP;
-    uniform float castOn, shadowBias, shadowRes;
+    uniform float castOn, shadowBias;
+    uniform vec2 shadowWobUv;   // wobble amplitude: fixed world size -> window UV
+    uniform sampler2D tCastMask;            // blurred + re-thresholded shadow mask
+    uniform float castSmoothOn, castBand;
 
     // ---- helpers -------------------------------------------------
     float hash(vec2 p) {
@@ -2365,7 +2616,8 @@ const post = new THREE.ShaderMaterial({
 
     // cast-shadow test in the sun's orthographic light space. Edges are
     // wobbled by the same surface-anchored noise the strokes use, so
-    // cast shadow shapes read as hand-painted. Returns 1 = blocked.
+    // cast shadow shapes read as hand-painted. Returns 1 = blocked;
+    // the boundary itself is a fractional ~sub-texel antialiased ramp.
     float castAt(vec3 w) {
       if (castOn < 0.5) return 0.0;
       vec4 lp = lightVP * vec4(w, 1.0);
@@ -2374,8 +2626,20 @@ const post = new THREE.ShaderMaterial({
         return 0.0;
       float hnf = 0.35 / hatchNoiseScale;
       sc.xy += (vec2(vnoise3(w * hnf), vnoise3(w * hnf + 40.0)) - 0.5)
-               * hatchNoise * 8.0 / shadowRes;
-      return step(texture2D(tShadow, sc.xy).x + shadowBias, sc.z);
+               * hatchNoise * shadowWobUv;
+      // hardware-PCF compare gives a one-texel linear ramp across the
+      // boundary; the narrow smoothstep re-hardens it into a crisp
+      // antialiased edge instead of a nearest-tap texel staircase
+      float lit = texture2D(tShadow, vec3(sc.xy, sc.z - shadowBias));
+      return smoothstep(0.3, 0.7, 1.0 - lit);
+    }
+
+    // smoothed-silhouette path: the blurred + re-thresholded mask field.
+    // The 50% level-set of a smooth field is a smooth curve — small
+    // features are gone and corners are rounded before we ever get here;
+    // the narrow band just re-hardens the edge with ~a pixel of AA.
+    float castMaskAt(vec2 p) {
+      return smoothstep(0.5 - castBand, 0.5 + castBand, texture2D(tCastMask, p).r);
     }
 
     // the shading test as a reusable mask, so shadow boundaries can be
@@ -2386,7 +2650,7 @@ const post = new THREE.ShaderMaterial({
       vec3 n = normalAt(p);
       float shade = clamp(dot(n, normalize(lightDir)), 0.0, 1.0);
       vec3 w = worldAt(p);
-      shade = min(shade, 1.0 - castAt(w));
+      shade = min(shade, 1.0 - (castSmoothOn > 0.5 ? castMaskAt(p) : castAt(w)));
       float sn = (vnoise3(w * (0.35 / hatchNoiseScale)) - 0.5) * hatchNoise * 0.3;
       return step(shade + sn, hatchThreshold);
     }
@@ -2447,7 +2711,9 @@ const post = new THREE.ShaderMaterial({
         // cast shadows: a blocked pixel is fully in shadow, and every
         // style downstream (hard step, soft ramp, hatch strokes) treats
         // it that way automatically
-        shade = min(shade, 1.0 - castAt(wp));
+        float castS = castSmoothOn > 0.5   // "cast" itself is a GLSL reserved word
+                    ? castMaskAt(uv) : castAt(wp);
+        shade = min(shade, 1.0 - castS);
         float glowS = 1.0 - texture2D(tPaint, uv).a;   // emissive: no shading
         float hnf = 0.35 / hatchNoiseScale;
         if (shadeMode > 0.5) {
@@ -2461,8 +2727,10 @@ const post = new THREE.ShaderMaterial({
             shadow += shadowAmount * 0.6 *
                      (1.0 - smoothstep(crossThreshold - 0.30, crossThreshold + 0.30, shade + sn));
           } else {
-            // hard: binary — a pixel is shadowed or it is not, one flat level
-            shadow = shadowAmount * step(shade + sn, hatchThreshold);
+            // hard: binary — a pixel is shadowed or it is not, one flat
+            // level. The cast term joins by max, outside the step, so its
+            // antialiased edge fraction isn't re-binarized into jaggies
+            shadow = shadowAmount * max(step(shade + sn, hatchThreshold), castS);
           }
           // intensity 1 = pitch black, never past it; lamps take none
           shadow = min(shadow, 1.0) * (1.0 - glowS);
@@ -2690,6 +2958,54 @@ const blurMat = new THREE.ShaderMaterial({
     }`,
   depthTest: false, depthWrite: false,
 });
+// cast-shadow mask extract: the same light-space PCF test the ink pass
+// uses, run once per (half-res) pixel into its own target so the mask
+// can be blurred and re-thresholded as a field. No wobble here — the
+// smoothing IS the stylization on this path.
+const castMaskMat = new THREE.ShaderMaterial({
+  uniforms: {
+    tDepth: { value: null }, tShadow: { value: null },
+    invViewProj: { value: new THREE.Matrix4() },
+    lightVP: { value: new THREE.Matrix4() },
+    shadowBias: { value: 0 },
+  },
+  vertexShader: blitVert,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    varying vec2 vUv;
+    uniform sampler2D tDepth;
+    uniform highp sampler2DShadow tShadow;
+    uniform mat4 invViewProj, lightVP;
+    uniform float shadowBias;
+    void main() {
+      float z = texture2D(tDepth, vUv).x;
+      if (z >= 0.9999) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }  // sky
+      vec4 wp = invViewProj * vec4(vUv * 2.0 - 1.0, z * 2.0 - 1.0, 1.0);
+      vec3 w = wp.xyz / wp.w;
+      vec4 lp = lightVP * vec4(w, 1.0);
+      vec3 sc = lp.xyz * 0.5 + 0.5;
+      float m = 0.0;
+      if (sc.x > 0.0 && sc.x < 1.0 && sc.y > 0.0 && sc.y < 1.0 && sc.z < 1.0)
+        m = 1.0 - texture2D(tShadow, vec3(sc.xy, sc.z - shadowBias));
+      gl_FragColor = vec4(vec3(m), 1.0);
+    }`,
+  depthTest: false, depthWrite: false,
+});
+// re-threshold between blur rounds: pulls the smeared field back toward
+// a shape with a defined 50% edge (blur+threshold twice ~ curvature
+// flow: wiggles round off, large shapes barely move)
+const maskThreshMat = new THREE.ShaderMaterial({
+  uniforms: { tDiffuse: { value: null }, uBand: { value: 0.15 } },
+  vertexShader: blitVert,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    varying vec2 vUv; uniform sampler2D tDiffuse; uniform float uBand;
+    void main() {
+      float m = smoothstep(0.5 - uBand, 0.5 + uBand, texture2D(tDiffuse, vUv).r);
+      gl_FragColor = vec4(vec3(m), 1.0);
+    }`,
+  depthTest: false, depthWrite: false,
+});
 const blitScene = new THREE.Scene();
 const blitQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), copyMat);
 blitQuad.frustumCulled = false;
@@ -2702,6 +3018,11 @@ const orbit = { theta: 0.8, phi: 1.12, radius: 46, target: new THREE.Vector3(0, 
 // free-flight state. yaw 0 looks down -z, matching three's default camera;
 // pitch is positive looking up.
 const fly = { pos: new THREE.Vector3(), yaw: 0, pitch: 0 };
+// third-person chase camera: same spherical convention as orbit, but the
+// target eases after the player instead of being dragged directly
+const chase = { theta: 0.8, phi: 1.15, dist: P.camDist };
+const camTarget = new THREE.Vector3();
+let camEasing = false;
 const keys = new Set();
 const _fwd = new THREE.Vector3(), _rgt = new THREE.Vector3(), _at = new THREE.Vector3();
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -2729,19 +3050,54 @@ function syncCameraMode(toFly) {
 }
 
 let flyBox = null, inFly = false;
+let playerBox = null, inPlayer = false;
 function refreshHint() {
   const h = document.getElementById('hint');
-  if (h) h.textContent = P.flyMode
-    ? 'wasd = move · q/e = down/up · shift = fast · drag = look · wheel = dolly · f = orbit'
-    : 'drag = orbit · shift-drag = pan · wheel = zoom · drop .obj to load · f = fly';
+  if (h) h.textContent = P.playerMode
+    ? 'wasd = move · e = mount/dismount · shift = run · drag = orbit cam · wheel = zoom · p = exit'
+    : P.flyMode
+      ? 'wasd = move · q/e = down/up · shift = fast · drag = look · wheel = dolly · f = orbit'
+      : 'drag = orbit · shift-drag = pan · wheel = zoom · drop .obj to load · f = fly · p = player';
 }
 function setFlyMode(on) {
   on = !!on;
+  if (on && P.playerMode) setPlayerMode(false);   // modes are exclusive
   P.flyMode = on;
   if (on === inFly) return;               // already there; don't re-sync the view
   syncCameraMode(on);                     // read the OLD mode's camera first
   inFly = on;
   if (flyBox) flyBox.checked = on;
+  keys.clear();
+  refreshHint();
+  markDirty();
+}
+// entering player mode seeds the chase orbit from wherever the camera is
+// so the cut is seamless; leaving hands the pose back to orbit, focused
+// where the player was — the same no-jump contract as fly<->orbit.
+function seedChaseFromCamera() {
+  const focus = player.state === 'riding' ? bike.pos : player.pos;
+  camTarget.set(focus.x, focus.y + P.camHeight, focus.z);
+  _at.subVectors(camera.position, camTarget);
+  const r = _at.length() || 1;
+  chase.dist = clamp(r, 2.5, 40);
+  chase.phi = clamp(Math.acos(clamp(_at.y / r, -1, 1)), 0.15, Math.PI / 2 - 0.02);
+  chase.theta = Math.atan2(_at.x, _at.z);
+}
+function setPlayerMode(on) {
+  on = !!on;
+  P.playerMode = on;
+  if (on === inPlayer) { if (playerBox) playerBox.checked = on; return; }
+  if (on) {
+    if (P.flyMode) setFlyMode(false);
+    spawnActors();
+    seedChaseFromCamera();
+  } else {
+    const focus = player.state === 'riding' ? bike.pos : player.pos;
+    orbit.target.set(focus.x, focus.y + P.camHeight, focus.z);
+    orbit.theta = chase.theta; orbit.phi = chase.phi; orbit.radius = chase.dist;
+  }
+  inPlayer = on;
+  if (playerBox) playerBox.checked = on;
   keys.clear();
   refreshHint();
   markDirty();
@@ -2752,6 +3108,8 @@ addEventListener('keydown', e => {
   if (typingIn(e.target) || e.ctrlKey || e.metaKey || e.altKey) return;
   const k = e.key.toLowerCase();
   if (k === 'f') { setFlyMode(!P.flyMode); return; }
+  if (k === 'p') { setPlayerMode(!P.playerMode); return; }
+  if (P.playerMode && k === 'e') { if (!e.repeat) tryMountToggle(); return; }
   if ('wasdqe'.includes(k) && k.length === 1) { keys.add(k); markDirty(); }
   if (k === 'shift') keys.add('shift');
 });
@@ -2770,7 +3128,10 @@ addEventListener('pointerup', () => dragging = false);
 addEventListener('pointermove', e => {
   if (!dragging) return;
   const dx = e.clientX - lx, dy = e.clientY - ly; lx = e.clientX; ly = e.clientY;
-  if (P.flyMode) {                       // drag to look; same sign as orbit
+  if (P.playerMode) {                    // orbit the chase camera around the player
+    chase.theta -= dx * 0.005;
+    chase.phi = clamp(chase.phi - dy * 0.005, 0.15, Math.PI / 2 - 0.02);
+  } else if (P.flyMode) {                // drag to look; same sign as orbit
     fly.yaw -= dx * 0.004;
     fly.pitch = clamp(fly.pitch - dy * 0.004, -1.5, 1.5);
   } else if (panning) {
@@ -2786,7 +3147,10 @@ addEventListener('pointermove', e => {
 });
 renderer.domElement.addEventListener('wheel', e => {
   e.preventDefault();
-  if (P.flyMode) {                       // dolly along the view, so the wheel
+  if (P.playerMode) {
+    chase.dist = clamp(chase.dist * (1 + Math.sign(e.deltaY) * 0.09), 2.5, 40);
+    P.camDist = chase.dist;              // the slider tracks the wheel
+  } else if (P.flyMode) {                // dolly along the view, so the wheel
     const step = flySpeedUnits() * 0.35; // still reads as "zoom"
     fly.pos.addScaledVector(flyForward(_fwd), -Math.sign(e.deltaY) * step);
   } else {
@@ -2803,6 +3167,71 @@ function flySpeedUnits() {
 }
 let lastCamT = performance.now();
 
+// per-frame player/bike simulation. Runs from updateCamera, so it only
+// advances on rendered frames — tick() keeps the loop dirty while the
+// player is moving, coasting or bobbing so that's every frame in practice.
+function updatePlayer(dt) {
+  if (!playerActor) return;
+  let moved = false;
+  const riding = player.state === 'riding';
+  // ---- bike physics: always integrated, so a dismount at speed coasts
+  // out under drag instead of freezing mid-air. Inputs only when riding.
+  const maxV = 18 * P.driveSpeed * (keys.has('shift') ? 1.6 : 1);
+  const accel = 22 * P.driveSpeed;
+  if (riding && keys.has('w')) bike.speed = Math.min(maxV, bike.speed + accel * dt);
+  else if (riding && keys.has('s')) bike.speed = Math.max(-maxV * 0.4, bike.speed - accel * dt);
+  else bike.speed *= Math.exp(-1.2 * dt);
+  if (Math.abs(bike.speed) < 0.01) bike.speed = 0;
+  // steering authority scales with speed and reverses in reverse
+  const steer = riding ? (keys.has('a') ? 1 : 0) - (keys.has('d') ? 1 : 0) : 0;
+  bike.yaw += steer * dt * 2.4 * clamp(bike.speed / 6, -1, 1);
+  if (bike.speed) {
+    const dx = -Math.sin(bike.yaw) * bike.speed * dt;
+    const dz = -Math.cos(bike.yaw) * bike.speed * dt;
+    resolveMove(bike.pos, dx, dz, _mv);
+    if (_mv.x || _mv.z) { bike.pos.x += _mv.x; bike.pos.z += _mv.z; moved = true; }
+    else if (dx || dz) bike.speed = 0;             // rammed something
+  }
+  if (riding) bike.hoverT += dt;                   // bob only animates ridden
+  const by = groundHeight(bike.pos.x, bike.pos.z, bike.pos.y) + BIKE_HOVER
+           + (riding ? Math.sin(bike.hoverT * 2.1) * 0.08 : 0);
+  if (Math.abs(by - bike.pos.y) > 1e-4) { bike.pos.y = by; moved = true; }
+  if (!riding) {
+    // on foot: camera-relative WASD; the character eases toward the heading
+    const ix = (keys.has('d') ? 1 : 0) - (keys.has('a') ? 1 : 0);
+    const iz = (keys.has('s') ? 1 : 0) - (keys.has('w') ? 1 : 0);
+    if (ix || iz) {
+      const inv = 1 / Math.hypot(ix, iz);
+      const fx = -Math.sin(chase.theta), fz = -Math.cos(chase.theta);   // away from camera
+      const rx = Math.cos(chase.theta), rz = -Math.sin(chase.theta);
+      const wx = (fx * -iz + rx * ix) * inv, wz = (fz * -iz + rz * ix) * inv;
+      const v = 4.2 * P.walkSpeed * (keys.has('shift') ? 1.8 : 1);
+      resolveMove(player.pos, wx * v * dt, wz * v * dt, _mv);
+      if (_mv.x || _mv.z) {
+        player.pos.x += _mv.x; player.pos.z += _mv.z;
+        player.speed = v; player.bobT += dt * v * 0.5;
+        let dyaw = Math.atan2(-wx, -wz) - player.yaw;
+        dyaw = Math.atan2(Math.sin(dyaw), Math.cos(dyaw));
+        player.yaw += dyaw * Math.min(1, 12 * dt);
+        moved = true;
+      }
+    } else player.speed = 0;
+    const g = groundHeight(player.pos.x, player.pos.z, player.pos.y);
+    if (Math.abs(g - player.pos.y) > 1e-4) { player.pos.y = g; moved = true; }
+  }
+  // stay on the ground sheet and inside the shadow/far-plane fit
+  const lim = (sceneSphere ? sceneSphere.radius : 100) * 0.9;
+  player.pos.x = clamp(player.pos.x, -lim, lim);
+  player.pos.z = clamp(player.pos.z, -lim, lim);
+  bike.pos.x = clamp(bike.pos.x, -lim, lim);
+  bike.pos.z = clamp(bike.pos.z, -lim, lim);
+  if (moved) {
+    applyActorTransforms();
+    shadowDirty = true;      // the cached sun map must re-render to track us
+    markDirty();
+  }
+}
+
 function updateCamera() {
   const nowT = performance.now();
   const dt = Math.min(0.1, (nowT - lastCamT) / 1000);   // cap so a stall can't teleport
@@ -2812,7 +3241,21 @@ function updateCamera() {
     markDirty();
   }
 
-  if (P.flyMode) {
+  if (P.playerMode) {
+    updatePlayer(dt);
+    const focus = player.state === 'riding' ? bike.pos : player.pos;
+    _at.set(focus.x, focus.y + P.camHeight, focus.z);
+    // exponential ease toward the player; keep rendering until the tail settles
+    camTarget.lerp(_at, 1 - Math.exp(-8 * dt));
+    camEasing = camTarget.distanceToSquared(_at) > 1e-6;
+    if (camEasing) markDirty();
+    const sp = Math.sin(chase.phi), r = chase.dist;
+    camera.position.set(
+      camTarget.x + r * sp * Math.sin(chase.theta),
+      camTarget.y + r * Math.cos(chase.phi),
+      camTarget.z + r * sp * Math.cos(chase.theta));
+    camera.lookAt(camTarget);
+  } else if (P.flyMode) {
     flyForward(_fwd);
     _rgt.set(Math.cos(fly.yaw), 0, -Math.sin(fly.yaw));
     const v = flySpeedUnits() * (keys.has('shift') ? 4 : 1) * dt;
@@ -2846,9 +3289,10 @@ function updateCamera() {
   // orbit can never get closer to its target than the radius, so that's a safe
   // basis. Flight can be anywhere, so cap the near plane there — otherwise
   // flying far from the scene centre would clip whatever you flew up to.
-  const camDist = P.flyMode ? camera.position.distanceTo(centre) : orbit.radius;
+  const free = P.flyMode || P.playerMode;   // camera can get close to anything
+  const camDist = free ? camera.position.distanceTo(centre) : orbit.radius;
   let near = Math.max(0.05, camDist * P.nearFactor);
-  if (P.flyMode) near = Math.min(near, 0.5);
+  if (free) near = Math.min(near, 0.5);
   // exactly the farthest point of the bounding sphere: tight but never clips
   const far = Math.max(near + 1, camera.position.distanceTo(centre) + radius);
   if (near !== camera.near || far !== camera.far) {
@@ -2971,6 +3415,7 @@ checkbox('lightOrbit', 'orbit light');
 slider('shadowBias', 'shadow bias', 0.0005, 0.01, 0.0005);
 dropdown('shadowRes', 'shadow map', ['1024', '2048', '4096'], makeShadowTarget);
 slider('shadowAmount', 'intensity', 0, 1, 0.01);
+slider('shadowSmoothPx', 'shadow smooth', 0, 32, 1);
 slider('shadowLine', 'shadow lines', 0, 1, 0.01);
 slider('shadowLineWidth', 'shadow line w', 0.5, 3, 0.05);
 slider('hatchThreshold', 'shade start', 0, 1, 0.01);
@@ -3004,6 +3449,12 @@ section('camera');
 flyBox = checkbox('flyMode', 'fly camera (f)', () => setFlyMode(P.flyMode));
 slider('flySpeed', 'fly speed', 0.1, 5, 0.1);
 checkbox('autoRotate', 'auto-rotate (orbit)');
+section('player');
+playerBox = checkbox('playerMode', 'player mode (p)', () => setPlayerMode(P.playerMode));
+slider('walkSpeed', 'walk speed', 0.25, 3, 0.05);
+slider('driveSpeed', 'drive speed', 0.25, 3, 0.05);
+slider('camDist', 'camera dist', 2.5, 40, 0.5, () => { chase.dist = P.camDist; });
+checkbox('collision', 'full collision (experimental)', swapGroundImpl);
 section('scene');
 slider('density', 'greeble density', 0.3, 2.5, 0.05, () => buildScene());
 buttons([
@@ -3168,7 +3619,66 @@ function updateLightDir() {
   const el = THREE.MathUtils.degToRad(P.lightElevation);
   lightWorld.set(Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el));
 }
-let prevLightAz = -1, prevLightEl = -1;
+
+// fit the sun's ortho window to the camera frustum ∩ scene footprint in
+// light space: a zoomed-in view concentrates the whole shadow map on
+// what's on screen instead of spreading it over the scene sphere (which
+// the ground plane inflates to cover everything). Returns true when the
+// window moved, i.e. the cached map is stale.
+const _fv = new THREE.Vector3();
+const _prevLVP = new Float32Array(16);
+function fitShadowFrustum() {
+  const c = sceneSphere.center, r = Math.max(1, sceneSphere.radius);
+  lightCam.position.copy(c).addScaledVector(lightWorld, r * 1.5);
+  lightCam.lookAt(c);
+  lightCam.near = 0.1; lightCam.far = 3 * r;
+  lightCam.updateMatrixWorld();
+  lightCam.matrixWorldInverse.copy(lightCam.matrixWorld).invert();
+  // camera frustum corners -> light-space xy extent
+  let x0 = 1e9, x1 = -1e9, y0 = 1e9, y1 = -1e9;
+  for (let i = 0; i < 8; i++) {
+    _fv.set(i & 1 ? 1 : -1, i & 2 ? 1 : -1, i & 4 ? 1 : -1)
+       .applyMatrix4(camera.projectionMatrixInverse)
+       .applyMatrix4(camera.matrixWorld)
+       .applyMatrix4(lightCam.matrixWorldInverse);
+    x0 = Math.min(x0, _fv.x); x1 = Math.max(x1, _fv.x);
+    y0 = Math.min(y0, _fv.y); y1 = Math.max(y1, _fv.y);
+  }
+  // never wider than the scene itself; an empty overlap (camera looking
+  // away from the scene) falls back to the full footprint
+  x0 = Math.max(x0, -r); x1 = Math.min(x1, r);
+  y0 = Math.max(y0, -r); y1 = Math.min(y1, r);
+  if (x0 >= x1 || y0 >= y1) { x0 = -r; x1 = r; y0 = -r; y1 = r; }
+  // pad for the painterly edge wobble + PCF reach, then quantize the
+  // window to a power-of-2 ladder of the scene size and snap its origin
+  // to the rung's texel grid: camera moves slide the window in whole
+  // texels over an identical world lattice, so the cached map's texels
+  // land in exactly the same spots — no edge crawl while panning. Zoom
+  // changes texel density only at rung crossings (rare, subtle) instead
+  // of continuously.
+  const res = +P.shadowRes;
+  const pad = 16 * Math.max(x1 - x0, y1 - y0) / res;
+  x0 -= pad; x1 += pad; y0 -= pad; y1 += pad;
+  const maxW = 2.05 * r;   // full footprint + margin = the top rung
+  const rung = need => maxW / Math.pow(2, Math.max(0,
+    Math.floor(Math.log2(maxW / (need * 1.05)))));
+  const wq = rung(x1 - x0), hq = rung(y1 - y0);
+  const tx = wq / res, ty = hq / res;
+  x0 = Math.floor((0.5 * (x0 + x1) - wq * 0.5) / tx) * tx;
+  y0 = Math.floor((0.5 * (y0 + y1) - hq * 0.5) / ty) * ty;
+  lightCam.left = x0; lightCam.right = x0 + wq;
+  lightCam.bottom = y0; lightCam.top = y0 + hq;
+  lightCam.updateProjectionMatrix();
+  lightVPmat.multiplyMatrices(lightCam.projectionMatrix, lightCam.matrixWorldInverse);
+  // the VP matrix encodes direction + window, so comparing it against
+  // the last render's catches every way the map can go stale
+  const e = lightVPmat.elements;
+  let moved = false;
+  for (let i = 0; i < 16; i++)
+    if (Math.abs(e[i] - _prevLVP[i]) > 1e-9) { moved = true; break; }
+  if (moved) _prevLVP.set(e);
+  return moved;
+}
 const _lv = new THREE.Vector3();
 let frames = 0, lastStats = performance.now();
 let refinePending = false, lastChange = 0, lastRender = 0;
@@ -3204,6 +3714,7 @@ function renderFrame(useHi) {
     lu.uMinFeat.value = P.minFeature / 100;
     lu.uInvFov.value = invFovScale();
     lineSegs.visible = true;
+    for (const a of actors) { a.mesh.material = fillMaterial; a.lines.visible = true; }
     renderer.setRenderTarget(null);
     renderer.setClearColor(new THREE.Color(P.paperColor), 1);
     renderer.clear();
@@ -3216,6 +3727,7 @@ function renderFrame(useHi) {
   idMaterial.uniforms.uUnit.value = ui;
   lineSegs.visible = false;
   glassRoot.visible = false;   // opaque passes never see the glass mesh
+  for (const a of actors) { a.mesh.material = idMaterial; a.lines.visible = false; }
 
   const T = (useHi && targetsHi) ? targetsHi : targetsLo;
 
@@ -3237,6 +3749,9 @@ function renderFrame(useHi) {
   if (glassVertCount) {
     sceneRoot.visible = false;
     glassRoot.visible = true;
+    // actors are opaque-only: keep them out of the glass MRT or the
+    // compose step draws glass edges around them
+    for (const a of actors) a.group.visible = false;
     renderer.setRenderTarget(T.rtGlass);
     renderer.render(scene, camera);
     idMaterial.side = THREE.BackSide;
@@ -3245,6 +3760,7 @@ function renderFrame(useHi) {
     idMaterial.side = THREE.DoubleSide;
     sceneRoot.visible = true;
     glassRoot.visible = false;
+    for (const a of actors) a.group.visible = true;
   }
 
   // debug view: show the ID buffer itself instead of inking it. This is what
@@ -3262,24 +3778,14 @@ function renderFrame(useHi) {
     return;
   }
 
-  // cast-shadow map: cached — re-rendered only when the light moved or
-  // the scene rebuilt. Glass and lines are already hidden; glass casts
-  // nothing. The map is depth-only, taken from an orthographic camera
-  // fitted to the scene's bounding sphere.
+  // cast-shadow map: cached — re-rendered only when the light moved, the
+  // fitted light window shifted with the camera, or the scene rebuilt.
+  // Glass and lines are already hidden; glass casts nothing. The map is
+  // depth-only, taken from an orthographic camera fitted to the visible
+  // slice of the scene.
   if (P.castShadow && P.hatchOn) {
-    if (P.lightAzimuth !== prevLightAz || P.lightElevation !== prevLightEl)
-      shadowDirty = true;
+    if (fitShadowFrustum()) shadowDirty = true;
     if (shadowDirty) {
-      prevLightAz = P.lightAzimuth; prevLightEl = P.lightElevation;
-      const c = sceneSphere.center, r = Math.max(1, sceneSphere.radius);
-      lightCam.left = -r; lightCam.right = r; lightCam.top = r; lightCam.bottom = -r;
-      lightCam.near = 0.1; lightCam.far = 3 * r;
-      lightCam.position.copy(c).addScaledVector(lightWorld, r * 1.5);
-      lightCam.lookAt(c);
-      lightCam.updateProjectionMatrix();
-      lightCam.updateMatrixWorld();
-      lightCam.matrixWorldInverse.copy(lightCam.matrixWorld).invert();
-      lightVPmat.multiplyMatrices(lightCam.projectionMatrix, lightCam.matrixWorldInverse);
       renderer.setRenderTarget(rtShadow);
       renderer.setClearColor(0xffffff, 1);
       renderer.clear();
@@ -3288,6 +3794,48 @@ function renderFrame(useHi) {
       scene.overrideMaterial = null;
       shadowDirty = false;
     }
+  }
+
+  // cast-shadow silhouette smoothing: extract the shadow mask at half
+  // res, then blur -> re-threshold -> blur. Blur+threshold is
+  // morphological smoothing — the edge becomes the 50% level-set of a
+  // smooth field, so features smaller than the radius melt away and
+  // corners round into painted lobes; doing it twice approximates
+  // curvature flow (wiggles vanish, large shapes barely move). Fully
+  // deterministic — no noise anywhere on this path.
+  const castSmooth = P.castShadow && P.hatchOn && P.shadowSmoothPx > 0;
+  if (castSmooth) {
+    const cm = castMaskMat.uniforms;
+    cm.tDepth.value = T.rtID.depthTexture;
+    cm.tShadow.value = rtShadow.depthTexture;
+    cm.lightVP.value.copy(lightVPmat);
+    cm.shadowBias.value = P.shadowBias;
+    cm.invViewProj.value.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).invert();
+    blitQuad.material = castMaskMat;
+    renderer.setRenderTarget(T.rtMaskA);
+    renderer.render(blitScene, postCamera);
+    // kernel reach is 4 taps x uDir; sizing uDir against the SCREEN
+    // resolution makes the slider mean "pixels on screen" regardless of
+    // mask res or supersample factor
+    const stepU = P.shadowSmoothPx / (4 * rtScreen.width);
+    const stepV = P.shadowSmoothPx / (4 * rtScreen.height);
+    const blurAtoB = (src, dst, mid) => {
+      blurMat.uniforms.tDiffuse.value = src.texture;
+      blurMat.uniforms.uDir.value.set(stepU, 0);
+      blitQuad.material = blurMat;
+      renderer.setRenderTarget(mid);
+      renderer.render(blitScene, postCamera);
+      blurMat.uniforms.tDiffuse.value = mid.texture;
+      blurMat.uniforms.uDir.value.set(0, stepV);
+      renderer.setRenderTarget(dst);
+      renderer.render(blitScene, postCamera);
+    };
+    blurAtoB(T.rtMaskA, T.rtMaskA, T.rtMaskB);       // round 1: A -> (B) -> A
+    maskThreshMat.uniforms.tDiffuse.value = T.rtMaskA.texture;
+    blitQuad.material = maskThreshMat;
+    renderer.setRenderTarget(T.rtMaskB);             // re-threshold: A -> B
+    renderer.render(blitScene, postCamera);
+    blurAtoB(T.rtMaskB, T.rtMaskB, T.rtMaskA);       // round 2: B -> (A) -> B
   }
 
   // pass 2: view-space normals — needed by hatching/shadows and by the
@@ -3347,7 +3895,17 @@ function renderFrame(useHi) {
   u.tShadow.value = rtShadow.depthTexture;
   u.lightVP.value.copy(lightVPmat);
   u.castOn.value = P.castShadow && P.hatchOn ? 1 : 0;
-  u.shadowRes.value = +P.shadowRes;
+  // wobble amplitude: a fixed world size (the old 8-texels-of-the-full-
+  // scene-window look), converted into the current window's UV — the
+  // edge texture no longer breathes when the fitted window resizes
+  const wobW = 16 * (sceneSphere ? sceneSphere.radius : 100) / +P.shadowRes;
+  u.shadowWobUv.value.set(wobW / (lightCam.right - lightCam.left),
+                          wobW / (lightCam.top - lightCam.bottom));
+  u.tCastMask.value = T.rtMaskB.texture;
+  u.castSmoothOn.value = castSmooth ? 1 : 0;
+  // AA band sized so the re-hardened edge spans ~1.5 screen px of the
+  // final ramp (whose width grows with the blur radius)
+  u.castBand.value = Math.min(0.45, 1.2 / Math.max(P.shadowSmoothPx, 3));
   u.shadeMode.value = P.shadeStyle === 'hard' ? 1 : (P.shadeStyle === 'soft' ? 2 : 0);
   // setRGB with raw bytes skips the linear conversion .set(hex) would do,
   // keeping the uniform in the same raw display space as the aPaint bytes
@@ -3401,8 +3959,12 @@ function tick() {
   const now = performance.now();
   // flight has to keep rendering while a movement key is held, otherwise the
   // dirty-flag loop would idle mid-move
-  if (P.autoRotate && !P.flyMode) dirty = true;
-  if (P.flyMode && keys.size) dirty = true;
+  if (P.autoRotate && !P.flyMode && !P.playerMode) dirty = true;
+  if ((P.flyMode || P.playerMode) && keys.size) dirty = true;
+  // riding = continuous hover bob; bike.speed = coasting after key release;
+  // camEasing = the chase camera's smoothing tail
+  if (P.playerMode && (player.state === 'riding' || Math.abs(bike.speed) > 0.01 || camEasing))
+    dirty = true;
   const prog = P.progressive && !P.vectorMode && targetsHi;
   let counted = false;
   if (dirty) {
@@ -3481,15 +4043,31 @@ async function idbGet(k) {
 let pendingDirHandle = null;   // stored handle awaiting a permission click
 
 async function scanModelsDir(dir) {
-  const scenes = [];
+  const scenes = [], loose = [];
   for await (const [name, handle] of dir.entries()) {
-    if (handle.kind !== 'directory') continue;
+    // .obj files sitting loose at the top of the picked folder become a
+    // scene of their own, so dropping one model in doesn't require
+    // wrapping it in a subfolder first
+    if (handle.kind === 'file') {
+      if (/\.obj$/i.test(name))
+        loose.push({ name, text: await (await handle.getFile()).text() });
+      continue;
+    }
     const files = [];
     for await (const [fn, fh] of handle.entries()) {
       if (fh.kind === 'file' && /\.obj$/i.test(fn))
         files.push({ name: fn, text: await (await fh.getFile()).text() });
     }
     if (files.length) scenes.push({ name, files });
+  }
+  if (loose.length) {
+    loose.sort((a, b) => a.name.localeCompare(b.name));
+    // one loose model is findable under its own name; several are only
+    // meaningfully grouped under the folder's
+    scenes.push({
+      name: loose.length === 1 ? loose[0].name.replace(/\.obj$/i, '') : dir.name,
+      files: loose,
+    });
   }
   scenes.sort((a, b) => a.name.localeCompare(b.name));
   return scenes;
@@ -3629,6 +4207,10 @@ window.__orbit = orbit;                            // headless camera placement
 window.__updateBudget = updateBudget;
 window.__fly = fly; window.__keys = keys; window.__setFlyMode = setFlyMode;
 window.__camera = camera;
+window.__player = player; window.__bike = bike; window.__chase = chase;
+window.__setPlayerMode = setPlayerMode; window.__mount = tryMountToggle;
+window.__updatePlayer = updatePlayer; window.__actors = actors;
+window.__scene = scene; window.__renderer = renderer;
 window.__setModelScenes = s => setModelScenes(s, true);
 
 addEventListener('resize', () => {

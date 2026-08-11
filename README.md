@@ -2,7 +2,7 @@
 
 Real-time Moebius / Geof Darrow–style ink linework in the browser. One HTML file, no build step.
 
-![linework2026 default render](screenshot.png)
+![A loaded hoverbike .obj — emissive power cell, panel linework, cast shadows, character for scale](screenshot.png)
 
 ## Run it
 

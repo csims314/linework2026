@@ -155,6 +155,12 @@ const P = {
   // hard shade mode the lambert terminator melts too, at a flat
   // slider/20 radius. 0 = exact geometry (single-tap path).
   lightOrbit: false, orbitLightSpeed: 12, shadowBias: 0.0015, shadowRes: '2048', shadowSmoothPx: 12,
+  // shadow technique: 'map' = cached directional shadow map (PCF +
+  // contact-hardening melt), 'stencil' = per-triangle depth-fail stencil
+  // shadow volumes — pixel-exact hard silhouettes, no map resolution, no
+  // bias, works past the fitted light window. Contact hardening is a
+  // map-path feature; the stencil melt uses one flat radius.
+  shadowTech: 'stencil',
   // stroke breakup: displacement noise amount (past ~1 strokes start
   // folding into stipple — allowed, it reads as dry-brush) and the
   // world-space feature size of that noise. hatchBreak erodes strokes
@@ -297,6 +303,11 @@ function markDirty() { dirty = true; }
 // the cast-shadow map re-renders only when this is set: on rebuilds and
 // light moves. A still sun is as cheap as a baked shadow map.
 let shadowDirty = true;
+// stencil-shadow-volume geometry mirrors the merged mesh + actors;
+// rebuilt lazily when this is set (scene rebuilds, actor builds).
+// Declared up here because buildScene() runs before the volume
+// machinery below is initialized.
+let volDirty = true;
 
 // the OBJ model scene's current model (starts as the embedded speeder;
 // replaced when the user drops or loads an .obj)
@@ -2410,6 +2421,7 @@ function finishScene() {
   lineSegs.frustumCulled = false;
   lineSegs.visible = false;
   scene.add(lineSegs);
+  volDirty = true;   // stencil shadow volumes mirror the merged mesh
   markDirty();
 }
 
@@ -2486,6 +2498,7 @@ function buildActor(builderFn, seed) {
   scene.add(group);
   const a = { group, mesh, lines };
   actors.push(a);
+  volDirty = true;   // actor casters join the stencil volume scene
   return a;
 }
 
@@ -2751,6 +2764,16 @@ function makeShadowTarget() {
     minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
     depthTexture: d, depthBuffer: true,
   });
+  // initialize the attachment NOW: the post program binds this depth
+  // texture as sampler2DShadow every frame, and in stencil-shadow mode
+  // the map pass may never run. A depth texture that was never set up
+  // through the framebuffer path has no TEXTURE_COMPARE_MODE, and
+  // WebGL2 fails the whole draw (INVALID_OPERATION) for shadow-sampler
+  // mismatches — which silently killed the fullscreen post quad.
+  renderer.setRenderTarget(rtShadow);
+  renderer.setClearColor(0xffffff, 1);   // white decodes as beyond-far
+  renderer.clear();
+  renderer.setRenderTarget(null);
   shadowDirty = true;
   markDirty();
 }
@@ -2779,6 +2802,204 @@ const depthOnlyMat = new THREE.ShaderMaterial({
       gl_FragColor = vec4(hi, (gl_FragCoord.z - hi) * 255.0, 0.0, 1.0);
     }`,
 });
+
+/* ============================================================
+   Stencil shadow volumes — pixel-exact hard cast shadows via
+   per-triangle depth-fail volumes (Carmack's reverse), ported
+   from the FunWithShadows project. Every light-facing triangle
+   emits its own closed volume, so the kitbashed, interpenetrating,
+   non-manifold merged scene casts correctly with no watertight
+   requirement: side quads on interior shared edges are coincident
+   with opposite windings and cancel exactly in stencil counting.
+   The result is a screen-space binary mask (rtStencil.texture.r,
+   1 = shadowed) consumed wherever the map path did its PCF test.
+   ============================================================ */
+// Per source triangle: 6 unique verts (3 on the surface, 3 extruded
+// to the ideal point in the shader) and 24 indices — near cap, far
+// cap reversed, and an outward-wound side quad per edge. Positions
+// are welded first (~1e-5) so exported duplicates produce identical,
+// cancelling side quads; the weld keeps the first occurrence's exact
+// floats, so near caps still rasterize bit-identical to the depth
+// prepass (the acne-avoidance contract, see volume materials below).
+// The flat normal rides an int8-normalized vec4 with the extrude
+// flag in w — the facing test only needs ~1° accuracy.
+// Triangles flagged no-cast (ID color blue bit 1) emit nothing,
+// matching the shadow-map depth pass discard.
+function buildVolumeGeometry(source) {
+  const pos = source.attributes.position;
+  const col = source.attributes.color;
+  const idx = source.index;
+  const vertCount = pos.count;
+  const inv = 1e5;                        // 1/weld tolerance
+  const keyMap = new Map();
+  const welded = [];
+  const remap = new Uint32Array(vertCount);
+  for (let i = 0; i < vertCount; i++) {
+    const x = pos.getX(i), y = pos.getY(i), z = pos.getZ(i);
+    const key = Math.round(x * inv) + '_' + Math.round(y * inv) + '_' + Math.round(z * inv);
+    let w = keyMap.get(key);
+    if (w === undefined) {
+      w = welded.length / 3;
+      keyMap.set(key, w);
+      welded.push(x, y, z);
+    }
+    remap[i] = w;
+  }
+  const srcAt = i => idx ? idx.getX(i) : i;
+  const triCountSrc = (idx ? idx.count : vertCount) / 3;
+  const outPos = [], outN = [], outIdx = [];
+  const A = new THREE.Vector3(), B = new THREE.Vector3(), C = new THREE.Vector3();
+  const ab = new THREE.Vector3(), ac = new THREE.Vector3(), n = new THREE.Vector3();
+  const read = (w, v) => v.set(welded[w * 3], welded[w * 3 + 1], welded[w * 3 + 2]);
+  let emitted = 0;
+  for (let t = 0; t < triCountSrc; t++) {
+    const s0 = srcAt(t * 3);
+    if (col && (Math.round(col.getZ(s0) * 255) & 2)) continue;   // no-cast
+    const i0 = remap[s0], i1 = remap[srcAt(t * 3 + 1)], i2 = remap[srcAt(t * 3 + 2)];
+    if (i0 === i1 || i1 === i2 || i2 === i0) continue;   // degenerate after weld
+    read(i0, A); read(i1, B); read(i2, C);
+    ab.subVectors(B, A); ac.subVectors(C, A); n.crossVectors(ab, ac);
+    if (n.lengthSq() < 1e-14) continue;                  // zero-area
+    n.normalize();
+    const nx = Math.round(n.x * 127), ny = Math.round(n.y * 127), nz = Math.round(n.z * 127);
+    const base = outPos.length / 3;
+    for (const v of [A, B, C]) { outPos.push(v.x, v.y, v.z); outN.push(nx, ny, nz, 0); }
+    for (const v of [A, B, C]) { outPos.push(v.x, v.y, v.z); outN.push(nx, ny, nz, 127); }
+    outIdx.push(base, base + 1, base + 2,               // near cap
+                base + 5, base + 4, base + 3);          // far cap, reversed
+    for (let e = 0; e < 3; e++) {                       // side quads, outward
+      const i = base + e, j = base + (e + 1) % 3;
+      outIdx.push(j, i, i + 3, j, i + 3, j + 3);
+    }
+    emitted += 8;
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(outPos, 3));
+  g.setAttribute('aVolN', new THREE.Int8BufferAttribute(outN, 4, true));
+  g.setIndex(outIdx);
+  g.userData.shadowTriCount = emitted;
+  return g;
+}
+
+// Extrusion vertex shader. uLightDir = direction the light TRAVELS
+// (i.e. -lightWorld), world space. Light-facing triangles keep their
+// near cap on the surface and send flagged verts to the ideal point
+// vec4(uLightDir, 0) — needs the infinite-far projection. Back-facing
+// triangles extrude ALL verts and collapse to zero area. The
+// non-extruded branch uses EXACTLY the built-in materials' transform
+// expression (projectionMatrix * (modelViewMatrix * position)) so near
+// caps rasterize at bit-identical depth to the prepass; with depthFunc
+// LESS, equal-depth cap fragments then z-fail on BOTH volume passes and
+// the increment/decrement cancel — no self-shadow acne, no bias.
+const VOL_VERT = /* glsl */`
+  attribute vec4 aVolN;   // xyz = flat normal (int8 norm), w = extrude flag
+  uniform vec3 uLightDir;
+  void main() {
+    vec3 nWorld = mat3(modelMatrix) * aVolN.xyz;   // uniform scales only
+    float e = dot(nWorld, uLightDir) < 0.0 ? aVolN.w : 1.0;
+    if (e > 0.4) {
+      gl_Position = projectionMatrix * (viewMatrix * vec4(uLightDir, 0.0));
+    } else {
+      vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+      gl_Position = projectionMatrix * mvPosition;
+    }
+  }`;
+const volUniforms = { uLightDir: { value: new THREE.Vector3(0, -1, 0) } };
+const volCommon = {
+  uniforms: volUniforms,
+  vertexShader: VOL_VERT,
+  fragmentShader: 'void main() { gl_FragColor = vec4(1.0); }',
+  colorWrite: false, depthWrite: false, depthTest: true,
+  depthFunc: THREE.LessDepth,      // strict: equal-depth caps must z-fail
+  stencilWrite: true,
+  stencilFunc: THREE.AlwaysStencilFunc, stencilRef: 0,
+  stencilFuncMask: 0xff, stencilWriteMask: 0xff,
+  stencilFail: THREE.KeepStencilOp, stencilZPass: THREE.KeepStencilOp,
+};
+// depth-fail: back faces increment on z-fail, front faces decrement.
+// Wrap ops are mandatory — nested volumes exceed a count of 1.
+const volBackMat = new THREE.ShaderMaterial({
+  ...volCommon, side: THREE.BackSide, stencilZFail: THREE.IncrementWrapStencilOp });
+const volFrontMat = new THREE.ShaderMaterial({
+  ...volCommon, side: THREE.FrontSide, stencilZFail: THREE.DecrementWrapStencilOp });
+// depth prepass into rtStencil: same transform expression and same
+// DoubleSide rasterization as idMaterial, color left at the clear value
+const volDepthMat = new THREE.ShaderMaterial({
+  side: THREE.DoubleSide, colorWrite: false,
+  vertexShader: /* glsl */`
+    void main() {
+      vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
+      gl_Position = projectionMatrix * mvPosition;
+    }`,
+  fragmentShader: 'void main() { gl_FragColor = vec4(0.0); }',
+});
+// fullscreen extract: write 1 where stencil != 0. stencilWrite must be
+// true even though every op is Keep — three.js gates the whole stencil
+// state (including the func test) behind it.
+const stencilExtractMat = new THREE.ShaderMaterial({
+  vertexShader: 'void main() { gl_Position = vec4(position.xy, 0.0, 1.0); }',
+  fragmentShader: 'void main() { gl_FragColor = vec4(1.0, 0.0, 0.0, 1.0); }',
+  depthTest: false, depthWrite: false,
+  stencilWrite: true,
+  stencilFunc: THREE.NotEqualStencilFunc, stencilRef: 0,
+  stencilFuncMask: 0xff, stencilWriteMask: 0,
+  stencilFail: THREE.KeepStencilOp,
+  stencilZFail: THREE.KeepStencilOp, stencilZPass: THREE.KeepStencilOp,
+});
+
+// volume meshes live in their own scene; actor volumes share the source
+// mesh's matrixWorld by reference so animation is free. Rebuilt lazily
+// (volDirty, declared near shadowDirty) — only when stencil mode renders.
+const volScene = new THREE.Scene();
+let volTriCount = 0, volBytes = 0, lastVolBuildMs = 0;
+const volLinks = [];   // { mesh, srcRoot } for per-frame visibility sync
+function rebuildShadowVolumes() {
+  const t0 = performance.now();
+  for (const l of volLinks) { l.mesh.geometry.dispose(); volScene.remove(l.mesh); }
+  volLinks.length = 0;
+  volTriCount = 0; volBytes = 0;
+  const addCaster = (srcMesh, srcRoot) => {
+    if (!srcMesh || !srcMesh.geometry.attributes.position ||
+        srcMesh.geometry.attributes.position.count === 0) return;
+    const g = buildVolumeGeometry(srcMesh.geometry);
+    const m = new THREE.Mesh(g, volBackMat);
+    m.matrixAutoUpdate = false;
+    m.matrixWorldAutoUpdate = false;
+    m.matrixWorld = srcMesh.matrixWorld;   // shared reference
+    m.frustumCulled = false;               // extrusion happens in the shader
+    volScene.add(m);
+    volLinks.push({ mesh: m, srcRoot });
+    volTriCount += g.userData.shadowTriCount;
+    volBytes += g.attributes.position.count * 16 + g.index.count * 4;
+  };
+  addCaster(sceneRoot, sceneRoot);         // glass casts nothing (matches map path)
+  for (const a of actors) addCaster(a.mesh, a.group);
+  volDirty = false;
+  lastVolBuildMs = performance.now() - t0;
+}
+
+// screen-space mask target (color + packed depth24/stencil8), sized to
+// whichever target set is rendering. Linear filter: the binary mask's
+// one-texel bilinear ramp re-hardens into an antialiased edge downstream.
+let rtStencil = null;
+function ensureStencilTarget(w, h) {
+  if (rtStencil && rtStencil.width === w && rtStencil.height === h) return;
+  if (rtStencil) rtStencil.dispose();
+  rtStencil = new THREE.WebGLRenderTarget(w, h, {
+    minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+    depthBuffer: true, stencilBuffer: true,
+  });
+}
+
+// far plane at infinity (epsilon trick), patched in place: the ideal
+// point (w = 0) rasterizes at depth ~1-ε instead of clipping. Restored
+// with camera.updateProjectionMatrix() after the volume passes.
+function applyInfiniteProjection(cam) {
+  const e = cam.projectionMatrix.elements;   // column-major
+  e[10] = 1e-5 - 1;
+  e[14] = (1e-5 - 2) * cam.near;
+  cam.projectionMatrixInverse.copy(cam.projectionMatrix).invert();
+}
 
 /* ============================================================
    Post pass — where the ink happens
@@ -2834,6 +3055,7 @@ const post = new THREE.ShaderMaterial({
     castOn: { value: 0 }, shadowBias: { value: 0 },
     shadowWobUv: { value: new THREE.Vector2() },
     tCastMask: { value: null }, castSmoothOn: { value: 0 }, castPxScale: { value: 0 },
+    tStencilMask: { value: null }, stencilOn: { value: 0 }, stencilWobW: { value: 0 },
   },
   vertexShader: /* glsl */`
     varying vec2 vUv;
@@ -2871,6 +3093,8 @@ const post = new THREE.ShaderMaterial({
     uniform vec2 shadowWobUv;   // wobble amplitude: fixed world size -> window UV
     uniform sampler2D tCastMask;            // blurred + re-thresholded shadow mask
     uniform float castSmoothOn, castPxScale;
+    uniform sampler2D tStencilMask;         // stencil-volume mask, screen space
+    uniform float stencilOn, stencilWobW;   // wobble amplitude in world units
 
     // ---- helpers -------------------------------------------------
     float hash(vec2 p) {
@@ -3109,12 +3333,23 @@ const post = new THREE.ShaderMaterial({
       return d;
     }
 
-    // cast-shadow test in the sun's orthographic light space. Edges are
-    // wobbled by the same surface-anchored noise the strokes use, so
-    // cast shadow shapes read as hand-painted. Returns 1 = blocked;
-    // the boundary itself is a fractional ~sub-texel antialiased ramp.
-    float castAt(vec3 w) {
+    // cast-shadow test. Map path: PCF in the sun's orthographic light
+    // space. Stencil path: the screen-space stencil-volume mask, sampled
+    // at this pixel — pixel-exact geometry, re-hardened from its bilinear
+    // ramp into a crisp antialiased edge. Both wobble the lookup by the
+    // same surface-anchored noise the strokes use, so cast shadow shapes
+    // read as hand-painted. Returns 1 = blocked.
+    float castAt(vec2 p, vec3 w) {
       if (castOn < 0.5) return 0.0;
+      if (stencilOn > 0.5) {
+        // wobble in screen UV, amplitude anchored to a fixed WORLD size
+        // at this pixel's depth (worldSize * invFov / viewZ = UV along y)
+        float hnfS = 0.35 / hatchNoiseScale;
+        vec2 wob = (vec2(vnoise3(w * hnfS), vnoise3(w * hnfS + 40.0)) - 0.5)
+                 * hatchNoise * stencilWobW * invFovScale / max(linDepth(p), 0.2);
+        wob.x *= resolution.y / resolution.x;
+        return smoothstep(0.3, 0.7, texture2D(tStencilMask, p + wob).r);
+      }
       vec4 lp = lightVP * vec4(w, 1.0);
       vec3 sc = lp.xyz * 0.5 + 0.5;      // ortho: no perspective divide
       if (sc.x <= 0.0 || sc.x >= 1.0 || sc.y <= 0.0 || sc.y >= 1.0 || sc.z >= 1.0)
@@ -3150,7 +3385,7 @@ const post = new THREE.ShaderMaterial({
     // shadow shapes get ink outlines from the same detector.
     float shadowMaskAt(vec2 p) {
       vec3 w = worldAt(p);
-      float castS = castSmoothOn > 0.5 ? castMaskAt(p) : castAt(w);
+      float castS = castSmoothOn > 0.5 ? castMaskAt(p) : castAt(p, w);
       // hard mode on the smoothed path: the melt mask already contains
       // the terminator — re-deriving it here would ink the jagged
       // per-facet edge instead of the rounded one
@@ -3227,7 +3462,7 @@ const post = new THREE.ShaderMaterial({
         // style downstream (hard step, soft ramp, hatch strokes) treats
         // it that way automatically
         float castS = castSmoothOn > 0.5   // "cast" itself is a GLSL reserved word
-                    ? castMaskAt(uv) : castAt(wp);
+                    ? castMaskAt(uv) : castAt(uv, wp);
         shade = min(shade, 1.0 - castS);
         float glowS = 1.0 - texture2D(tPaint, uv).a;   // emissive: no shading
         float hnf = 0.35 / hatchNoiseScale;
@@ -3290,7 +3525,7 @@ const post = new THREE.ShaderMaterial({
       // grounded root darkens both sides equally, so the seamless
       // contact survives under shadow.
       if (hatchOn > 0.5 && !sky && unlitF > 0.5) {
-        float castS = castSmoothOn > 0.5 ? castMaskAt(uv) : castAt(wp);
+        float castS = castSmoothOn > 0.5 ? castMaskAt(uv) : castAt(uv, wp);
         float glowS = 1.0 - texture2D(tPaint, uv).a;
         shadow = min(shadowAmount * castS, 1.0) * (1.0 - glowS);
       }
@@ -3935,6 +4170,7 @@ const castMaskMat = new THREE.ShaderMaterial({
   uniforms: {
     tDepth: { value: null }, tShadow: { value: null },
     tShadowC: { value: null },   // RG-packed readable blocker depth
+    tStencilMask: { value: null }, stencilOn: { value: 0 },
     tNormal: { value: null }, tID: { value: null },
     invViewProj: { value: new THREE.Matrix4() },
     lightVP: { value: new THREE.Matrix4() },
@@ -3955,10 +4191,10 @@ const castMaskMat = new THREE.ShaderMaterial({
   fragmentShader: /* glsl */`
     precision highp float;
     varying vec2 vUv;
-    uniform sampler2D tDepth, tNormal, tID, tShadowC;
+    uniform sampler2D tDepth, tNormal, tID, tShadowC, tStencilMask;
     uniform highp sampler2DShadow tShadow;
     uniform mat4 invViewProj, lightVP;
-    uniform float shadowBias, hatchThreshold, selfShade, castOn;
+    uniform float shadowBias, hatchThreshold, selfShade, castOn, stencilOn;
     uniform float uPenK, uPenMin, uPenMax, uTermR, uMaxR, uDepthRange;
     uniform vec2 uSearchUv, uTexel;
     uniform vec3 lightDir;
@@ -3976,7 +4212,14 @@ const castMaskMat = new THREE.ShaderMaterial({
       vec4 wp = invViewProj * vec4(vUv * 2.0 - 1.0, z * 2.0 - 1.0, 1.0);
       vec3 w = wp.xyz / wp.w;
       float m = 0.0, radW = 0.0;
-      if (castOn > 0.5) {
+      if (castOn > 0.5 && stencilOn > 0.5) {
+        // stencil-volume path: the mask is already screen space and
+        // pixel-exact. No blocker depths exist to estimate throw from,
+        // so the melt radius is one flat value (uPenMax, slider/10) —
+        // the pre-contact-hardening behavior.
+        m = step(0.5, texture2D(tStencilMask, vUv).r);
+        radW = uPenMax;
+      } else if (castOn > 0.5) {
         vec4 lp = lightVP * vec4(w, 1.0);
         vec3 sc = lp.xyz * 0.5 + 0.5;
         if (sc.x > 0.0 && sc.x < 1.0 && sc.y > 0.0 && sc.y < 1.0 && sc.z < 1.0) {
@@ -4538,6 +4781,9 @@ section('shading');
 checkbox('hatchOn', 'enabled');
 dropdown('shadeStyle', 'style', ['hatch', 'hard', 'soft']);
 checkbox('castShadow', 'cast shadows');
+// stencil = per-triangle depth-fail shadow volumes (pixel-exact, no
+// bias/res); bias + map-res + contact hardening are map-path only
+dropdown('shadowTech', 'technique', ['map', 'stencil']);
 slider('lightAzimuth', 'light azimuth°', 0, 360, 1);
 slider('lightElevation', 'light elev°', 10, 80, 1);
 checkbox('lightOrbit', 'orbit light');
@@ -4667,7 +4913,14 @@ function gpuBytes() {
   b += tgt(targetsLo) + tgt(targetsHi);
   if (rtScreen) b += rtScreen.width * rtScreen.height * 4;
   if (rtEdges) b += rtEdges.width * rtEdges.height * 8;   // edges + weights
-  if (P.castShadow) b += (+P.shadowRes) * (+P.shadowRes) * 8;   // shadow map color + depth
+  if (P.castShadow && P.shadowTech !== 'stencil')
+    b += (+P.shadowRes) * (+P.shadowRes) * 8;   // shadow map color + depth
+  // stencil path: volume geometry + the screen-space mask target
+  // (color + packed depth24/stencil8)
+  if (P.shadowTech === 'stencil') {
+    b += volBytes;
+    if (rtStencil) b += rtStencil.width * rtStencil.height * 8;
+  }
   return b;
 }
 // Geometry draws only — the fullscreen post passes aren't the interesting
@@ -4759,7 +5012,9 @@ function updateBudget(frameCount, elapsed) {
     ` · edge ${Math.round(tEdges)} · rest ${Math.round(rest)} ms`;
   const cv = renderer.domElement;
   infoEl.textContent =
-    `${drawCalls()} draw${drawCalls() > 1 ? 's' : ''} · ${(cv.width * cv.height / 1e6).toFixed(2)} MP canvas`;
+    `${drawCalls()} draw${drawCalls() > 1 ? 's' : ''} · ${(cv.width * cv.height / 1e6).toFixed(2)} MP canvas` +
+    (P.shadowTech === 'stencil' && volTriCount
+      ? ` · ${fmtN(volTriCount)} volume tris (${Math.round(lastVolBuildMs)} ms)` : '');
   window.__tris = triCount;
 }
 
@@ -5013,7 +5268,8 @@ function renderFrame(useHi) {
   // Glass and lines are already hidden; glass casts nothing. The map is
   // depth-only, taken from an orthographic camera fitted to the visible
   // slice of the scene.
-  if (P.castShadow && P.hatchOn) {
+  const stencilMode = P.shadowTech === 'stencil';
+  if (P.castShadow && P.hatchOn && !stencilMode) {
     if (fitShadowFrustum()) shadowDirty = true;
     if (shadowDirty) {
       renderer.setRenderTarget(rtShadow);
@@ -5024,6 +5280,39 @@ function renderFrame(useHi) {
       scene.overrideMaterial = null;
       shadowDirty = false;
     }
+  }
+
+  // stencil shadow volumes: view-dependent, so regenerated every frame
+  // (this loop only renders on dirty anyway). Sequence: depth prepass +
+  // two volume passes under an infinite-far projection, then a stencil-
+  // gated fullscreen extract into the mask's color attachment.
+  if (P.castShadow && P.hatchOn && stencilMode) {
+    if (volDirty) rebuildShadowVolumes();
+    // actors can be hidden (or culled from the opaque pass); their
+    // volumes must agree or they'd cast from nowhere
+    for (const l of volLinks) l.mesh.visible = l.srcRoot.visible;
+    ensureStencilTarget(T.rtID.width, T.rtID.height);
+    volUniforms.uLightDir.value.copy(lightWorld).negate();   // direction light travels
+    applyInfiniteProjection(camera);
+    const prevAuto = renderer.autoClear;
+    renderer.autoClear = false;   // would wipe the stencil between passes
+    renderer.setRenderTarget(rtStencil);
+    renderer.setClearColor(0x000000, 1);   // 0 = lit
+    renderer.clear(true, true, true);
+    scene.overrideMaterial = volDepthMat;  // opaque state matches pass 1a
+    renderer.render(scene, camera);
+    scene.overrideMaterial = null;
+    volScene.overrideMaterial = volBackMat;
+    renderer.render(volScene, camera);
+    volScene.overrideMaterial = volFrontMat;
+    renderer.render(volScene, camera);
+    volScene.overrideMaterial = null;
+    blitQuad.material = stencilExtractMat;
+    renderer.render(blitScene, postCamera);
+    renderer.autoClear = prevAuto;
+    // restore the finite projection — everything downstream (normal
+    // pass, invViewProj reconstruction) uses the standard matrix
+    camera.updateProjectionMatrix();
   }
 
   // pass 2: view-space normals — needed by hatching/shadows and by the
@@ -5071,6 +5360,8 @@ function renderFrame(useHi) {
     cm.hatchThreshold.value = P.hatchThreshold;
     cm.selfShade.value = P.shadeStyle === 'hard' ? 1 : 0;
     cm.castOn.value = P.castShadow ? 1 : 0;
+    cm.tStencilMask.value = rtStencil ? rtStencil.texture : null;
+    cm.stencilOn.value = stencilMode ? 1 : 0;
     cm.tShadowC.value = rtShadow.texture;
     cm.uPenK.value = P.shadowSmoothPx / 100;
     // 1.2 texels: enough with the diamond-PCF extract to hide texel
@@ -5174,6 +5465,11 @@ function renderFrame(useHi) {
   const wobW = 16 * (sceneSphere ? sceneSphere.radius : 100) / +P.shadowRes;
   u.shadowWobUv.value.set(wobW / (lightCam.right - lightCam.left),
                           wobW / (lightCam.top - lightCam.bottom));
+  u.tStencilMask.value = rtStencil ? rtStencil.texture : null;
+  u.stencilOn.value = stencilMode ? 1 : 0;
+  // same fixed-world-size wobble as the map path, on a constant 2048
+  // basis so the shadow-map res dropdown doesn't touch the stencil look
+  u.stencilWobW.value = 16 * (sceneSphere ? sceneSphere.radius : 100) / 2048;
   u.tCastMask.value = T.rtMaskB.texture;
   u.castSmoothOn.value = castSmooth ? 1 : 0;
   // uMaxR world units -> screen px at unit depth; castMaskAt scales this

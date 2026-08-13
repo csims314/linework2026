@@ -39,6 +39,13 @@
   .row .val { flex:0 0 34px; text-align:right; color:#e8a33d; }
   .row input[type=checkbox] { accent-color:#e8a33d; }
   .row input[type=color] { flex:0 0 34px; height:20px; border:none; background:none; padding:0; }
+  /* pinned rows carry "section · label", so give the label more room */
+  #starbox .row label { flex-basis:148px; }
+  .row button.mini { flex:0 0 14px; padding:0; margin:0; background:none; border:none;
+    cursor:pointer; font-size:11px; line-height:1; color:#555e6b; }
+  .row button.mini:hover { color:#dfe3ea; }
+  .row button.mini.reset { color:#e8a33d; }
+  .row button.mini.star.on { color:#e8a33d; }
   .row select { flex:1; min-width:0; background:#2b303a; color:#dfe3ea; border:1px solid #444c59;
     border-radius:5px; padding:3px 4px; font:inherit; font-size:11px; cursor:pointer; }
   button { background:#2b303a; color:#dfe3ea; border:1px solid #444c59; border-radius:5px; padding:4px 8px; font:inherit; cursor:pointer; margin:2px 2px 0 0;}
@@ -64,13 +71,20 @@
   #budget .gpu { margin-top:9px; padding-top:7px; border-top:1px solid #333a45;
     color:#8fa3bf; font-size:10px; line-height:1.35; word-break:break-word; }
   #budget .info { color:#6d7d92; font-size:10px; margin-top:7px; line-height:1.4; }
+  #budget details { margin-top:6px; border-top:1px solid #333a45; }
+  #budget summary { cursor:pointer; list-style:none; user-select:none; padding:6px 0 0;
+    font-size:10px; color:#8fa3bf; text-transform:uppercase; letter-spacing:.12em; }
+  #budget summary::-webkit-details-marker { display:none; }
+  #budget summary::before { content:'\25B8'; display:inline-block; width:12px; color:#e8a33d; }
+  #budget details[open] summary::before { content:'\25BE'; }
+  #budget details[open] #budgetAdvList { margin-top:7px; }
 </style>
 </head>
 <body>
 <div id="app"></div>
 <div id="sceneMenu"><h1>SCENES</h1><div id="sceneList"></div></div>
 <div id="panel"><h1>MOEBIUS LINES</h1></div>
-<div id="budget"><h1>BUDGET</h1><div id="budgetList"></div></div>
+<div id="budget"><h1>BUDGET</h1><div id="budgetList"></div><details id="budgetAdv"><summary>advanced</summary><div id="budgetAdvList"></div></details></div>
 <div id="hint">drag&nbsp;=&nbsp;orbit&nbsp;&nbsp;·&nbsp;&nbsp;shift-drag&nbsp;=&nbsp;pan&nbsp;&nbsp;·&nbsp;&nbsp;wheel&nbsp;=&nbsp;zoom&nbsp;&nbsp;·&nbsp;&nbsp;drop&nbsp;.obj&nbsp;to&nbsp;load</div>
 
 <script type="importmap">
@@ -99,6 +113,20 @@ const P = {
   showIDs: false,
   // debug: raw triangle wireframe on paper (ink-colored lines)
   wireframe: false,
+  // procedural skybox: horizon tint of the gradient, cloud coverage,
+  // and scattered pale ovals on the ground plane (all shader noise)
+  skyHorizon: '#f4d9c8', clouds: 0.55, groundSpeckle: 1,
+  // sky gradient height (elevation where horizon tint gives way to sky),
+  // cloud mass scale + horizon fade-in band, speckle size multiplier
+  // (1 = the old hardcoded look) and distance-fade STRENGTH: 0 = never
+  // fade (default), 1 = the old ramp, higher pulls the fade closer
+  skyGradHeight: 0.30, cloudScale: 5.5, cloudFade: 0.10,
+  speckleSize: 1, speckleFade: 0,
+  // emissive sun disc drawn at the LIGHT direction (size in degrees, 0 = off)
+  sunSize: 15, sunColor: '#f7c948', sunGlow: 0.35,
+  // halo extent as a multiple of the disc, and how far the core pushes
+  // from sunColor toward white
+  sunHaloWidth: 3.5, sunCore: 0.4,
   // feature LOD: fade a line when the shapes it separates are small on screen.
   // minFeature is a % of screen height; 0 disables the whole feature.
   minFeature: 0.4, lodMetric: 'area', lodUnit: 'region', keepSilhouettes: false,
@@ -117,11 +145,16 @@ const P = {
   // light moves or the camera shifts its fitted light window; a still
   // view is as cheap as a baked map. Orbit animates the azimuth.
   castShadow: true, lightAzimuth: 303, lightElevation: 50,
-  // shadowSmoothPx simplifies the cast-shadow silhouette: the shadow
-  // mask is blurred by this many screen pixels and re-thresholded at
-  // 50%, twice — features smaller than the radius vanish and corners
-  // round into painted lobes. 0 = exact geometry (single-tap path).
-  lightOrbit: false, shadowBias: 0.0015, shadowRes: '2048', shadowSmoothPx: 12,
+  // shadowSmoothPx simplifies the shadow silhouette: the shadow mask
+  // is blurred and re-thresholded at 50%, twice — features smaller than
+  // the radius vanish and corners round into painted lobes. The radius
+  // is CONTACT-HARDENING, in world units: it grows with how far the
+  // shadow traveled from its caster (slider/100 per unit of throw,
+  // capped at slider/10), so small props and contact points keep crisp
+  // defined shadows while tall casters get wide simplified edges. In
+  // hard shade mode the lambert terminator melts too, at a flat
+  // slider/20 radius. 0 = exact geometry (single-tap path).
+  lightOrbit: false, orbitLightSpeed: 12, shadowBias: 0.0015, shadowRes: '2048', shadowSmoothPx: 12,
   // stroke breakup: displacement noise amount (past ~1 strokes start
   // folding into stipple — allowed, it reads as dry-brush) and the
   // world-space feature size of that noise. hatchBreak erodes strokes
@@ -136,12 +169,17 @@ const P = {
   // of the regular line radius
   shadowLine: 0.46, shadowLineWidth: 1.65,
   // colors
-  inkColor: '#1d1a17', paperColor: '#f6f2e6', paperGrain: 0.05,
+  inkColor: '#1d1a17', paperColor: '#f6f2e6', paperGrain: 0, grainScale: 1,
+  // paper material model: pressed-felt fiber strength and granule flecks
+  paperFiber: 0.35, paperFleck: 0.5,
   // watercolor (raster mode only): per-kind fills baked at rebuild,
   // wash/pooling/tint/fade applied in the compose step. colorOn off
   // must render pixel-identical to the pre-color build.
   colorOn: true, skyColor: '#d8efec',
-  washAmount: 0.05, washScale: 3.05, poolAmount: 0.01, inkTint: 1, aerialFade: 0.81,
+  washAmount: 0, washScale: 3.05, poolAmount: 0.01, inkTint: 0, aerialFade: 0.81,
+  // edge-pooling band width (× line radius) and the aerial fade ramp
+  // endpoints as fractions of the camera far plane
+  poolRadius: 3.5, aerialNear: 0.18, aerialFar: 0.9,
   // per-region value drift baked into aPaint — adjacent panels read as
   // separately mixed brush pools (rebuilds on change)
   regionJitter: 0.07,
@@ -160,7 +198,7 @@ const P = {
   playerMode: false, walkSpeed: 1, driveSpeed: 1,
   camDist: 9, camHeight: 1.6, collision: false,
   // scene
-  scene: 'yard', perQuad: false, autoRotate: false, seed: 7, density: 2.5,
+  scene: 'yard', perQuad: false, autoRotate: false, rotateSpeed: 7.5, seed: 7, density: 2.5,
 };
 
 /* ============================================================
@@ -845,6 +883,23 @@ let modelScenes = [];   // [{ name, files: [{ name, text }] }]
 // folder. Too big to embed; the scene builds without it and rebuilds
 // once the text arrives.
 let hoverbikeText = null;
+// Blender-authored garden assets for the tendril scene (Models/garden/),
+// fetched alongside the hoverbike; each is optional — the scene builds
+// with whatever has arrived and rebuilds when loads land
+const GARDEN_NAMES = ['mushroom_tower', 'woven_barrel', 'moss_arch_mound',
+  'leaf_fan', 'bulb_lamp', 'cairn_stack', 'root_arc', 'bead_reed',
+  'lily_pad', 'tube_cluster', 'puff_shrub', 'rock_slab', 'coral_column'];
+const gardenText = {};
+// fallback for file:// (no fetch): pull garden OBJs from the cached
+// models folder if the user has picked it since Models/garden existed
+function fillGardenFromModelScenes() {
+  for (const sc of modelScenes)
+    for (const f of sc.files) {
+      const m = /^(.+)\.obj$/i.exec(f.name);
+      if (m && GARDEN_NAMES.includes(m[1]) && !gardenText[m[1]])
+        gardenText[m[1]] = f.text;
+    }
+}
 function findHoverbikeText() {
   if (hoverbikeText) return hoverbikeText;
   for (const sc of modelScenes)
@@ -1887,6 +1942,56 @@ function buildTendrils() {
       }
     }
   }))));
+  // ---- garden pieces: Blender-authored organic assets ------------
+  // Placed through the same rejection-sampled keep-outs as the
+  // tendrils (which are already laid out, so their rng stream is
+  // unaffected by which assets have loaded). soft pieces grow from
+  // the sand: unlit + soft-root + paint blend, like the tendrils —
+  // but they still cast shadows. Others are lit casters.
+  const GARDEN_LAYOUT = {
+    mushroom_tower:  { n: 1, s: [0.5, 0.62], zone: [-24, -10], R: 6,   soft: false },
+    root_arc:        { n: 2, s: [0.75, 1.0], zone: [-28, -6],  R: 7,   soft: true },
+    moss_arch_mound: { n: 2, s: [0.5, 0.7],  zone: [-22, 0],   R: 5,   soft: true },
+    coral_column:    { n: 2, s: [0.45, 0.6], zone: [-26, -8],  R: 3,   soft: false },
+    cairn_stack:     { n: 3, s: [0.28, 0.42], zone: [-20, 8],  R: 2.5, soft: false },
+    woven_barrel:    { n: 3, s: [0.22, 0.3], zone: [-12, 12],  R: 2.2, soft: false },
+    bulb_lamp:       { n: 3, s: [0.25, 0.38], zone: [-18, 10], R: 2,   soft: false },
+    leaf_fan:        { n: 4, s: [0.2, 0.34], zone: [-20, 10],  R: 1.8, soft: true },
+    tube_cluster:    { n: 5, s: [0.14, 0.24], zone: [-14, 16], R: 1.4, soft: true },
+    puff_shrub:      { n: 5, s: [0.1, 0.2],  zone: [-16, 16],  R: 1.2, soft: true },
+    rock_slab:       { n: 4, s: [0.16, 0.3], zone: [-18, 14],  R: 1.8, soft: false },
+    bead_reed:       { n: 6, s: [0.16, 0.28], zone: [-16, 12], R: 0.8, soft: false },
+    lily_pad:        { n: 5, s: [0.12, 0.2], zone: [-8, 18],   R: 1.2, soft: true },
+  };
+  fillGardenFromModelScenes();     // file:// fallback via the folder cache
+  for (const gname of GARDEN_NAMES) {
+    const cfg = GARDEN_LAYOUT[gname], txt = gardenText[gname];
+    if (!cfg || !txt) continue;
+    for (let i = 0; i < cfg.n; i++) {
+      let px = 0, pz = 0, ok = false;
+      for (let a = 0; a < 20 && !ok; a++) {
+        px = (rng() - 0.5) * 92;
+        pz = cfg.zone[0] + rng() * (cfg.zone[1] - cfg.zone[0]);
+        ok = placed.every(p => {
+          const dx = px - p.x, dz = pz - p.z, m = cfg.R + p.R;
+          return dx * dx + dz * dz >= m * m;
+        });
+      }
+      if (!ok) continue;
+      placed.push({ x: px, z: pz, R: cfg.R });
+      const s = cfg.s[0] + rng() * (cfg.s[1] - cfg.s[0]);
+      const gg = parseOBJ(txt);
+      gg.applyMatrix4(new THREE.Matrix4().makeScale(s, s, s));
+      const yaw = rng() * Math.PI * 2;
+      const doPut = () => { setPaint(null); put(null, gg, px, 0, pz, 0, yaw, 0, 0.55); };
+      withContours(() => {
+        if (cfg.soft)
+          withUnlit(() => withSoftRoot(() => withPaintBlend(groundCol, 0.3, 1.6, doPut)));
+        else doPut();
+      });
+    }
+  }
+
   // the parked hoverbike (Models/hoverbike.obj) on the open sand in
   // front of the thicket — the one lit, shadow-casting machine in the
   // field (built last so the tendril layout's rng/crng streams stay
@@ -2628,7 +2733,9 @@ function makeTargets() {
 makeTargets();
 
 // cast-shadow map: screen-resolution independent, cached until
-// shadowDirty. Depth-only content; the color attachment is unused.
+// shadowDirty. Depth in the depth attachment (compare-only, for PCF);
+// the color attachment holds the same depth RG-packed and readable,
+// for the contact-hardening blocker search.
 let rtShadow = null;
 function makeShadowTarget() {
   if (rtShadow) rtShadow.dispose();
@@ -2664,7 +2771,12 @@ const depthOnlyMat = new THREE.ShaderMaterial({
     varying float vNoCast;
     void main() {
       if (vNoCast > 0.5) discard;
-      gl_FragColor = vec4(1.0);
+      // pack window-space depth into RG (8+8 bit): the depth attachment
+      // is compare-only (hardware PCF), so the color attachment doubles
+      // as a READABLE blocker-depth map for the contact-hardening
+      // penumbra estimate. Clear color white decodes as beyond-far.
+      float hi = floor(gl_FragCoord.z * 255.0) / 255.0;
+      gl_FragColor = vec4(hi, (gl_FragCoord.z - hi) * 255.0, 0.0, 1.0);
     }`,
 });
 
@@ -2690,8 +2802,16 @@ const post = new THREE.ShaderMaterial({
     hatchNoise: { value: 0 }, hatchNoiseScale: { value: 1 }, hatchBreak: { value: 0 },
     shadeMode: { value: 0 }, shadowAmount: { value: 0 },
     shadowLine: { value: 0 }, shadowLineWidth: { value: 1 },
-    paperGrain: { value: 0 }, oneSided: { value: 0 }, coverage: { value: 0 },
+    paperGrain: { value: 0 }, grainScale: { value: 1 }, ssScale: { value: 1 },
+    oneSided: { value: 0 }, coverage: { value: 0 },
     edgeToAlpha: { value: 0 }, softContact: { value: 0 }, groundY: { value: 0 },
+    horizonColor: { value: new THREE.Color(P.skyHorizon) },
+    cloudAmt: { value: 0 }, speckleAmt: { value: 0 },
+    skyGradHeight: { value: 0.30 }, cloudScale: { value: 5.5 }, cloudFade: { value: 0.10 },
+    speckleSize: { value: 1 }, speckleFade: { value: 0 },
+    sunDir: { value: new THREE.Vector3(0, 1, 0) },
+    sunSize: { value: 0 }, sunColor: { value: new THREE.Color(P.sunColor) },
+    sunGlow: { value: 0 }, sunHaloWidth: { value: 3.5 }, sunCore: { value: 0.4 },
     minFeature: { value: 0 }, invFovScale: { value: 1 }, keepSil: { value: 0 },
     // watercolor
     tPaint:     { value: null },
@@ -2699,6 +2819,8 @@ const post = new THREE.ShaderMaterial({
     colorOn:    { value: 1 },
     washAmount: { value: 0 }, washScale: { value: 1 }, poolAmount: { value: 0 },
     inkTint: { value: 0 }, aerialFade: { value: 0 },
+    poolRadius: { value: 3.5 }, aerialNear: { value: 0.18 }, aerialFar: { value: 0.9 },
+    paperFiber: { value: 0.35 }, paperFleck: { value: 0.5 },
     invViewProj: { value: new THREE.Matrix4() },
     viewToWorldN: { value: new THREE.Matrix3() },
     // glass & glow
@@ -2711,7 +2833,7 @@ const post = new THREE.ShaderMaterial({
     tShadow: { value: null }, lightVP: { value: new THREE.Matrix4() },
     castOn: { value: 0 }, shadowBias: { value: 0 },
     shadowWobUv: { value: new THREE.Vector2() },
-    tCastMask: { value: null }, castSmoothOn: { value: 0 }, castBand: { value: 0.2 },
+    tCastMask: { value: null }, castSmoothOn: { value: 0 }, castPxScale: { value: 0 },
   },
   vertexShader: /* glsl */`
     varying vec2 vUv;
@@ -2728,11 +2850,15 @@ const post = new THREE.ShaderMaterial({
                   wobbleAmp, wobbleFreq, hatchOn, hatchThreshold, crossThreshold,
                   hatchSpacing, hatchWidth, hatchAngle, hatchNoise, hatchNoiseScale,
                   hatchBreak, shadeMode, shadowAmount, shadowLine, shadowLineWidth,
-                  paperGrain, oneSided, coverage, minFeature, invFovScale, keepSil,
-                  edgeToAlpha, softContact, groundY;
+                  paperGrain, grainScale, ssScale, oneSided, coverage, minFeature, invFovScale, keepSil,
+                  edgeToAlpha, softContact, groundY, cloudAmt, speckleAmt, sunSize, sunGlow,
+                  skyGradHeight, cloudScale, cloudFade, speckleSize, speckleFade,
+                  sunHaloWidth, sunCore, paperFiber, paperFleck;
+    uniform vec3 horizonColor, sunDir, sunColor;
     uniform sampler2D tPaint;
     uniform vec3 skyColor;
-    uniform float colorOn, washAmount, washScale, poolAmount, inkTint, aerialFade;
+    uniform float colorOn, washAmount, washScale, poolAmount, inkTint, aerialFade,
+                  poolRadius, aerialNear, aerialFar;
     uniform mat4 invViewProj;
     uniform mat3 viewToWorldN;
     uniform sampler2D tGlassID, tGlassPaint, tGlassDepth, tGlow;
@@ -2744,7 +2870,7 @@ const post = new THREE.ShaderMaterial({
     uniform float castOn, shadowBias;
     uniform vec2 shadowWobUv;   // wobble amplitude: fixed world size -> window UV
     uniform sampler2D tCastMask;            // blurred + re-thresholded shadow mask
-    uniform float castSmoothOn, castBand;
+    uniform float castSmoothOn, castPxScale;
 
     // ---- helpers -------------------------------------------------
     float hash(vec2 p) {
@@ -2838,6 +2964,23 @@ const post = new THREE.ShaderMaterial({
                    + glassInkB(p + px * RG3, o) + glassInkB(p + px * RG4, o));
     }
     float lum(vec3 c) { return c.r + c.g + c.b; }
+
+    // ---- paper tooth ------------------------------------------------
+    // one octave of value noise reads as low-res fog, so the paper is a
+    // small material model instead: a rotated two-octave fBm base, two
+    // crossed anisotropic octaves for pressed-felt fiber direction, and
+    // a band-passed fleck layer thresholded into discrete granules.
+    // Still all value noise — no textures. Output stays ~[0,1] with a
+    // ~0.5 mean so the existing amount math is unchanged.
+    float paperTooth(vec2 sp) {
+      vec2 p2 = mat2(0.8, -0.6, 0.6, 0.8) * sp;
+      float base = vnoise(sp * 0.55) * 0.55 + vnoise(p2 * 1.13) * 0.30;
+      float fib = vnoise(sp * vec2(0.23, 1.05) + 31.7)
+                * vnoise(sp * vec2(1.05, 0.23) + 77.3);
+      float bp = vnoise(sp * 0.9 + 13.1) - vnoise(sp * 1.02 + 57.9);
+      float fleck = smoothstep(0.10, 0.22, bp);
+      return clamp((base + fib * paperFiber) * 0.75 + fleck * paperFleck, 0.0, 1.0);
+    }
 
     // ---- feature LOD --------------------------------------------
     // the ID buffer's alpha carries each shape's world size (log
@@ -2991,7 +3134,14 @@ const post = new THREE.ShaderMaterial({
     // features are gone and corners are rounded before we ever get here;
     // the narrow band just re-hardens the edge with ~a pixel of AA.
     float castMaskAt(vec2 p) {
-      return smoothstep(0.5 - castBand, 0.5 + castBand, texture2D(tCastMask, p).r);
+      // AA band from the melt's per-pixel on-screen radius (G channel =
+      // contact-hardening radius / uMaxR, blurred along with the mask):
+      // the re-hardening band has to track the blur that made the field
+      // (band ~ 1.2/r), per pixel now that the radius varies per shadow
+      vec4 cm = texture2D(tCastMask, p);
+      float rpx = clamp(cm.g * castPxScale / max(linDepth(p), 1e-3), 3.0, 66.0);
+      float band = min(0.45, 1.2 / rpx);
+      return smoothstep(0.5 - band, 0.5 + band, cm.r);
     }
 
     // the shading test as a reusable mask, so shadow boundaries can be
@@ -3001,6 +3151,11 @@ const post = new THREE.ShaderMaterial({
     float shadowMaskAt(vec2 p) {
       vec3 w = worldAt(p);
       float castS = castSmoothOn > 0.5 ? castMaskAt(p) : castAt(w);
+      // hard mode on the smoothed path: the melt mask already contains
+      // the terminator — re-deriving it here would ink the jagged
+      // per-facet edge instead of the rounded one
+      if (castSmoothOn > 0.5 && abs(shadeMode - 1.0) < 0.5)
+        return step(0.5, castS);
       // unlit surfaces have no terminator — their mask is cast-only,
       // so shadow shapes still get outlines on flat paper grounds
       if (mod(floor(texture2D(tID, p).b * 255.0 + 0.5), 2.0) > 0.5)
@@ -3089,8 +3244,12 @@ const post = new THREE.ShaderMaterial({
           } else {
             // hard: binary — a pixel is shadowed or it is not, one flat
             // level. The cast term joins by max, outside the step, so its
-            // antialiased edge fraction isn't re-binarized into jaggies
-            shadow = shadowAmount * max(step(shade + sn, hatchThreshold), castS);
+            // antialiased edge fraction isn't re-binarized into jaggies.
+            // On the smoothed path the mask was extracted with the
+            // terminator already folded in — use it whole, don't re-step
+            // the jagged per-facet edge back on top
+            shadow = shadowAmount * (castSmoothOn > 0.5 ? castS
+                   : max(step(shade + sn, hatchThreshold), castS));
           }
           // intensity 1 = pitch black, never past it; lamps take none
           shadow = min(shadow, 1.0) * (1.0 - glowS);
@@ -3157,7 +3316,9 @@ const post = new THREE.ShaderMaterial({
         ink *= clamp(mix(1.0, clamp(14.0 / dC, 0.0, 1.0), fExtra), 0.0, 1.0);
 
       // ---- compose on paper --------------------------------------
-      float grain = vnoise(vUv * resolution * 0.7);
+      // display-pixel anchored so supersampling can't average it away;
+      // grainScale >1 = coarser tooth
+      float grain = paperTooth(vUv * resolution / (grainScale * ssScale));
       vec3 col;
       if (colorOn < 0.5) {
         // legacy path — byte-identical to the pre-color renderer when
@@ -3166,7 +3327,63 @@ const post = new THREE.ShaderMaterial({
         paper *= 1.0 - shadow;
         col = mix(paper, inkColor, clamp(ink, 0.0, 1.0));
       } else if (sky) {
-        col = skyColor * (1.0 - paperGrain * 0.6 * grain);
+        // ---- PROCEDURAL SKYBOX: gradient + ink-outlined clouds ----
+        // world view ray via two unprojects (sky pixels only)
+        vec2 sndc = uv * 2.0 - 1.0;
+        vec4 wra = invViewProj * vec4(sndc, -1.0, 1.0);
+        vec4 wrb = invViewProj * vec4(sndc, 1.0, 1.0);
+        vec3 rd = normalize(wrb.xyz / wrb.w - wra.xyz / wra.w);
+        float el = max(rd.y, 0.0);
+        col = mix(horizonColor, skyColor, smoothstep(0.02, max(skyGradHeight, 0.03), el));
+        // ---- the sun: an emissive disc AT the light direction, so it
+        // agrees with the cast shadows and rides the light-orbit
+        // animation. Soft halo bloom + hot core + the house ink rim.
+        // Drawn before the clouds so they can pass in front of it.
+        if (sunSize > 0.0) {
+          float sunD = dot(rd, sunDir);
+          float cosR = cos(sunSize);
+          // wide halo: quadratic falloff outside the disc
+          float haloS = pow(clamp((sunD - cos(sunSize * sunHaloWidth)) /
+                                  max(1.0 - cos(sunSize * sunHaloWidth), 1e-4), 0.0, 1.0), 3.0);
+          col = mix(col, sunColor, haloS * sunGlow);
+          float aaS = fwidth(sunD) + 1e-6;
+          float disc = smoothstep(cosR - aaS, cosR + aaS, sunD);
+          col = mix(col, mix(sunColor, vec3(1.0), sunCore), disc);
+          // ink rim, tinted like every other line
+          float sws = lineWidth * 0.5;
+          float srimS = (1.0 - smoothstep(sws * aaS, (sws + 1.0) * aaS, abs(sunD - cosR)))
+                      * min(lineWidth, 1.0);
+          vec3 sInk = mix(inkColor, sunColor * vec3(0.32, 0.30, 0.48), inkTint);
+          col = mix(col, sInk, srimS * 0.85);
+        }
+        if (cloudAmt > 0.0 && rd.y > 0.015) {
+          // clouds on a STEREOGRAPHIC dome mapping: seam-free,
+          // world-anchored, zenith-stable (the old plane projection
+          // degenerated straight overhead), still flattening gently
+          // toward the horizon. Two octaves of the same value noise as
+          // everything else — no textures.
+          vec2 cp = rd.xz / (1.0 + rd.y) * cloudScale;
+          float n = vnoise(cp) * 0.65 + vnoise(cp * 2.7 + 19.1) * 0.35;
+          float t = 1.0 - cloudAmt * 0.42;       // coverage -> threshold
+          float aaN = fwidth(n) + 1e-5;          // one pixel worth of n
+          // only the horizon fade-in remains — overhead is covered now
+          float band = smoothstep(0.03, max(cloudFade, 0.04), el);
+          float cfill = smoothstep(t, t + aaN * 1.5, n) * band;
+          // ink rim straddling the threshold, matched to the detector's
+          // lines: total width = lineWidth px, and sub-pixel widths
+          // render at partial strength (the hairline-gray look the
+          // geometry lines get from coverage AA)
+          float cw = lineWidth * 0.5;
+          float crim = (1.0 - smoothstep(cw * aaN, (cw + 1.0) * aaN, abs(n - t)))
+                     * band * min(lineWidth, 1.0);
+          col = mix(col, vec3(0.985, 0.985, 0.98), cfill);
+          // cloud rims obey the same ink-tint model as every other
+          // line, with the cloud's white fill as their "paint" — at
+          // inkTint 1 no line anywhere shows the raw ink color
+          vec3 cInk = mix(inkColor, vec3(0.985, 0.985, 0.98) * vec3(0.32, 0.30, 0.48), inkTint);
+          col = mix(col, cInk, crim * 0.8);
+        }
+        col *= 1.0 - paperGrain * 0.6 * grain;
       } else {
         vec4 pp = texture2D(tPaint, uv);          // same wobbled uv as tID
         vec3 paint = pp.rgb;
@@ -3189,9 +3406,67 @@ const post = new THREE.ShaderMaterial({
         // reads as settled pigment rather than a halo. Inherits the
         // threshold, one-sided and LOD logic for free.
         if (poolAmount > 0.0) {
-          float pool = inkTest(uv, o * 3.5, dC);
+          float pool = inkTest(uv, o * poolRadius, dC);
           pool *= 0.55 + 0.45 * vnoise3(wp * 3.0 + 7.3);
           paint *= 1.0 - poolAmount * 0.30 * pool * lit;
+        }
+        // ---- ground speckle: scattered ink-rimmed pale ovals -------
+        // one hash per cell (3x3 searched) on the ground plane; pure
+        // value-hash, no textures. Perspective flattens the discs into
+        // the reference's ovals on its own.
+        if (speckleAmt > 0.0) {
+          vec3 wn = viewToWorldN * normalAt(uv);
+          if (wn.y > 0.85 && abs(wp.y - groundY) < 0.6) {
+            float sCellW = 3.2 * speckleSize;     // base 3.2-unit cells
+            vec2 scc = wp.xz / sCellW;
+            vec2 sCell = floor(scc);
+            float sfill = 0.0, srim = 0.0;
+            for (int cy = -1; cy <= 1; cy++)
+            for (int cx = -1; cx <= 1; cx++) {
+              vec2 c = sCell + vec2(float(cx), float(cy));
+              vec3 h = fract(sin(vec3(dot(c, vec2(127.1, 311.7)),
+                                      dot(c, vec2(269.5, 183.3)),
+                                      dot(c, vec2(419.2, 371.9)))) * 43758.5453);
+              // patchy scatter: low-freq noise makes some stretches of
+              // sand busy and others bare instead of an even grid
+              float patchy = smoothstep(0.2, 0.8, vnoise(c * 0.37 + 9.1));   // 'patch' is a GLSL reserved word
+              if (h.z > speckleAmt * 1.5 * patchy) continue;
+              vec2 ctr = c + 0.2 + h.xy * 0.6;    // jittered centre
+              // long-tailed sizes: mostly small flecks, the odd big lozenge
+              float u2 = fract(h.z * 9.7);
+              float rx = 0.03 + 0.17 * u2 * u2;
+              // random orientation and aspect
+              float sAng = h.x * 6.2832;
+              vec2 dd = scc - ctr;
+              dd = vec2(dd.x * cos(sAng) - dd.y * sin(sAng),
+                        dd.x * sin(sAng) + dd.y * cos(sAng));
+              vec2 d = dd / vec2(rx, rx * (0.45 + 0.4 * fract(h.x * 5.1)));
+              // domain-warp the rim so each blob is a lumpy potato,
+              // not a perfect ellipse
+              d += (vec2(vnoise(scc * 6.0 + h.y * 43.0),
+                         vnoise(scc * 6.0 + h.z * 91.0)) - 0.5) * 0.9;
+              float r = length(d);
+              // analytic pixel size — fwidth is undefined inside this
+              // divergent loop (the continue above), which is why rims
+              // vanished with it: wpx is world units per pixel, cells
+              // are 3.2 units, r is normalized by rx
+              float aaR = wpx / (sCellW * rx) * 1.4;
+              float sw = lineWidth * 0.5;   // match the detector's width
+              sfill = max(sfill, 1.0 - smoothstep(1.0 - aaR, 1.0 + aaR, r));
+              // rim strength varies per blob — hand-drawn unevenness
+              float rimA = 0.55 + 0.45 * fract(h.y * 3.3);
+              srim = max(srim, (1.0 - smoothstep(sw * aaR, (sw + 1.0) * aaR, abs(r - 1.0)))
+                              * min(lineWidth, 1.0) * rimA);
+            }
+            // fade with distance before the pattern aliases into shimmer
+            // fade STRENGTH: 0 = never fade, 1 = the classic 25-70%-of-far
+            // ramp, higher divides the distances so speckles die sooner
+            float sfade = speckleFade <= 0.0 ? 1.0
+                        : 1.0 - smoothstep(cameraFar * 0.25 / speckleFade,
+                                           cameraFar * 0.7  / speckleFade, dC);
+            paint = mix(paint, vec3(0.99, 0.985, 0.97), sfill * 0.95 * sfade * lit);
+            ink = max(ink, srim * sfade * lit);
+          }
         }
         paint *= 1.0 - shadow;                    // hard/soft (already glow-gated)
         paint *= 1.0 - paperGrain * grain;        // grain hits fills like paper
@@ -3202,9 +3477,10 @@ const post = new THREE.ShaderMaterial({
         vec3 inkT = mix(inkColor, paint * vec3(0.32, 0.30, 0.48), inkTint);
         col = mix(paint, inkT, clamp(ink, 0.0, 1.0));
         // aerial perspective: distance dissolves everything toward the
-        // sky — except lamps, which keep glowing through the haze.
-        col = mix(col, skyColor,
-                  aerialFade * smoothstep(cameraFar * 0.18, cameraFar * 0.9, dC) * lit);
+        // HORIZON color (that's what distant ground meets now that the
+        // sky is a gradient) — except lamps, which glow through.
+        col = mix(col, horizonColor,
+                  aerialFade * smoothstep(cameraFar * aerialNear, cameraFar * aerialFar, dC) * lit);
       }
 
       // ---- GLASS LAYER -------------------------------------------
@@ -3600,36 +3876,159 @@ const blurMat = new THREE.ShaderMaterial({
     }`,
   depthTest: false, depthWrite: false,
 });
-// cast-shadow mask extract: the same light-space PCF test the ink pass
-// uses, run once per (half-res) pixel into its own target so the mask
-// can be blurred and re-thresholded as a field. No wobble here — the
-// smoothing IS the stylization on this path.
-const castMaskMat = new THREE.ShaderMaterial({
+// depth-aware blur for the shadow melt: the kernel reach is the
+// per-pixel WORLD radius the extract wrote into G (contact hardening),
+// converted to screen px with 1/depth. World anchoring keeps near and
+// far edges equally smoothed; the per-pixel radius keeps small-throw
+// shadows crisp while long-throw edges melt wide. G itself is blurred
+// by the same kernel, which diffuses the radius field smoothly across
+// the edge for the second round.
+const maskBlurMat = new THREE.ShaderMaterial({
   uniforms: {
-    tDepth: { value: null }, tShadow: { value: null },
-    invViewProj: { value: new THREE.Matrix4() },
-    lightVP: { value: new THREE.Matrix4() },
-    shadowBias: { value: 0 },
+    tDiffuse: { value: null }, tDepth: { value: null },
+    uAxis: { value: new THREE.Vector2() },   // one screen px, in UV, along the blur axis
+    uPxScale: { value: 0 },                  // uMaxR world units -> screen px at depth 1
+    cameraNear: { value: 0.1 }, cameraFar: { value: 1000 },
   },
   vertexShader: blitVert,
   fragmentShader: /* glsl */`
     precision highp float;
     varying vec2 vUv;
-    uniform sampler2D tDepth;
+    uniform sampler2D tDiffuse, tDepth;
+    uniform vec2 uAxis;
+    uniform float uPxScale, cameraNear, cameraFar;
+    void main() {
+      float ndc = texture2D(tDepth, vUv).x * 2.0 - 1.0;
+      float d = (2.0 * cameraNear * cameraFar) /
+                (cameraFar + cameraNear - ndc * (cameraFar - cameraNear));
+      // one-sided kernel reach in screen px, clamped: the far clamp caps
+      // tap spacing at ~5.5 px so the re-threshold can't quantize sparse
+      // taps into sawtooth edges or drippy fingers on big near radii
+      float r = clamp(texture2D(tDiffuse, vUv).g * uPxScale / d, 1.0, 66.0);
+      float s = r / 12.0;                 // tap spacing: 25 taps span the reach densely
+      float sg = r / 2.7;                 // gaussian sigma, matched to the old 9-tap falloff
+      vec3 c = vec3(0.0);
+      float wsum = 0.0;
+      for (int i = -12; i <= 12; i++) {
+        float x = float(i) * s;
+        float w = exp(-0.5 * x * x / (sg * sg));
+        c += texture2D(tDiffuse, vUv + uAxis * x).rgb * w;
+        wsum += w;
+      }
+      gl_FragColor = vec4(c / wsum, 1.0);
+    }`,
+  depthTest: false, depthWrite: false,
+});
+// shadow mask extract: the same light-space PCF test the ink pass
+// uses, run once per (half-res) pixel into its own target so the mask
+// can be blurred and re-thresholded as a field. No wobble here — the
+// smoothing IS the stylization on this path. In hard shade mode the
+// lambert terminator joins the mask (selfShade), so flat-facet shading
+// corners on low-poly models melt the same way cast silhouettes do.
+// R = shadow mask. G = desired melt radius / uMaxR, from CONTACT
+// HARDENING: a blocker search estimates how far the shadow traveled
+// from its caster, and the radius grows with that throw. Short-throw
+// shadows (small props, contact points) stay crisp and pinned; long
+// throws (buildings, the pretzel) get wide simplified edges. One
+// global radius either blobbed small shadows or under-smoothed big ones.
+const castMaskMat = new THREE.ShaderMaterial({
+  uniforms: {
+    tDepth: { value: null }, tShadow: { value: null },
+    tShadowC: { value: null },   // RG-packed readable blocker depth
+    tNormal: { value: null }, tID: { value: null },
+    invViewProj: { value: new THREE.Matrix4() },
+    lightVP: { value: new THREE.Matrix4() },
+    shadowBias: { value: 0 },
+    lightDir: { value: new THREE.Vector3() },
+    hatchThreshold: { value: 0 },
+    selfShade: { value: 0 }, castOn: { value: 0 },
+    uSearchUv: { value: new THREE.Vector2() },  // blocker search reach in map UV
+    uTexel: { value: new THREE.Vector2() },     // one shadow-map texel in UV
+    uPenK: { value: 0 },        // penumbra world units per unit of throw
+    uPenMin: { value: 0 },      // contact floor: ~2 shadow texels, world units
+    uPenMax: { value: 0 },      // penumbra cap, world units
+    uTermR: { value: 0 },       // terminator melt radius, world units
+    uMaxR: { value: 1 },        // G-channel normalization, world units
+    uDepthRange: { value: 1 },  // light near->far span, world units
+  },
+  vertexShader: blitVert,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    varying vec2 vUv;
+    uniform sampler2D tDepth, tNormal, tID, tShadowC;
     uniform highp sampler2DShadow tShadow;
     uniform mat4 invViewProj, lightVP;
-    uniform float shadowBias;
+    uniform float shadowBias, hatchThreshold, selfShade, castOn;
+    uniform float uPenK, uPenMin, uPenMax, uTermR, uMaxR, uDepthRange;
+    uniform vec2 uSearchUv, uTexel;
+    uniform vec3 lightDir;
+    // one blocker tap: accumulate depths that lie between light and
+    // receiver. rz carries extra bias so the receiver's own surface
+    // does not register as a blocker at grazing angles.
+    void tapB(vec2 q, float rz, inout float s, inout float n) {
+      vec2 p2 = texture2D(tShadowC, q).rg;
+      float bz = p2.r + p2.g / 255.0;
+      if (bz < rz) { s += bz; n += 1.0; }
+    }
     void main() {
       float z = texture2D(tDepth, vUv).x;
       if (z >= 0.9999) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }  // sky
       vec4 wp = invViewProj * vec4(vUv * 2.0 - 1.0, z * 2.0 - 1.0, 1.0);
       vec3 w = wp.xyz / wp.w;
-      vec4 lp = lightVP * vec4(w, 1.0);
-      vec3 sc = lp.xyz * 0.5 + 0.5;
-      float m = 0.0;
-      if (sc.x > 0.0 && sc.x < 1.0 && sc.y > 0.0 && sc.y < 1.0 && sc.z < 1.0)
-        m = 1.0 - texture2D(tShadow, vec3(sc.xy, sc.z - shadowBias));
-      gl_FragColor = vec4(vec3(m), 1.0);
+      float m = 0.0, radW = 0.0;
+      if (castOn > 0.5) {
+        vec4 lp = lightVP * vec4(w, 1.0);
+        vec3 sc = lp.xyz * 0.5 + 0.5;
+        if (sc.x > 0.0 && sc.x < 1.0 && sc.y > 0.0 && sc.y < 1.0 && sc.z < 1.0) {
+          // 4-tap rotated-diamond PCF (each tap is itself a bilinear
+          // compare): positions the edge sub-texel, so nearly grid-
+          // aligned silhouettes don't step in long texel-run sawteeth —
+          // those survive a small contact-hardened melt radius
+          float zb = sc.z - shadowBias;
+          m = 1.0 - 0.25 * (
+            texture2D(tShadow, vec3(sc.xy + vec2( 0.6,  0.2) * uTexel, zb)) +
+            texture2D(tShadow, vec3(sc.xy + vec2(-0.6, -0.2) * uTexel, zb)) +
+            texture2D(tShadow, vec3(sc.xy + vec2(-0.2,  0.6) * uTexel, zb)) +
+            texture2D(tShadow, vec3(sc.xy + vec2( 0.2, -0.6) * uTexel, zb)));
+          // blocker search over a FIXED stratified disk (golden-angle
+          // spiral). No per-pixel rotation noise: rotated disks fringe
+          // the re-thresholded edge (learned the hard way). Lit pixels
+          // near a shadow inherit its radius, so the melt widens the
+          // edge symmetrically.
+          float rz = sc.z - shadowBias * 4.0;
+          float bs = 0.0, bn = 0.0;
+          tapB(sc.xy + vec2( 0.204,  0.000) * uSearchUv, rz, bs, bn);
+          tapB(sc.xy + vec2(-0.261,  0.239) * uSearchUv, rz, bs, bn);
+          tapB(sc.xy + vec2( 0.040, -0.454) * uSearchUv, rz, bs, bn);
+          tapB(sc.xy + vec2( 0.328,  0.429) * uSearchUv, rz, bs, bn);
+          tapB(sc.xy + vec2(-0.603, -0.106) * uSearchUv, rz, bs, bn);
+          tapB(sc.xy + vec2( 0.572, -0.362) * uSearchUv, rz, bs, bn);
+          tapB(sc.xy + vec2(-0.191,  0.711) * uSearchUv, rz, bs, bn);
+          tapB(sc.xy + vec2(-0.364, -0.702) * uSearchUv, rz, bs, bn);
+          tapB(sc.xy + vec2( 0.790,  0.289) * uSearchUv, rz, bs, bn);
+          tapB(sc.xy + vec2(-0.821,  0.340) * uSearchUv, rz, bs, bn);
+          tapB(sc.xy + vec2( 0.395, -0.847) * uSearchUv, rz, bs, bn);
+          tapB(sc.xy + vec2( 0.293,  0.932) * uSearchUv, rz, bs, bn);
+          if (bn > 0.0) {
+            // contact floor: never below ~1.5 shadow texels, so crisp
+            // contact shadows still melt their raw texel staircase
+            float throwW = max(0.0, (sc.z - bs / bn)) * uDepthRange;
+            radW = clamp(uPenK * throwW, uPenMin, uPenMax);
+          }
+        }
+      }
+      // unlit surfaces (ID blue LSB) have no terminator — cast-only
+      if (selfShade > 0.5 &&
+          mod(floor(texture2D(tID, vUv).b * 255.0 + 0.5), 2.0) < 0.5) {
+        vec3 n = texture2D(tNormal, vUv).xyz * 2.0 - 1.0;
+        float shade = clamp(dot(n, normalize(lightDir)), 0.0, 1.0);
+        m = max(m, step(shade, hatchThreshold));
+        // carry the terminator radius on the dark side AND the adjacent
+        // near-threshold lit facets, so the blur rounds the terminator
+        // from both sides instead of dragging it sideways
+        if (shade < hatchThreshold + 0.25) radW = max(radW, uTermR);
+      }
+      gl_FragColor = vec4(m, radW / uMaxR, 0.0, 1.0);
     }`,
   depthTest: false, depthWrite: false,
 });
@@ -3643,8 +4042,10 @@ const maskThreshMat = new THREE.ShaderMaterial({
     precision highp float;
     varying vec2 vUv; uniform sampler2D tDiffuse; uniform float uBand;
     void main() {
-      float m = smoothstep(0.5 - uBand, 0.5 + uBand, texture2D(tDiffuse, vUv).r);
-      gl_FragColor = vec4(vec3(m), 1.0);
+      vec4 t = texture2D(tDiffuse, vUv);
+      float m = smoothstep(0.5 - uBand, 0.5 + uBand, t.r);
+      // G is the melt-radius field — re-threshold the mask only
+      gl_FragColor = vec4(m, t.g, 0.0, 1.0);
     }`,
   depthTest: false, depthWrite: false,
 });
@@ -3884,7 +4285,7 @@ function updateCamera() {
   const dt = Math.min(0.1, (nowT - lastCamT) / 1000);   // cap so a stall can't teleport
   lastCamT = nowT;
   if (P.lightOrbit) {
-    P.lightAzimuth = (P.lightAzimuth + dt * 12) % 360;  // slow sweep for staging
+    P.lightAzimuth = (P.lightAzimuth + dt * P.orbitLightSpeed) % 360;  // slow sweep for staging
     markDirty();
   }
 
@@ -3915,7 +4316,8 @@ function updateCamera() {
     camera.position.copy(fly.pos);
     camera.lookAt(_at.copy(fly.pos).add(_fwd));
   } else {
-    if (P.autoRotate) orbit.theta += 0.0022;
+    // per-second (was 0.0022 rad/frame, refresh-rate dependent)
+    if (P.autoRotate) orbit.theta += dt * P.rotateSpeed * Math.PI / 180;
     const sp = Math.sin(orbit.phi), r = orbit.radius;
     camera.position.set(
       orbit.target.x + r * sp * Math.sin(orbit.theta),
@@ -3960,7 +4362,69 @@ const panel = document.getElementById('panel');
 // controls append here; retargeted below so most of them land inside the
 // collapsible "advanced" block instead of the panel itself
 let uiTarget = panel;
-function section(title) { const h = document.createElement('h2'); h.textContent = title; uiTarget.appendChild(h); }
+
+// ---- starred controls + per-control reset ---------------------------
+// Every keyed control registers here. A star toggle moves its row into a
+// pinned section at the top of the panel (persisted in localStorage); a
+// reset button — visible only while the value differs from the scene-load
+// default — puts the single setting back, firing the same side effects.
+const P0 = {};                       // scene-load defaults, per key
+let starredKeys = new Set();
+try { starredKeys = new Set(JSON.parse(localStorage.getItem('lw2026.starred') || '[]')); } catch (e) {}
+const starHead = document.createElement('h2');
+starHead.textContent = '★ pinned'; starHead.style.display = 'none';
+const starBox = document.createElement('div');
+starBox.id = 'starbox';
+panel.appendChild(starHead); panel.appendChild(starBox);
+const controls = new Map();          // key -> {row, ph, starBtn, syncReset}
+function saveStars() {
+  try { localStorage.setItem('lw2026.starred', JSON.stringify([...starredKeys])); } catch (e) {}
+}
+function setStar(key, on) {
+  const c = controls.get(key); if (!c) return;
+  if (on) { starredKeys.add(key); starBox.appendChild(c.row); }
+  else { starredKeys.delete(key); c.ph.parentNode.insertBefore(c.row, c.ph); }
+  // pinned rows are far from their section heading, so carry it in the
+  // label ("shading · spacing"); the bare label returns on unstar
+  const lbl = c.row.querySelector('label');
+  if (lbl) {
+    lbl.textContent = on && c.sect ? c.sect + ' · ' + c.baseLabel : c.baseLabel;
+    lbl.title = lbl.textContent;         // full text survives the ellipsis
+  }
+  c.starBtn.textContent = on ? '★' : '☆';
+  c.starBtn.classList.toggle('on', on);
+  saveStars();
+  starHead.style.display = starBox.children.length ? '' : 'none';
+}
+function register(key, row, isDefault, applyDefault) {
+  P0[key] = P[key];
+  const rb = document.createElement('button');
+  rb.className = 'mini reset'; rb.textContent = '↺'; rb.title = 'reset to default';
+  rb.addEventListener('click', applyDefault);
+  const sb = document.createElement('button');
+  sb.className = 'mini star'; sb.textContent = '☆'; sb.title = 'pin to top';
+  sb.addEventListener('click', () => setStar(key, !starredKeys.has(key)));
+  row.appendChild(rb); row.appendChild(sb);
+  const c = { row, starBtn: sb, ph: document.createComment('slot:' + key),
+              sect: currentSection,
+              baseLabel: row.querySelector('label')?.textContent ?? '',
+              syncReset: () => { rb.style.visibility = isDefault() ? 'hidden' : 'visible'; } };
+  controls.set(key, c);
+  uiTarget.appendChild(row);
+  uiTarget.insertBefore(c.ph, row);  // remembers the home slot for unstarring
+  if (starredKeys.has(key)) setStar(key, true);
+  c.syncReset();
+}
+// one delegated refresh keeps every reset button's visibility honest,
+// including keys changed as a side effect of the control just touched
+for (const ev of ['input', 'click', 'change'])
+  panel.addEventListener(ev, () => controls.forEach(c => c.syncReset()));
+
+let currentSection = '';   // the heading in force when a control registers
+function section(title) {
+  currentSection = title;
+  const h = document.createElement('h2'); h.textContent = title; uiTarget.appendChild(h);
+}
 function slider(key, label, min, max, step, onCommit) {
   const row = document.createElement('div'); row.className = 'row';
   const val = document.createElement('span'); val.className = 'val'; val.textContent = P[key];
@@ -3969,7 +4433,11 @@ function slider(key, label, min, max, step, onCommit) {
   Object.assign(inp, { type: 'range', min, max, step, value: P[key] });
   inp.addEventListener('input', () => { P[key] = parseFloat(inp.value); val.textContent = inp.value; markDirty(); });
   if (onCommit) inp.addEventListener('change', onCommit);  // fires on release, not every tick
-  row.appendChild(inp); row.appendChild(val); uiTarget.appendChild(row);
+  row.appendChild(inp); row.appendChild(val);
+  register(key, row, () => P[key] === P0[key], () => {
+    P[key] = P0[key]; inp.value = P0[key]; val.textContent = P0[key];
+    markDirty(); if (onCommit) onCommit();
+  });
 }
 function checkbox(key, label, onChange) {
   const row = document.createElement('div'); row.className = 'row';
@@ -3977,7 +4445,11 @@ function checkbox(key, label, onChange) {
   const inp = document.createElement('input');
   inp.type = 'checkbox'; inp.checked = P[key];
   inp.addEventListener('change', () => { P[key] = inp.checked; markDirty(); if (onChange) onChange(); });
-  row.appendChild(inp); uiTarget.appendChild(row);
+  row.appendChild(inp);
+  register(key, row, () => P[key] === P0[key], () => {
+    P[key] = P0[key]; inp.checked = P0[key];
+    markDirty(); if (onChange) onChange();
+  });
   return inp;                              // so the F key can keep it in sync
 }
 function dropdown(key, label, options, onChange) {
@@ -3991,7 +4463,11 @@ function dropdown(key, label, options, onChange) {
   }
   sel.value = P[key];
   sel.addEventListener('change', () => { P[key] = sel.value; markDirty(); if (onChange) onChange(); });
-  row.appendChild(sel); uiTarget.appendChild(row);
+  row.appendChild(sel);
+  register(key, row, () => P[key] === P0[key], () => {
+    P[key] = P0[key]; sel.value = P0[key];
+    markDirty(); if (onChange) onChange();
+  });
 }
 function colorPick(key, label) {
   const row = document.createElement('div'); row.className = 'row';
@@ -3999,7 +4475,11 @@ function colorPick(key, label) {
   const inp = document.createElement('input');
   inp.type = 'color'; inp.value = P[key];
   inp.addEventListener('input', () => { P[key] = inp.value; markDirty(); });
-  row.appendChild(inp); uiTarget.appendChild(row);
+  row.appendChild(inp);
+  // color inputs normalize to lowercase hex — compare case-blind
+  register(key, row, () => String(P[key]).toLowerCase() === String(P0[key]).toLowerCase(), () => {
+    P[key] = P0[key]; inp.value = P0[key]; markDirty();
+  });
 }
 function buttons(defs) {
   const row = document.createElement('div'); row.className = 'row';
@@ -4061,6 +4541,7 @@ checkbox('castShadow', 'cast shadows');
 slider('lightAzimuth', 'light azimuth°', 0, 360, 1);
 slider('lightElevation', 'light elev°', 10, 80, 1);
 checkbox('lightOrbit', 'orbit light');
+slider('orbitLightSpeed', 'orbit °/s', 1, 60, 1);
 slider('shadowBias', 'shadow bias', 0.0005, 0.01, 0.0005);
 dropdown('shadowRes', 'shadow map', ['1024', '2048', '4096'], makeShadowTarget);
 slider('shadowAmount', 'intensity', 0, 1, 0.01);
@@ -4084,20 +4565,40 @@ slider('haloStrength', 'halo', 0, 10, 0.05);
 slider('haloSize', 'halo size', 0.25, 30, 0.25);
 section('watercolor');
 colorPick('skyColor', 'sky');
+colorPick('skyHorizon', 'horizon');
+slider('skyGradHeight', 'sky gradient', 0.05, 1, 0.01);
+slider('clouds', 'clouds', 0, 1, 0.05);
+slider('cloudScale', 'cloud scale', 2, 15, 0.1);
+slider('cloudFade', 'cloud horizon', 0.04, 0.3, 0.01);
+slider('groundSpeckle', 'ground speckle', 0, 1, 0.05);
+slider('speckleSize', 'speckle size', 0.3, 3, 0.05);
+slider('speckleFade', 'speckle fade', 0, 2, 0.05);   // strength: 0 = never fade
+slider('sunSize', 'sun size', 0, 25, 0.5);
+slider('sunGlow', 'sun emissive', 0, 1, 0.05);
+slider('sunHaloWidth', 'sun halo width', 1.5, 8, 0.1);
+slider('sunCore', 'sun core', 0, 1, 0.05);
+colorPick('sunColor', 'sun');
 slider('regionJitter', 'region jitter', 0, 0.25, 0.005, () => buildScene());
 slider('washAmount', 'wash mottle', 0, 0.5, 0.01);
 slider('washScale', 'mottle scale', 0.25, 4, 0.05);
 slider('poolAmount', 'edge pooling', 0, 1, 0.01);
+slider('poolRadius', 'pool radius', 1, 8, 0.1);
 slider('inkTint', 'ink tint', 0, 1, 0.01);
 slider('aerialFade', 'aerial fade', 0, 1, 0.01);
+slider('aerialNear', 'aerial start', 0.05, 1, 0.01);
+slider('aerialFar', 'aerial end', 0.1, 1.5, 0.01);
 section('paper & ink');
 colorPick('inkColor', 'ink');
 colorPick('paperColor', 'paper');
 slider('paperGrain', 'grain', 0, 0.25, 0.005);
+slider('grainScale', 'grain scale', 0.5, 5, 0.05);
+slider('paperFiber', 'fiber', 0, 1, 0.01);
+slider('paperFleck', 'fleck', 0, 1, 0.01);
 section('camera');
 flyBox = checkbox('flyMode', 'fly camera (f)', () => setFlyMode(P.flyMode));
 slider('flySpeed', 'fly speed', 0.1, 5, 0.1);
 checkbox('autoRotate', 'auto-rotate (orbit)');
+slider('rotateSpeed', 'rotate °/s', 1, 45, 0.5);
 section('player');
 playerBox = checkbox('playerMode', 'player mode (p)', () => setPlayerMode(P.playerMode));
 slider('walkSpeed', 'walk speed', 0.25, 3, 0.05);
@@ -4176,7 +4677,10 @@ function drawCalls() {
   const normals = P.hatchOn || P.contourLine > 0 || (hasSoftRoot && P.softContact > 0) ? 1 : 0;
   return (P.vectorMode ? 2 : 1 + normals) + glass;
 }
+// fps stays in the always-visible strip; every other meter lives in
+// the collapsed "advanced" expander so the default footprint is tiny
 const budgetList = document.getElementById('budgetList');
+const budgetAdvList = document.getElementById('budgetAdvList');
 for (const b of BUDGETS) {
   const m = document.createElement('div'); m.className = 'm';
   m.innerHTML = `<div class="cap"><span class="lab">${b.label}</span><span class="val">–</span></div>`;
@@ -4186,7 +4690,8 @@ for (const b of BUDGETS) {
     const s = document.createElement('div'); s.className = 'seg';
     bar.appendChild(s); b.segs.push(s);
   }
-  m.appendChild(bar); budgetList.appendChild(m);
+  m.appendChild(bar);
+  (b.label === 'fps' ? budgetList : budgetAdvList).appendChild(m);
   b.el = m; b.valEl = m.querySelector('.val');
   if (b.label === 'rebuild') {                 // stage split lives under it
     b.subEl = document.createElement('div');
@@ -4196,7 +4701,7 @@ for (const b of BUDGETS) {
 }
 const infoEl = document.createElement('div');
 infoEl.className = 'info';
-document.getElementById('budget').appendChild(infoEl);
+budgetAdvList.appendChild(infoEl);
 // Which adapter actually got picked. Worth showing because the renderer asks
 // for powerPreference:'high-performance', and on a dual-GPU laptop this is the
 // only way to confirm the request was honoured rather than silently ignored.
@@ -4215,7 +4720,7 @@ document.getElementById('budget').appendChild(infoEl);
   } catch (e) { /* masked or unavailable — leave the fallback */ }
   el.textContent = name;
   el.title = name;
-  document.getElementById('budget').appendChild(el);
+  budgetAdvList.appendChild(el);
 })();
 
 function setMeter(b, value, note, stale) {
@@ -4521,37 +5026,85 @@ function renderFrame(useHi) {
     }
   }
 
-  // cast-shadow silhouette smoothing: extract the shadow mask at half
+  // pass 2: view-space normals — needed by hatching/shadows and by the
+  // self-overlap contour detector (glass is invisible here: the
+  // translucent layer takes no shading and no contours). Rendered before
+  // the shadow melt below, which reads normals for the terminator term.
+  if (P.hatchOn || P.contourLine > 0 || (hasSoftRoot && P.softContact > 0) ||
+      P.groundSpeckle > 0) {
+    renderer.setRenderTarget(T.rtNormal);
+    renderer.setClearColor(0x8080ff, 1);
+    renderer.clear();
+    scene.overrideMaterial = normalMaterial;
+    renderer.render(scene, camera);
+    scene.overrideMaterial = null;
+  }
+
+  // shadow silhouette smoothing: extract the shadow mask at half
   // res, then blur -> re-threshold -> blur. Blur+threshold is
   // morphological smoothing — the edge becomes the 50% level-set of a
   // smooth field, so features smaller than the radius melt away and
   // corners round into painted lobes; doing it twice approximates
   // curvature flow (wiggles vanish, large shapes barely move). Fully
-  // deterministic — no noise anywhere on this path.
-  const castSmooth = P.castShadow && P.hatchOn && P.shadowSmoothPx > 0;
+  // deterministic — no noise anywhere on this path. Hard shade mode
+  // folds the lambert terminator into the mask, so the pass runs even
+  // when cast shadows are off.
+  const castSmooth = P.hatchOn && P.shadowSmoothPx > 0 &&
+                     (P.castShadow || P.shadeStyle === 'hard');
+  // melt radii in WORLD units, all driven by the one slider:
+  //   meltW  — terminator melt radius (slider/20; 12 ≈ 0.6 units)
+  //   penK   — cast penumbra per unit of shadow throw (slider/100), the
+  //            contact-hardening slope: a stylized sun angular size
+  //   penMax — cast penumbra cap (slider/10), also the G normalization
+  // Scenes are size-normalized, so absolute units hold across them.
+  const meltW = P.shadowSmoothPx / 20;
+  const penMaxR = Math.max(P.shadowSmoothPx / 10, meltW);
   if (castSmooth) {
     const cm = castMaskMat.uniforms;
     cm.tDepth.value = T.rtID.depthTexture;
     cm.tShadow.value = rtShadow.depthTexture;
+    cm.tNormal.value = T.rtNormal.texture;
+    cm.tID.value = T.rtID.texture[0];
     cm.lightVP.value.copy(lightVPmat);
     cm.shadowBias.value = P.shadowBias;
+    cm.lightDir.value.copy(lightWorld).transformDirection(camera.matrixWorldInverse);
+    cm.hatchThreshold.value = P.hatchThreshold;
+    cm.selfShade.value = P.shadeStyle === 'hard' ? 1 : 0;
+    cm.castOn.value = P.castShadow ? 1 : 0;
+    cm.tShadowC.value = rtShadow.texture;
+    cm.uPenK.value = P.shadowSmoothPx / 100;
+    // 1.2 texels: enough with the diamond-PCF extract to hide texel
+    // stairs, small enough that thin-pole shadows survive the melt
+    cm.uPenMin.value = Math.max(0.06,
+      1.2 * (lightCam.right - lightCam.left) / +P.shadowRes);
+    cm.uTexel.value.set(1 / +P.shadowRes, 1 / +P.shadowRes);
+    cm.uPenMax.value = P.shadowSmoothPx / 10;
+    cm.uTermR.value = meltW;
+    cm.uMaxR.value = penMaxR;
+    cm.uDepthRange.value = lightCam.far - lightCam.near;
+    cm.uSearchUv.value.set(penMaxR / (lightCam.right - lightCam.left),
+                           penMaxR / (lightCam.top - lightCam.bottom));
     cm.invViewProj.value.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).invert();
     blitQuad.material = castMaskMat;
     renderer.setRenderTarget(T.rtMaskA);
     renderer.render(blitScene, postCamera);
-    // kernel reach is 4 taps x uDir; sizing uDir against the SCREEN
-    // resolution makes the slider mean "pixels on screen" regardless of
-    // mask res or supersample factor
-    const stepU = P.shadowSmoothPx / (4 * rtScreen.width);
-    const stepV = P.shadowSmoothPx / (4 * rtScreen.height);
+    // depth-aware blur: the kernel reach scales with 1/depth in the
+    // shader so the melt is meltW world units everywhere. uAxis is one
+    // SCREEN pixel of UV, keeping the radius in screen terms regardless
+    // of mask res or supersample factor
+    const mb = maskBlurMat.uniforms;
+    mb.tDepth.value = T.rtID.depthTexture;
+    mb.cameraNear.value = camera.near;
+    mb.cameraFar.value = camera.far;
+    mb.uPxScale.value = penMaxR * invFovScale() * rtScreen.height;
     const blurAtoB = (src, dst, mid) => {
-      blurMat.uniforms.tDiffuse.value = src.texture;
-      blurMat.uniforms.uDir.value.set(stepU, 0);
-      blitQuad.material = blurMat;
+      mb.tDiffuse.value = src.texture;
+      mb.uAxis.value.set(1 / rtScreen.width, 0);
+      blitQuad.material = maskBlurMat;
       renderer.setRenderTarget(mid);
       renderer.render(blitScene, postCamera);
-      blurMat.uniforms.tDiffuse.value = mid.texture;
-      blurMat.uniforms.uDir.value.set(0, stepV);
+      mb.tDiffuse.value = mid.texture;
+      mb.uAxis.value.set(0, 1 / rtScreen.height);
       renderer.setRenderTarget(dst);
       renderer.render(blitScene, postCamera);
     };
@@ -4561,18 +5114,6 @@ function renderFrame(useHi) {
     renderer.setRenderTarget(T.rtMaskB);             // re-threshold: A -> B
     renderer.render(blitScene, postCamera);
     blurAtoB(T.rtMaskB, T.rtMaskB, T.rtMaskA);       // round 2: B -> (A) -> B
-  }
-
-  // pass 2: view-space normals — needed by hatching/shadows and by the
-  // self-overlap contour detector (glass is invisible here: the
-  // translucent layer takes no shading and no contours)
-  if (P.hatchOn || P.contourLine > 0 || (hasSoftRoot && P.softContact > 0)) {
-    renderer.setRenderTarget(T.rtNormal);
-    renderer.setClearColor(0x8080ff, 1);
-    renderer.clear();
-    scene.overrideMaterial = normalMaterial;
-    renderer.render(scene, camera);
-    scene.overrideMaterial = null;
   }
 
   // pass 2b: glow halo — extract emissive pixels, blur at quarter res
@@ -4606,6 +5147,9 @@ function renderFrame(useHi) {
   u.tGlow.value = T.rtGlowA.texture;
   u.haloStrength.value = hasGlow ? P.haloStrength : 0;   // exact no-op without lamps
   u.resolution.value.set(T.rtID.width, T.rtID.height);
+  // grain frequency locks to DISPLAY pixels: supersampled stills keep
+  // their tooth instead of averaging it away in the downsample
+  u.ssScale.value = T.scale;
   u.lightDir.value.copy(_lv.copy(lightWorld).transformDirection(camera.matrixWorldInverse));
   u.inkColor.value.set(P.inkColor);
   u.paperColor.value.set(P.paperColor);
@@ -4613,9 +5157,13 @@ function renderFrame(useHi) {
     'wobbleAmp','wobbleFreq','hatchThreshold','crossThreshold',
     'hatchSpacing','hatchWidth','hatchAngle','hatchNoise','hatchNoiseScale',
     'hatchBreak','shadowAmount','shadowLine','shadowLineWidth',
-    'paperGrain','washAmount','washScale','poolAmount','inkTint','aerialFade',
+    'paperGrain','grainScale','washAmount','washScale','poolAmount','inkTint','aerialFade',
     'glassTint','glassLine','glassBackLine','glowLift','contourLine',
-    'shadowBias']) u[k].value = P[k];
+    'shadowBias','skyGradHeight','cloudScale','cloudFade','speckleSize','speckleFade',
+    'sunHaloWidth','sunCore','poolRadius','paperFiber','paperFleck']) u[k].value = P[k];
+  // smoothstep(a, b) needs a < b — keep the aerial ramp well-ordered
+  u.aerialNear.value = P.aerialNear;
+  u.aerialFar.value = Math.max(P.aerialFar, P.aerialNear + 0.02);
   u.contourCos.value = Math.cos(THREE.MathUtils.degToRad(P.contourAngle));
   u.tShadow.value = rtShadow.depthTexture;
   u.lightVP.value.copy(lightVPmat);
@@ -4628,14 +5176,23 @@ function renderFrame(useHi) {
                           wobW / (lightCam.top - lightCam.bottom));
   u.tCastMask.value = T.rtMaskB.texture;
   u.castSmoothOn.value = castSmooth ? 1 : 0;
-  // AA band sized so the re-hardened edge spans ~1.5 screen px of the
-  // final ramp (whose width grows with the blur radius)
-  u.castBand.value = Math.min(0.45, 1.2 / Math.max(P.shadowSmoothPx, 3));
+  // uMaxR world units -> screen px at unit depth; castMaskAt scales this
+  // by the per-pixel G radius for its AA band (band ~ 1.2 / on-screen r)
+  u.castPxScale.value = penMaxR * invFovScale() * rtScreen.height;
   u.shadeMode.value = P.shadeStyle === 'hard' ? 1 : (P.shadeStyle === 'soft' ? 2 : 0);
   // setRGB with raw bytes skips the linear conversion .set(hex) would do,
   // keeping the uniform in the same raw display space as the aPaint bytes
   const skyB = hex2u8(P.skyColor);
   u.skyColor.value.setRGB(skyB[0] / 255, skyB[1] / 255, skyB[2] / 255);
+  const horB = hex2u8(P.skyHorizon);   // raw bytes, same as skyColor
+  u.horizonColor.value.setRGB(horB[0] / 255, horB[1] / 255, horB[2] / 255);
+  u.cloudAmt.value = P.clouds;
+  u.speckleAmt.value = P.groundSpeckle;
+  u.sunDir.value.copy(lightWorld);     // the sun IS the light source
+  u.sunSize.value = THREE.MathUtils.degToRad(P.sunSize);
+  u.sunGlow.value = P.sunGlow;
+  const sunB = hex2u8(P.sunColor);
+  u.sunColor.value.setRGB(sunB[0] / 255, sunB[1] / 255, sunB[2] / 255);
   u.colorOn.value = P.colorOn ? 1 : 0;
   // world reconstruction for pigment noise (pass 1 already refreshed
   // camera.matrixWorldInverse via renderer.render)
@@ -4752,16 +5309,23 @@ async function idbGet(k) {
 
 let pendingDirHandle = null;   // stored handle awaiting a permission click
 
-// fetch the tendril scene's hoverbike from disk (works when served over
-// http; on file:// the cached models folder is the fallback source)
+// fetch the tendril scene's hoverbike + garden assets from disk (works
+// when served over http; on file:// the cached models folder remains
+// the hoverbike's fallback source). One rebuild once everything landed.
 (async () => {
-  try {
-    const r = await fetch('Models/hoverbike.obj');
-    if (r.ok) {
-      hoverbikeText = await r.text();
-      if (P.scene === 'tendrils') buildScene();
-    }
-  } catch (e) { /* no server / file missing — scene just has no craft */ }
+  const jobs = [['hoverbike', 'Models/hoverbike.obj'],
+    ...GARDEN_NAMES.map(n => [n, 'Models/garden/' + n + '.obj'])];
+  let got = 0;
+  await Promise.all(jobs.map(async ([n, url]) => {
+    try {
+      const r = await fetch(url);
+      if (!r.ok) return;
+      const t = await r.text();
+      if (n === 'hoverbike') hoverbikeText = t; else gardenText[n] = t;
+      got++;
+    } catch (e) { /* missing file — that piece just doesn't appear */ }
+  }));
+  if (got && P.scene === 'tendrils') buildScene();
 })();
 
 async function scanModelsDir(dir) {

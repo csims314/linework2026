@@ -104,7 +104,7 @@ const P = {
   // Scale-invariant plane test, not a raw depth threshold.
   softContact: 1,
   // region grouping: neighbors that share a color draw no line between them
-  regionGroup: true, similarity: 0.7,
+  regionGroup: true, similarity: 0.1,
   // self-overlap contours from the normal buffer: ink where visible
   // surface orientation jumps discontinuously (a fold crossing itself),
   // which the ID detector can't see inside a single region. 0 = off.
@@ -154,7 +154,7 @@ const P = {
   // defined shadows while tall casters get wide simplified edges. In
   // hard shade mode the lambert terminator melts too, at a flat
   // slider/20 radius. 0 = exact geometry (single-tap path).
-  lightOrbit: false, orbitLightSpeed: 12, shadowBias: 0.0015, shadowRes: '2048', shadowSmoothPx: 12,
+  lightOrbit: false, orbitLightSpeed: 12, shadowBias: 0.0015, shadowRes: '2048', shadowSmoothPx: 1,
   // shadow technique: 'map' = cached directional shadow map (PCF +
   // contact-hardening melt), 'stencil' = per-triangle depth-fail stencil
   // shadow volumes — pixel-exact hard silhouettes, no map resolution, no
@@ -171,6 +171,11 @@ const P = {
   // instead — flat cel step or smooth ramp, both reusing the shade
   // thresholds (cross adds a deeper core shadow) and the noise sliders
   shadeStyle: 'hard', shadowAmount: 0.22,
+  // shade from crease-limited smoothed normals: the lit/shade boundary
+  // sweeps across low-poly facets instead of staircasing along their
+  // edges (ink and contours still see the flat facets). Pure texture
+  // swap — toggling costs nothing and needs no rebuild.
+  smoothShade: true,
   // ink along shadow boundaries (0 = off) and its width as a multiple
   // of the regular line radius
   shadowLine: 0.46, shadowLineWidth: 1.65,
@@ -1332,7 +1337,33 @@ const idMaterial = new THREE.ShaderMaterial({
       outPaint = vPaint;
     }`,
 });
-const normalMaterial = new THREE.MeshNormalMaterial({ side: THREE.DoubleSide });
+// normal pass, two attachments: [0] flat facet normals (ink / contour /
+// soft-contact detectors), [1] crease-limited smoothed normals baked by
+// bakeSmoothNormals (the shade term only). Both view-space, *0.5+0.5.
+const normalMaterial = new THREE.ShaderMaterial({
+  side: THREE.DoubleSide,
+  glslVersion: THREE.GLSL3,
+  vertexShader: /* glsl */`
+    in vec3 aSNormal;
+    out vec3 vN;
+    out vec3 vSN;
+    void main() {
+      vN = normalMatrix * normal;
+      vSN = normalMatrix * aSNormal;
+      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+    }`,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    in vec3 vN;
+    in vec3 vSN;
+    layout(location = 0) out vec4 oFlat;
+    layout(location = 1) out vec4 oSmooth;
+    void main() {
+      float s = gl_FrontFacing ? 1.0 : -1.0;   // DoubleSide flip, like MeshNormalMaterial
+      oFlat = vec4(normalize(vN) * s * 0.5 + 0.5, 1.0);
+      oSmooth = vec4(normalize(vSN) * s * 0.5 + 0.5, 1.0);
+    }`,
+});
 // vector mode: paper-colored fill occludes, real line geometry draws
 const fillMaterial = new THREE.MeshBasicMaterial({
   color: 0xf6f2e6, side: THREE.DoubleSide,
@@ -2391,6 +2422,60 @@ function parseOBJ(text) {
   return geo;
 }
 
+// Crease-limited smoothed normals for the SHADE test only. Per welded
+// position, each vertex-use averages the area-weighted normals of the
+// incident faces lying within 60° of its own face — so organic low-poly
+// facets merge into one smoothly turning shade normal (the terminator
+// sweeps across faces instead of staircasing along their edges), while
+// hard 90° machinery corners keep flat shading. The ink / contour /
+// soft-contact detectors keep reading the flat normals; only the
+// lighting term ever samples these.
+function bakeSmoothNormals(geo) {
+  const pos = geo.attributes.position.array;
+  const nor = geo.attributes.normal.array;
+  const nV = geo.attributes.position.count;
+  const site = new Map();
+  const vSite = new Int32Array(nV);
+  const lists = [];
+  const t = 1e4;
+  for (let i = 0; i < nV; i++) {
+    const k = Math.round(pos[i * 3] * t) + '_' +
+              Math.round(pos[i * 3 + 1] * t) + '_' +
+              Math.round(pos[i * 3 + 2] * t);
+    let s = site.get(k);
+    if (s === undefined) { s = lists.length; site.set(k, s); lists.push([]); }
+    vSite[i] = s;
+  }
+  for (let f = 0; f < nV; f += 3) {
+    const b = f * 3;
+    const ux = pos[b + 3] - pos[b], uy = pos[b + 4] - pos[b + 1], uz = pos[b + 5] - pos[b + 2];
+    const wx = pos[b + 6] - pos[b], wy = pos[b + 7] - pos[b + 1], wz = pos[b + 8] - pos[b + 2];
+    const area = Math.hypot(uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx);
+    const nx = nor[b], ny = nor[b + 1], nz = nor[b + 2];
+    lists[vSite[f]].push(nx, ny, nz, area);
+    lists[vSite[f + 1]].push(nx, ny, nz, area);
+    lists[vSite[f + 2]].push(nx, ny, nz, area);
+  }
+  const out = new Int8Array(nV * 3);
+  const CREASE = 0.5;                     // cos 60°
+  for (let i = 0; i < nV; i++) {
+    const b = i * 3;
+    const fx = nor[b], fy = nor[b + 1], fz = nor[b + 2];
+    const L = lists[vSite[i]];
+    let sx = 0, sy = 0, sz = 0;
+    for (let j = 0; j < L.length; j += 4) {
+      if (fx * L[j] + fy * L[j + 1] + fz * L[j + 2] > CREASE) {
+        sx += L[j] * L[j + 3]; sy += L[j + 1] * L[j + 3]; sz += L[j + 2] * L[j + 3];
+      }
+    }
+    const l = Math.hypot(sx, sy, sz) || 1;
+    out[b] = Math.round(sx / l * 127);
+    out[b + 1] = Math.round(sy / l * 127);
+    out[b + 2] = Math.round(sz / l * 127);
+  }
+  geo.setAttribute('aSNormal', new THREE.Int8BufferAttribute(out, 3, true));
+}
+
 function finishScene() {
   const { merged, mergedGlass, lineGeom, stats } = mergeBagArray(bag);
   bag = [];
@@ -2400,6 +2485,7 @@ function finishScene() {
   regionCount = stats.regions;
   lineVertCount = stats.lineVerts;
   hasGlow = stats.hasGlow;
+  bakeSmoothNormals(merged);
   merged.computeBoundingSphere();
   sceneSphere = merged.boundingSphere;   // drives the adaptive far plane
   if (glassVertCount) {                  // expand it to cover the glass mesh
@@ -2486,6 +2572,7 @@ function buildActor(builderFn, seed) {
   currentSoft = ps; currentContour = pk; currentPBlend = pb;
   currentUnlit = pu; currentNoCast = pn;
   const { merged, mergedGlass, lineGeom } = mergeBagArray(mine, { timing: false });
+  bakeSmoothNormals(merged);
   mergedGlass.dispose();               // actors are opaque-only
   const group = new THREE.Group();
   const mesh = new THREE.Mesh(merged, idMaterial);
@@ -2686,7 +2773,9 @@ function makeTargetSet(scale) {
       depthBuffer: true,
       samples: msaaSamples(),
     }),
-    rtNormal: new THREE.WebGLRenderTarget(w, h, {
+    // two attachments: [0] flat facet normals, [1] smoothed shade
+    // normals (same r160 MRT API caveat as rtID above)
+    rtNormal: new THREE.WebGLMultipleRenderTargets(w, h, 2, {
       minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
     }),
     rtInk: new THREE.WebGLRenderTarget(w, h, {
@@ -3008,6 +3097,7 @@ const post = new THREE.ShaderMaterial({
   uniforms: {
     tID:        { value: null },
     tNormal:    { value: null },
+    tNormalS:   { value: null },   // smoothed shade normals (or flat when off)
     tDepth:     { value: null },
     resolution: { value: new THREE.Vector2() },
     cameraNear: { value: camera.near },
@@ -3064,7 +3154,7 @@ const post = new THREE.ShaderMaterial({
   fragmentShader: /* glsl */`
     precision highp float;
     varying vec2 vUv;
-    uniform sampler2D tID, tNormal, tDepth;
+    uniform sampler2D tID, tNormal, tNormalS, tDepth;
     uniform vec2 resolution;
     uniform float cameraNear, cameraFar;
     uniform vec3 lightDir, inkColor, paperColor;
@@ -3138,6 +3228,9 @@ const post = new THREE.ShaderMaterial({
              (cameraFar + cameraNear - ndc * (cameraFar - cameraNear));
     }
     vec3 normalAt(vec2 uv) { return texture2D(tNormal, uv).xyz * 2.0 - 1.0; }
+    // shade normal: the smoothed attachment when smooth shading is on,
+    // the flat one otherwise (the JS binds whichever applies)
+    vec3 snormalAt(vec2 uv) { return texture2D(tNormalS, uv).xyz * 2.0 - 1.0; }
     float linDepthG(vec2 uv) {          // same, for the glass layer's depth
       float z = texture2D(tGlassDepth, uv).x;
       float ndc = z * 2.0 - 1.0;
@@ -3395,7 +3488,7 @@ const post = new THREE.ShaderMaterial({
       // so shadow shapes still get outlines on flat paper grounds
       if (mod(floor(texture2D(tID, p).b * 255.0 + 0.5), 2.0) > 0.5)
         return step(0.5, castS);
-      vec3 n = normalAt(p);
+      vec3 n = snormalAt(p);
       float shade = clamp(dot(n, normalize(lightDir)), 0.0, 1.0);
       shade = min(shade, 1.0 - castS);
       float sn = (vnoise3(w * (0.35 / hatchNoiseScale)) - 0.5) * hatchNoise * 0.3;
@@ -3456,8 +3549,11 @@ const post = new THREE.ShaderMaterial({
       // received shadows entirely — their paint composes as-is
       float unlitF = mod(floor(texture2D(tID, uv).b * 255.0 + 0.5), 2.0);
       if (hatchOn > 0.5 && !sky && unlitF < 0.5) {
+        // smoothed normal for the LIGHTING term; the triplanar stroke
+        // frame below stays on the flat facet normal by design (frame
+        // seams land on face boundaries, under ink lines)
         vec3 n = normalAt(uv);
-        float shade = clamp(dot(n, normalize(lightDir)), 0.0, 1.0);
+        float shade = clamp(dot(snormalAt(uv), normalize(lightDir)), 0.0, 1.0);
         // cast shadows: a blocked pixel is fully in shadow, and every
         // style downstream (hard step, soft ramp, hatch strokes) treats
         // it that way automatically
@@ -4780,6 +4876,7 @@ slider('softContact', 'soft contact', 0, 2, 0.05);
 section('shading');
 checkbox('hatchOn', 'enabled');
 dropdown('shadeStyle', 'style', ['hatch', 'hard', 'soft']);
+checkbox('smoothShade', 'smooth shading');
 checkbox('castShadow', 'cast shadows');
 // stencil = per-triangle depth-fail shadow volumes (pixel-exact, no
 // bias/res); bias + map-res + contact hardening are map-path only
@@ -4791,7 +4888,7 @@ slider('orbitLightSpeed', 'orbit °/s', 1, 60, 1);
 slider('shadowBias', 'shadow bias', 0.0005, 0.01, 0.0005);
 dropdown('shadowRes', 'shadow map', ['1024', '2048', '4096'], makeShadowTarget);
 slider('shadowAmount', 'intensity', 0, 1, 0.01);
-slider('shadowSmoothPx', 'shadow smooth', 0, 32, 1);
+slider('shadowSmoothPx', 'shadow smooth', 0, 3, 0.1);
 slider('shadowLine', 'shadow lines', 0, 1, 0.01);
 slider('shadowLineWidth', 'shadow line w', 0.5, 3, 0.05);
 slider('hatchThreshold', 'shade start', 0, 1, 0.01);
@@ -5352,7 +5449,9 @@ function renderFrame(useHi) {
     const cm = castMaskMat.uniforms;
     cm.tDepth.value = T.rtID.depthTexture;
     cm.tShadow.value = rtShadow.depthTexture;
-    cm.tNormal.value = T.rtNormal.texture;
+    // terminator melt uses the shade normal too, so its rounded edge
+    // agrees with the compose step's boundary
+    cm.tNormal.value = T.rtNormal.texture[P.smoothShade ? 1 : 0];
     cm.tID.value = T.rtID.texture[0];
     cm.lightVP.value.copy(lightVPmat);
     cm.shadowBias.value = P.shadowBias;
@@ -5428,7 +5527,8 @@ function renderFrame(useHi) {
   const u = post.uniforms;
   u.tID.value = T.rtID.texture[0];
   u.tPaint.value = T.rtID.texture[1];
-  u.tNormal.value = T.rtNormal.texture;
+  u.tNormal.value = T.rtNormal.texture[0];
+  u.tNormalS.value = T.rtNormal.texture[P.smoothShade ? 1 : 0];
   u.tDepth.value = T.rtID.depthTexture;
   u.tGlassID.value = T.rtGlass.texture[0];
   u.tGlassPaint.value = T.rtGlass.texture[1];

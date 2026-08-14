@@ -78,6 +78,13 @@
   #budget summary::before { content:'\25B8'; display:inline-block; width:12px; color:#e8a33d; }
   #budget details[open] summary::before { content:'\25BE'; }
   #budget details[open] #budgetAdvList { margin-top:7px; }
+  #debugbar { position:fixed; top:8px; left:50%; transform:translateX(-50%); z-index:10;
+    background:#20242c; border:1px solid #333a45; border-radius:8px; padding:4px 6px;
+    display:flex; gap:2px; flex-wrap:wrap; max-width:92vw; align-items:center; }
+  #debugbar .lab { color:#8fa3bf; font-size:10px; text-transform:uppercase;
+    letter-spacing:.12em; margin-right:6px; }
+  #debugbar button { margin:0; padding:3px 8px; font-size:10px; }
+  #debugbar button.on { background:#e8a33d; color:#20242c; border-color:#e8a33d; }
 </style>
 </head>
 <body>
@@ -85,6 +92,7 @@
 <div id="sceneMenu"><h1>SCENES</h1><div id="sceneList"></div></div>
 <div id="panel"><h1>MOEBIUS LINES</h1></div>
 <div id="budget"><h1>BUDGET</h1><div id="budgetList"></div><details id="budgetAdv"><summary>advanced</summary><div id="budgetAdvList"></div></details></div>
+<div id="debugbar"><span class="lab">debug</span></div>
 <div id="hint">drag&nbsp;=&nbsp;orbit&nbsp;&nbsp;·&nbsp;&nbsp;shift-drag&nbsp;=&nbsp;pan&nbsp;&nbsp;·&nbsp;&nbsp;wheel&nbsp;=&nbsp;zoom&nbsp;&nbsp;·&nbsp;&nbsp;drop&nbsp;.obj&nbsp;to&nbsp;load</div>
 
 <script type="importmap">
@@ -153,8 +161,10 @@ const P = {
   // capped at slider/10), so small props and contact points keep crisp
   // defined shadows while tall casters get wide simplified edges. In
   // hard shade mode the lambert terminator melts too, at a flat
-  // slider/20 radius. 0 = exact geometry (single-tap path).
-  lightOrbit: false, orbitLightSpeed: 12, shadowBias: 0.0015, shadowRes: '2048', shadowSmoothPx: 1,
+  // slider/20 radius. 0 = exact geometry (single-tap path). The melt
+  // only acts on ORGANIC receivers (blue bit 2) — hard-surface pixels
+  // get radius 0, so machinery's shadows stay crisp at any setting.
+  lightOrbit: false, orbitLightSpeed: 12, shadowBias: 0.0015, shadowRes: '2048', shadowSmoothPx: 0,
   // shadow technique: 'map' = cached directional shadow map (PCF +
   // contact-hardening melt), 'stencil' = per-triangle depth-fail stencil
   // shadow volumes — pixel-exact hard silhouettes, no map resolution, no
@@ -176,6 +186,15 @@ const P = {
   // edges (ink and contours still see the flat facets). Pure texture
   // swap — toggling costs nothing and needs no rebuild.
   smoothShade: true,
+  // per-class shade-field blur (screen px, before the hard threshold):
+  // organic surfaces (withOrganic / blue bit 2, which also get PN
+  // quadratic shade normals) melt generously; hard-surface machinery
+  // defaults to none so mechanical detail stays crisp. Ignored while
+  // the melt owns the terminator (shadow smooth > 0).
+  organicBlurPx: 1.5, hardBlurPx: 0,
+  // debug bar (top of screen): 'off' = normal render; 'classes' paints
+  // organic green / hard orange; the rest blit individual render passes
+  debugView: 'off',
   // ink along shadow boundaries (0 = off) and its width as a multiple
   // of the regular line radius
   shadowLine: 0.46, shadowLineWidth: 1.65,
@@ -1110,7 +1129,7 @@ function sizeMetrics(geom, stride, regionOf, nUnit) {
 
 function faceIdColors(geometry, perQuad, variation = 1.0, paintCol = null,
                       matAlpha = 1, matGlow = 0, soft = 0, contour = 0, pblend = null,
-                      unlit = 0, nocast = 0) {
+                      unlit = 0, nocast = 0, organic = 0) {
   const geom = geometry.index ? geometry.toNonIndexed() : geometry;
   const count = geom.attributes.position.count;
   const colors = new Float32Array(count * 3);
@@ -1166,14 +1185,15 @@ function faceIdColors(geometry, perQuad, variation = 1.0, paintCol = null,
   // still land), blue bit 1 = casts no shadow. Unflagged geometry is
   // forced to zero bits so the flags read reliably.
   const rLsb = soft ? 1 : 0, gLsb = contour ? 1 : 0;
-  const bBits = (unlit ? 1 : 0) | (nocast ? 2 : 0);
+  // blue bit 2 = organic (shade class); see withOrganic
+  const bBits = (unlit ? 1 : 0) | (nocast ? 2 : 0) | (organic ? 4 : 0);
   for (let i = 0; i < count; i++) {
     const br = Math.round(colors[i * 3] * 255);
     colors[i * 3] = ((br & ~1) | rLsb) / 255;
     const bg = Math.round(colors[i * 3 + 1] * 255);
     colors[i * 3 + 1] = ((bg & ~1) | gLsb) / 255;
     const bb = Math.round(colors[i * 3 + 2] * 255);
-    colors[i * 3 + 2] = ((bb & ~3) | bBits) / 255;
+    colors[i * 3 + 2] = ((bb & ~7) | bBits) / 255;
   }
   geom.setAttribute('color', new THREE.BufferAttribute(colors, 3));
 
@@ -1338,30 +1358,57 @@ const idMaterial = new THREE.ShaderMaterial({
     }`,
 });
 // normal pass, two attachments: [0] flat facet normals (ink / contour /
-// soft-contact detectors), [1] crease-limited smoothed normals baked by
-// bakeSmoothNormals (the shade term only). Both view-space, *0.5+0.5.
+// soft-contact detectors), [1] shade normals (the lighting term only).
+// ORGANIC surfaces (ID blue bit 2) evaluate a QUADRATIC PN-triangle
+// normal field per pixel from the baked corner + mid-edge coefficients:
+// the shade value curves inside every triangle instead of being
+// piecewise-linear, killing terminator plateaus at the source, view-
+// independently. Hard surfaces keep plain linear interpolation. On a
+// flat triangle every PN coefficient equals the face normal and the
+// quadratic collapses to a constant, so misflagged flat geometry is
+// mathematically unaffected. All view-space, *0.5+0.5.
 const normalMaterial = new THREE.ShaderMaterial({
   side: THREE.DoubleSide,
+  vertexColors: true,                   // for the organic flag bit
   glslVersion: THREE.GLSL3,
   vertexShader: /* glsl */`
     in vec3 aSNormal;
-    out vec3 vN;
-    out vec3 vSN;
+    in vec4 aSNA; in vec4 aSNB; in vec4 aSNC;
+    in vec4 aSM0; in vec4 aSM1; in vec4 aSM2;
+    out vec3 vN; out vec3 vSN;
+    out vec3 vNA; out vec3 vNB; out vec3 vNC;
+    out vec3 vM0; out vec3 vM1; out vec3 vM2;
+    out vec3 vBary;
+    out float vOrg;
     void main() {
       vN = normalMatrix * normal;
       vSN = normalMatrix * aSNormal;
+      vNA = normalMatrix * aSNA.xyz; vNB = normalMatrix * aSNB.xyz; vNC = normalMatrix * aSNC.xyz;
+      vM0 = normalMatrix * aSM0.xyz; vM1 = normalMatrix * aSM1.xyz; vM2 = normalMatrix * aSM2.xyz;
+      int c = gl_VertexID % 3;
+      vBary = vec3(c == 0 ? 1.0 : 0.0, c == 1 ? 1.0 : 0.0, c == 2 ? 1.0 : 0.0);
+      vOrg = mod(floor(color.b * 255.0 + 0.5) / 4.0, 2.0) >= 1.0 ? 1.0 : 0.0;
       gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
     }`,
   fragmentShader: /* glsl */`
     precision highp float;
-    in vec3 vN;
-    in vec3 vSN;
+    in vec3 vN; in vec3 vSN;
+    in vec3 vNA; in vec3 vNB; in vec3 vNC;
+    in vec3 vM0; in vec3 vM1; in vec3 vM2;
+    in vec3 vBary;
+    in float vOrg;
     layout(location = 0) out vec4 oFlat;
     layout(location = 1) out vec4 oSmooth;
     void main() {
       float s = gl_FrontFacing ? 1.0 : -1.0;   // DoubleSide flip, like MeshNormalMaterial
       oFlat = vec4(normalize(vN) * s * 0.5 + 0.5, 1.0);
-      oSmooth = vec4(normalize(vSN) * s * 0.5 + 0.5, 1.0);
+      vec3 sn = vSN;
+      if (vOrg > 0.5) {
+        vec3 b = vBary;
+        sn = b.x * b.x * vNA + b.y * b.y * vNB + b.z * b.z * vNC
+           + 2.0 * (b.x * b.y * vM0 + b.y * b.z * vM1 + b.z * b.x * vM2);
+      }
+      oSmooth = vec4(normalize(sn) * s * 0.5 + 0.5, 1.0);
     }`,
 });
 // vector mode: paper-colored fill occludes, real line geometry draws
@@ -1523,6 +1570,21 @@ function withNoCast(fn) {
   fn();
   currentNoCast = p;
 }
+// organic surfaces (ID blue bit 2): the shade classes. Organic gets PN
+// quadratic shade normals plus the 'organic smooth px' field blur —
+// aggressive, view-independent terminator smoothing for plants,
+// terrain and rocks. Unflagged (hard-surface) geometry keeps linear
+// interpolation and its own (default 0) blur, so detailed mechanical
+// parts stay crisp.
+let currentOrganic = 0;
+function withOrganic(fn) {
+  const p = currentOrganic; currentOrganic = 1;
+  fn();
+  currentOrganic = p;
+}
+// filename/material keyword classifier for imported models
+const organicName = s =>
+  /terrain|hill|ground|mound|arch|root|shrub|leaf|lily|puff|coral|rock|cairn|reed|tube|mushroom|plant|tree|bulb|organic/i.test(s || '');
 
 // ---- merge machinery -----------------------------------------
 let bag = [];
@@ -1538,7 +1600,7 @@ function put(frame, geom, x, y, z, rx = 0, ry = 0, rz = 0, variation = 1) {
   // tri mesh merges unrelated triangles and eats their shared edges)
   const g = faceIdColors(geom, P.perQuad && !geom.userData.forceTri, variation,
                          currentPaint, currentAlpha, currentGlow, currentSoft, currentContour,
-                         currentPBlend, currentUnlit, currentNoCast);
+                         currentPBlend, currentUnlit, currentNoCast, currentOrganic);
   g.applyMatrix4(frameOf(x, y, z, rx, ry, rz));
   if (frame) g.applyMatrix4(frame);
   bag.push(g);
@@ -1953,7 +2015,7 @@ function buildTendrils() {
   // bound of its sway, so no two tendrils (nor the hovercraft) can
   // intersect anywhere along their height.
   const placed = [{ x: 7.5, z: 16, R: 3.2 }];   // hovercraft keep-out
-  withNoCast(() => withUnlit(() => withPaintBlend(groundCol, 0.35, 2.0, () => withSoftRoot(() => {
+  withOrganic(() => withNoCast(() => withUnlit(() => withPaintBlend(groundCol, 0.35, 2.0, () => withSoftRoot(() => {
     for (let row = 0; row < 9; row++) {
       const back = 1 - row / 8;                 // 1 = far row, 0 = front
       const z = -30 + row * 5.4;
@@ -1983,7 +2045,7 @@ function buildTendrils() {
               px, -0.25, pz, 0, rng() * Math.PI * 2, 0, 0.5));
       }
     }
-  }))));
+  })))));
   // ---- garden pieces: Blender-authored organic assets ------------
   // Placed through the same rejection-sampled keep-outs as the
   // tendrils (which are already laid out, so their rng stream is
@@ -2025,7 +2087,11 @@ function buildTendrils() {
       const gg = parseOBJ(txt);
       gg.applyMatrix4(new THREE.Matrix4().makeScale(s, s, s));
       const yaw = rng() * Math.PI * 2;
-      const doPut = () => { setPaint(null); put(null, gg, px, 0, pz, 0, yaw, 0, 0.55); };
+      const doPut = () => {
+        setPaint(null);
+        const f = () => put(null, gg, px, 0, pz, 0, yaw, 0, 0.55);
+        organicName(gname) ? withOrganic(f) : f();   // barrels/lamps stay hard
+      };
       withContours(() => {
         if (cfg.soft)
           withUnlit(() => withSoftRoot(() => withPaintBlend(groundCol, 0.3, 1.6, doPut)));
@@ -2060,7 +2126,7 @@ function buildScene() {
   currentPaint = null;                     // no material state leaks across rebuilds
   currentAlpha = 1; currentGlow = 0;
   currentSoft = 0; hasSoftRoot = false; currentContour = 0; currentPBlend = null;
-  currentUnlit = 0; currentNoCast = 0;
+  currentUnlit = 0; currentNoCast = 0; currentOrganic = 0;
   shadowDirty = true;
   bag = [];
   const D = P.density;
@@ -2099,9 +2165,11 @@ function buildDirScene(i, only) {
     const x = solo ? 0 : (col - (cols - 1) / 2) * spacing;
     const z = solo ? 0 : (row - (rowsN - 1) / 2) * spacing;
     try {
-      // imports are organic/unknown geometry: contours on
-      withContours(() =>
+      // imports get contours; the shade class comes from the filename
+      // (see organicName) — rename the file or use withOrganic to override
+      const f = () => withContours(() =>
         put(null, parseOBJ(sc.files[k].text), x, 0, z, 0, 0.4 + k * 0.7, 0, 0.55));
+      organicName(sc.files[k].name) ? withOrganic(f) : f();
     } catch (e) { console.error('failed to parse', sc.files[k].name, e); }
   });
 }
@@ -2157,7 +2225,8 @@ function buildYard(D) {
     if (rng() < .55) {   // tank + saddle
       setPaint(PAL.mauve);
       const tr = .9 + rng() * 1.4, tx = (rng() - .5) * bw * .5, tz = (rng() - .5) * bd * .5;
-      put(bf, new THREE.SphereGeometry(tr, 16, 12), tx, bh + tr * .75, tz, 0, 0, 0, 0.45);
+      withOrganic(() =>   // rounded tank: smooth-class shading
+        put(bf, new THREE.SphereGeometry(tr, 16, 12), tx, bh + tr * .75, tz, 0, 0, 0, 0.45));
       put(bf, new THREE.CylinderGeometry(tr * .55, tr * .7, tr * .5, 10, 1), tx, bh + tr * .2, tz, 0, 0, 0, 0.55);
       put(bf, new THREE.TorusGeometry(tr * .8, .06, 6, 18), tx, bh + tr * .75, tz, Math.PI / 2, 0, 0, 0.6);
     }
@@ -2229,8 +2298,8 @@ function buildYard(D) {
   // hero object — high-res torus knot, floating like a monument.
   // The scene's ONE red: the palette reads warm-with-an-accent only
   // while red stays this rare.
-  withContours(() => withPaint(PAL.red, () =>
-    put(null, new THREE.TorusKnotGeometry(3.1, 0.95, 220, 20), 0, 13.5, 0, 0, 0, 0, 0.5)));
+  withOrganic(() => withContours(() => withPaint(PAL.red, () =>
+    put(null, new THREE.TorusKnotGeometry(3.1, 0.95, 220, 20), 0, 13.5, 0, 0, 0, 0, 0.5))));
   if (!window.__noDemo) demoMaterials(26, -8);
 }
 
@@ -2251,8 +2320,8 @@ function buildGarden() {
       const x = (c2 - 1) * 13, z = (r - 2) * 13;
       withPaint(PAL.pink, () =>
         put(null, new THREE.BoxGeometry(7, 1, 7), x, 0.5, z, 0, 0, 0, 0.35));   // plinth
-      withContours(() => withPaint(GARDEN_CYC[r], () =>
-        put(null, rows[r][c2](), x, 4.6, z, 0, 0, 0, 0.6)));
+      withOrganic(() => withContours(() => withPaint(GARDEN_CYC[r], () =>
+        put(null, rows[r][c2](), x, 4.6, z, 0, 0, 0, 0.6))));
     }
   }
   if (!window.__noDemo) demoMaterials(26, -8);
@@ -2264,14 +2333,16 @@ function buildPrims() {
   put(null, new THREE.PlaneGeometry(120, 120, 12, 12), 0, -0.02, 0, -Math.PI / 2, 0, 0, 0.10);
   setPaint(PAL.peri);
   put(null, new THREE.BoxGeometry(6, 6, 6), -14, 3, 0, 0, 0.5, 0, 0.8);
-  setPaint(PAL.rose);
-  put(null, new THREE.SphereGeometry(3.6, 24, 18), 0, 3.6, 0, 0, 0, 0, 0.6);
-  setPaint(PAL.celadon);
-  put(null, new THREE.CylinderGeometry(2.6, 2.6, 7, 16, 3), 14, 3.5, 0, 0, 0, 0, 0.6);
-  setPaint(PAL.mauve);
-  put(null, new THREE.ConeGeometry(3, 7, 12, 3), 0, 3.5, -14, 0, 0, 0, 0.6);
-  setPaint(PAL.slate);
-  put(null, new THREE.TorusGeometry(3, 1, 10, 24), 0, 4, 14, 0, 0, 0, 0.6);
+  withOrganic(() => {
+    setPaint(PAL.rose);
+    put(null, new THREE.SphereGeometry(3.6, 24, 18), 0, 3.6, 0, 0, 0, 0, 0.6);
+    setPaint(PAL.celadon);
+    put(null, new THREE.CylinderGeometry(2.6, 2.6, 7, 16, 3), 14, 3.5, 0, 0, 0, 0, 0.6);
+    setPaint(PAL.mauve);
+    put(null, new THREE.ConeGeometry(3, 7, 12, 3), 0, 3.5, -14, 0, 0, 0, 0.6);
+    setPaint(PAL.slate);
+    put(null, new THREE.TorusGeometry(3, 1, 10, 24), 0, 4, 14, 0, 0, 0, 0.6);
+  });
   if (!window.__noDemo) demoMaterials(-16, -14);
 }
 
@@ -2293,7 +2364,7 @@ function buildModel() {
 }
 
 function parseOBJ(text) {
-  const vs = [], pos = [], faceGroup = [];
+  const vs = [], vns = [], pos = [], norIdx = [], faceGroup = [];
   let quadFaces = 0, triFaces = 0;
   // o / g / usemtl changes are hard region boundaries: two parts that
   // merely touch — or two materials meeting on a flat panel — must
@@ -2308,9 +2379,10 @@ function parseOBJ(text) {
     gid = gIds.get(k);
   };
   regroup();
-  const addTri = (a, b, c) => {
+  const addTri = (a, b, c, na = -1, nb = -1, nc = -1) => {
     if (!vs[a] || !vs[b] || !vs[c]) return;
     pos.push(vs[a][0], vs[a][1], vs[a][2], vs[b][0], vs[b][1], vs[b][2], vs[c][0], vs[c][1], vs[c][2]);
+    norIdx.push(na, nb, nc);      // authored vn per corner, -1 = none
     faceGroup.push(gid);
   };
   // faces are collected first so buried ones can be culled before emitting
@@ -2318,6 +2390,7 @@ function parseOBJ(text) {
   for (const raw of text.split('\n')) {
     const t = raw.trim().split(/\s+/);
     if (t[0] === 'v') vs.push([+t[1], +t[2], +t[3]]);
+    else if (t[0] === 'vn') vns.push([+t[1], +t[2], +t[3]]);
     else if (t[0] === 'o' || t[0] === 'g') { part = t.slice(1).join(' '); regroup(); }
     else if (t[0] === 'usemtl') { mtl = t.slice(1).join(' '); regroup(); }
     else if (t[0] === 'f') {
@@ -2325,6 +2398,13 @@ function parseOBJ(text) {
         idx: t.slice(1).map(s => {
           const i = parseInt(s.split('/')[0], 10);
           return i < 0 ? vs.length + i : i - 1;
+        }),
+        // authored normal refs (v/vt/vn or v//vn); -1 when absent
+        nrm: t.slice(1).map(s => {
+          const p = s.split('/');
+          if (!p[2]) return -1;
+          const i = parseInt(p[2], 10);
+          return i < 0 ? vns.length + i : i - 1;
         }), g: gid });
     }
   }
@@ -2378,12 +2458,16 @@ function parseOBJ(text) {
 
   for (const f of faceList) {
     if (f.buried) continue;
-    const idx = f.idx;
+    const idx = f.idx, nrm = f.nrm;
     gid = f.g;                       // addTri tags each triangle with it
-    if (idx.length === 4) { quadFaces++; addTri(idx[0], idx[1], idx[2]); addTri(idx[0], idx[2], idx[3]); }
-    else {
+    if (idx.length === 4) {
+      quadFaces++;
+      addTri(idx[0], idx[1], idx[2], nrm[0], nrm[1], nrm[2]);
+      addTri(idx[0], idx[2], idx[3], nrm[0], nrm[2], nrm[3]);
+    } else {
       if (idx.length === 3) triFaces++;
-      for (let i = 1; i < idx.length - 1; i++) addTri(idx[0], idx[i], idx[i + 1]);
+      for (let i = 1; i < idx.length - 1; i++)
+        addTri(idx[0], idx[i], idx[i + 1], nrm[0], nrm[i], nrm[i + 1]);
     }
   }
   if (culled) console.info(
@@ -2401,7 +2485,11 @@ function parseOBJ(text) {
     pos[i + 1] = (pos[i + 1] - mn[1]) * s;
     pos[i + 2] = (pos[i + 2] - cz)    * s;
   }
-  // flat per-face normals
+  // normals: the file's authored vn where present (Blender smooth
+  // shading survives import — this is what keeps hard-shade terminators
+  // smooth on organic models), flat per-face geometry otherwise. This
+  // matches the primitive path, whose THREE geometries also carry
+  // authored (analytic) normals in the same attribute.
   const nor = new Float32Array(pos.length);
   for (let i = 0; i < pos.length; i += 9) {
     const ax = pos[i], ay = pos[i + 1], az = pos[i + 2];
@@ -2410,7 +2498,16 @@ function parseOBJ(text) {
     let nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx;
     const l = Math.hypot(nx, ny, nz) || 1;
     nx /= l; ny /= l; nz /= l;
-    for (let j = 0; j < 3; j++) { nor[i + j * 3] = nx; nor[i + j * 3 + 1] = ny; nor[i + j * 3 + 2] = nz; }
+    const tri = i / 9;
+    for (let j = 0; j < 3; j++) {
+      const a = vns[norIdx[tri * 3 + j]];
+      if (a) {
+        const al = Math.hypot(a[0], a[1], a[2]) || 1;
+        nor[i + j * 3] = a[0] / al; nor[i + j * 3 + 1] = a[1] / al; nor[i + j * 3 + 2] = a[2] / al;
+      } else {
+        nor[i + j * 3] = nx; nor[i + j * 3 + 1] = ny; nor[i + j * 3 + 2] = nz;
+      }
+    }
   }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
@@ -2422,18 +2519,33 @@ function parseOBJ(text) {
   return geo;
 }
 
-// Crease-limited smoothed normals for the SHADE test only. Per welded
-// position, each vertex-use averages the area-weighted normals of the
-// incident faces lying within 60° of its own face — so organic low-poly
-// facets merge into one smoothly turning shade normal (the terminator
-// sweeps across faces instead of staircasing along their edges), while
-// hard 90° machinery corners keep flat shading. The ink / contour /
-// soft-contact detectors keep reading the flat normals; only the
-// lighting term ever samples these.
+// Shade normals for the lighting term only. The rule: TRUST AUTHORED
+// smoothness — wherever the geometry's normal attribute differs from
+// the geometric face normal, the author (Blender vn, THREE's analytic
+// primitive normals) already said "smooth here", and that normal is
+// used verbatim: a cylinder's terminator comes out perfectly straight,
+// a Blender-smooth terrain's perfectly curved. Only flat-authored
+// vertices (imports without vn, icosahedra, boxes) fall back to a
+// crease-limited (60°) area-weighted one-ring average over welded
+// positions. No relaxation passes — averaging beyond one ring bends
+// the field and makes isolines wander. Float32, not int8: quantized
+// normals visibly stair-step a slowly-sweeping hard-shade boundary.
 function bakeSmoothNormals(geo) {
   const pos = geo.attributes.position.array;
   const nor = geo.attributes.normal.array;
   const nV = geo.attributes.position.count;
+  const nT = nV / 3;
+  // geometric (flat) face normals + areas from positions — the normal
+  // attribute can't be used here, it may be authored-smooth
+  const fN = new Float32Array(nT * 4);
+  for (let f = 0; f < nT; f++) {
+    const b = f * 9;
+    const ux = pos[b + 3] - pos[b], uy = pos[b + 4] - pos[b + 1], uz = pos[b + 5] - pos[b + 2];
+    const wx = pos[b + 6] - pos[b], wy = pos[b + 7] - pos[b + 1], wz = pos[b + 8] - pos[b + 2];
+    let nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx;
+    const area = Math.hypot(nx, ny, nz), l = area || 1;
+    fN[f * 4] = nx / l; fN[f * 4 + 1] = ny / l; fN[f * 4 + 2] = nz / l; fN[f * 4 + 3] = area;
+  }
   const site = new Map();
   const vSite = new Int32Array(nV);
   const lists = [];
@@ -2446,21 +2558,24 @@ function bakeSmoothNormals(geo) {
     if (s === undefined) { s = lists.length; site.set(k, s); lists.push([]); }
     vSite[i] = s;
   }
-  for (let f = 0; f < nV; f += 3) {
-    const b = f * 3;
-    const ux = pos[b + 3] - pos[b], uy = pos[b + 4] - pos[b + 1], uz = pos[b + 5] - pos[b + 2];
-    const wx = pos[b + 6] - pos[b], wy = pos[b + 7] - pos[b + 1], wz = pos[b + 8] - pos[b + 2];
-    const area = Math.hypot(uy * wz - uz * wy, uz * wx - ux * wz, ux * wy - uy * wx);
-    const nx = nor[b], ny = nor[b + 1], nz = nor[b + 2];
-    lists[vSite[f]].push(nx, ny, nz, area);
-    lists[vSite[f + 1]].push(nx, ny, nz, area);
-    lists[vSite[f + 2]].push(nx, ny, nz, area);
+  for (let f = 0; f < nT; f++) {
+    const q = f * 4;
+    lists[vSite[f * 3]].push(fN[q], fN[q + 1], fN[q + 2], fN[q + 3]);
+    lists[vSite[f * 3 + 1]].push(fN[q], fN[q + 1], fN[q + 2], fN[q + 3]);
+    lists[vSite[f * 3 + 2]].push(fN[q], fN[q + 1], fN[q + 2], fN[q + 3]);
   }
-  const out = new Int8Array(nV * 3);
   const CREASE = 0.5;                     // cos 60°
+  const out = new Float32Array(nV * 3);
   for (let i = 0; i < nV; i++) {
-    const b = i * 3;
-    const fx = nor[b], fy = nor[b + 1], fz = nor[b + 2];
+    const b = i * 3, q = ((i / 3) | 0) * 4;
+    const ax = nor[b], ay = nor[b + 1], az = nor[b + 2];
+    if (ax * fN[q] + ay * fN[q + 1] + az * fN[q + 2] < 0.999) {
+      // authored-smooth vertex: use it as-is
+      out[b] = ax; out[b + 1] = ay; out[b + 2] = az;
+      continue;
+    }
+    // flat-authored: crease-filtered one-ring star average
+    const fx = fN[q], fy = fN[q + 1], fz = fN[q + 2];
     const L = lists[vSite[i]];
     let sx = 0, sy = 0, sz = 0;
     for (let j = 0; j < L.length; j += 4) {
@@ -2469,11 +2584,51 @@ function bakeSmoothNormals(geo) {
       }
     }
     const l = Math.hypot(sx, sy, sz) || 1;
-    out[b] = Math.round(sx / l * 127);
-    out[b + 1] = Math.round(sy / l * 127);
-    out[b + 2] = Math.round(sz / l * 127);
+    out[b] = sx / l; out[b + 1] = sy / l; out[b + 2] = sz / l;
   }
-  geo.setAttribute('aSNormal', new THREE.Int8BufferAttribute(out, 3, true));
+  geo.setAttribute('aSNormal', new THREE.Float32BufferAttribute(out, 3));
+  // PN-triangle coefficients for the organic shade class: each vertex
+  // carries the triangle's three corner shade normals plus the three
+  // precomputed mid-edge normals (m_ij = n_i + n_j − v̄(P_j−P_i),
+  // v̄ = 2(P_j−P_i)·(n_i+n_j)/|P_j−P_i|²) so the normal pass can
+  // evaluate a QUADRATIC normal field per pixel — the shade value
+  // curves inside every triangle instead of being piecewise-linear,
+  // which is what plateaus the hard-shade isoline on coarse meshes.
+  // World-space is fine: the view transform is rigid.
+  const cA = new Int8Array(nV * 4), cB = new Int8Array(nV * 4), cC = new Int8Array(nV * 4);
+  const mA = new Int8Array(nV * 4), mB = new Int8Array(nV * 4), mC = new Int8Array(nV * 4);
+  const mid = (i0, i1, dst, off) => {
+    const ex = pos[i1 * 3] - pos[i0 * 3], ey = pos[i1 * 3 + 1] - pos[i0 * 3 + 1],
+          ez = pos[i1 * 3 + 2] - pos[i0 * 3 + 2];
+    const nsx = out[i0 * 3] + out[i1 * 3], nsy = out[i0 * 3 + 1] + out[i1 * 3 + 1],
+          nsz = out[i0 * 3 + 2] + out[i1 * 3 + 2];
+    const e2 = ex * ex + ey * ey + ez * ez;
+    const v = e2 > 1e-12 ? 2 * (ex * nsx + ey * nsy + ez * nsz) / e2 : 0;
+    let x = nsx - v * ex, y = nsy - v * ey, z = nsz - v * ez;
+    const l = Math.hypot(x, y, z) || 1;
+    dst[off] = Math.round(x / l * 127);
+    dst[off + 1] = Math.round(y / l * 127);
+    dst[off + 2] = Math.round(z / l * 127);
+  };
+  const put4 = (dst, off, src, i) => {
+    dst[off] = Math.round(out[i * 3] * 127);
+    dst[off + 1] = Math.round(out[i * 3 + 1] * 127);
+    dst[off + 2] = Math.round(out[i * 3 + 2] * 127);
+  };
+  for (let f = 0; f < nT; f++) {
+    const v0 = f * 3, v1 = v0 + 1, v2 = v0 + 2;
+    for (let c = 0; c < 3; c++) {
+      const o = (v0 + c) * 4;
+      put4(cA, o, out, v0); put4(cB, o, out, v1); put4(cC, o, out, v2);
+      mid(v0, v1, mA, o); mid(v1, v2, mB, o); mid(v2, v0, mC, o);
+    }
+  }
+  geo.setAttribute('aSNA', new THREE.Int8BufferAttribute(cA, 4, true));
+  geo.setAttribute('aSNB', new THREE.Int8BufferAttribute(cB, 4, true));
+  geo.setAttribute('aSNC', new THREE.Int8BufferAttribute(cC, 4, true));
+  geo.setAttribute('aSM0', new THREE.Int8BufferAttribute(mA, 4, true));
+  geo.setAttribute('aSM1', new THREE.Int8BufferAttribute(mB, 4, true));
+  geo.setAttribute('aSM2', new THREE.Int8BufferAttribute(mC, 4, true));
 }
 
 function finishScene() {
@@ -2563,14 +2718,14 @@ function buildActor(builderFn, seed) {
   const prevBag = bag, prevCrng = crng;
   const pc = currentPaint, pa = currentAlpha, pg = currentGlow;
   const ps = currentSoft, pk = currentContour, pb = currentPBlend;
-  const pu = currentUnlit, pn = currentNoCast;
+  const pu = currentUnlit, pn = currentNoCast, po = currentOrganic;
   bag = []; crng = mulberry32(seed);
   builderFn();
   const mine = bag;
   bag = prevBag; crng = prevCrng;
   currentPaint = pc; currentAlpha = pa; currentGlow = pg;
   currentSoft = ps; currentContour = pk; currentPBlend = pb;
-  currentUnlit = pu; currentNoCast = pn;
+  currentUnlit = pu; currentNoCast = pn; currentOrganic = po;
   const { merged, mergedGlass, lineGeom } = mergeBagArray(mine, { timing: false });
   bakeSmoothNormals(merged);
   mergedGlass.dispose();               // actors are opaque-only
@@ -2793,13 +2948,17 @@ function makeTargetSet(scale) {
       minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
     }),
     // half-res ping-pong pair for the cast-shadow silhouette smoothing
-    // (mask -> blur -> re-threshold); linear filter so the main pass
-    // upsamples the final field smoothly
+    // (mask -> blur -> re-threshold) and for the shade-field blur.
+    // Linear filter so the main pass upsamples smoothly; HALF FLOAT is
+    // load-bearing for the shade field — an 8-bit field re-plateaus the
+    // shallow gradients whose staircase this exists to remove
     rtMaskA: new THREE.WebGLRenderTarget(w >> 1, h >> 1, {
       minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+      type: THREE.HalfFloatType,
     }),
     rtMaskB: new THREE.WebGLRenderTarget(w >> 1, h >> 1, {
       minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+      type: THREE.HalfFloatType,
     }),
   };
 }
@@ -3146,6 +3305,7 @@ const post = new THREE.ShaderMaterial({
     shadowWobUv: { value: new THREE.Vector2() },
     tCastMask: { value: null }, castSmoothOn: { value: 0 }, castPxScale: { value: 0 },
     tStencilMask: { value: null }, stencilOn: { value: 0 }, stencilWobW: { value: 0 },
+    tShadeField: { value: null }, shadeFieldOn: { value: 0 },
   },
   vertexShader: /* glsl */`
     varying vec2 vUv;
@@ -3185,6 +3345,8 @@ const post = new THREE.ShaderMaterial({
     uniform float castSmoothOn, castPxScale;
     uniform sampler2D tStencilMask;         // stencil-volume mask, screen space
     uniform float stencilOn, stencilWobW;   // wobble amplitude in world units
+    uniform sampler2D tShadeField;          // blurred continuous shade value
+    uniform float shadeFieldOn;
 
     // ---- helpers -------------------------------------------------
     float hash(vec2 p) {
@@ -3231,6 +3393,16 @@ const post = new THREE.ShaderMaterial({
     // shade normal: the smoothed attachment when smooth shading is on,
     // the flat one otherwise (the JS binds whichever applies)
     vec3 snormalAt(vec2 uv) { return texture2D(tNormalS, uv).xyz * 2.0 - 1.0; }
+    // the lighting term. When the shade-field path is active it reads a
+    // screen-space BLURRED copy of the continuous shade value: Gouraud
+    // lighting is piecewise-linear per triangle, so on coarse meshes the
+    // hard-shade isoline snaps to per-triangle plateaus (staircase);
+    // smoothing the field first makes the boundary PATH smooth while the
+    // threshold afterwards keeps the edge razor-hard.
+    float shadeAt(vec2 p) {
+      return shadeFieldOn > 0.5 ? texture2D(tShadeField, p).r
+           : clamp(dot(snormalAt(p), normalize(lightDir)), 0.0, 1.0);
+    }
     float linDepthG(vec2 uv) {          // same, for the glass layer's depth
       float z = texture2D(tGlassDepth, uv).x;
       float ndc = z * 2.0 - 1.0;
@@ -3488,8 +3660,7 @@ const post = new THREE.ShaderMaterial({
       // so shadow shapes still get outlines on flat paper grounds
       if (mod(floor(texture2D(tID, p).b * 255.0 + 0.5), 2.0) > 0.5)
         return step(0.5, castS);
-      vec3 n = snormalAt(p);
-      float shade = clamp(dot(n, normalize(lightDir)), 0.0, 1.0);
+      float shade = shadeAt(p);
       shade = min(shade, 1.0 - castS);
       float sn = (vnoise3(w * (0.35 / hatchNoiseScale)) - 0.5) * hatchNoise * 0.3;
       return step(shade + sn, hatchThreshold);
@@ -3549,11 +3720,12 @@ const post = new THREE.ShaderMaterial({
       // received shadows entirely — their paint composes as-is
       float unlitF = mod(floor(texture2D(tID, uv).b * 255.0 + 0.5), 2.0);
       if (hatchOn > 0.5 && !sky && unlitF < 0.5) {
-        // smoothed normal for the LIGHTING term; the triplanar stroke
-        // frame below stays on the flat facet normal by design (frame
-        // seams land on face boundaries, under ink lines)
+        // smoothed normal for the LIGHTING term (via shadeAt, possibly
+        // field-blurred); the triplanar stroke frame below stays on the
+        // flat facet normal by design (frame seams land on face
+        // boundaries, under ink lines)
         vec3 n = normalAt(uv);
-        float shade = clamp(dot(snormalAt(uv), normalize(lightDir)), 0.0, 1.0);
+        float shade = shadeAt(uv);
         // cast shadows: a blocked pixel is fully in shadow, and every
         // style downstream (hard step, soft ramp, hatch strokes) treats
         // it that way automatically
@@ -4307,6 +4479,10 @@ const castMaskMat = new THREE.ShaderMaterial({
       if (z >= 0.9999) { gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0); return; }  // sky
       vec4 wp = invViewProj * vec4(vUv * 2.0 - 1.0, z * 2.0 - 1.0, 1.0);
       vec3 w = wp.xyz / wp.w;
+      // the melt only applies on ORGANIC receivers (ID blue bit 2):
+      // radW = 0 on hard-surface pixels keeps machinery's shadows crisp
+      // while plants/terrain melt at full radius
+      float orgF = mod(floor(texture2D(tID, vUv).b * 255.0 + 0.5) / 4.0, 2.0) >= 1.0 ? 1.0 : 0.0;
       float m = 0.0, radW = 0.0;
       if (castOn > 0.5 && stencilOn > 0.5) {
         // stencil-volume path: the mask is already screen space and
@@ -4314,7 +4490,7 @@ const castMaskMat = new THREE.ShaderMaterial({
         // so the melt radius is one flat value (uPenMax, slider/10) —
         // the pre-contact-hardening behavior.
         m = step(0.5, texture2D(tStencilMask, vUv).r);
-        radW = uPenMax;
+        radW = orgF * uPenMax;
       } else if (castOn > 0.5) {
         vec4 lp = lightVP * vec4(w, 1.0);
         vec3 sc = lp.xyz * 0.5 + 0.5;
@@ -4352,7 +4528,7 @@ const castMaskMat = new THREE.ShaderMaterial({
             // contact floor: never below ~1.5 shadow texels, so crisp
             // contact shadows still melt their raw texel staircase
             float throwW = max(0.0, (sc.z - bs / bn)) * uDepthRange;
-            radW = clamp(uPenK * throwW, uPenMin, uPenMax);
+            radW = orgF * clamp(uPenK * throwW, uPenMin, uPenMax);
           }
         }
       }
@@ -4365,7 +4541,7 @@ const castMaskMat = new THREE.ShaderMaterial({
         // carry the terminator radius on the dark side AND the adjacent
         // near-threshold lit facets, so the blur rounds the terminator
         // from both sides instead of dragging it sideways
-        if (shade < hatchThreshold + 0.25) radW = max(radW, uTermR);
+        if (shade < hatchThreshold + 0.25) radW = max(radW, orgF * uTermR);
       }
       gl_FragColor = vec4(m, radW / uMaxR, 0.0, 1.0);
     }`,
@@ -4388,6 +4564,104 @@ const maskThreshMat = new THREE.ShaderMaterial({
     }`,
   depthTest: false, depthWrite: false,
 });
+// shade-field extract: the continuous lighting value from the (view-
+// space) shade normals, rendered at half res so it can be blurred as a
+// FIELD before the compose thresholds it. G carries the ORGANIC class
+// bit (ID blue bit 2) so the blur picks its radius per pixel.
+const shadeFieldMat = new THREE.ShaderMaterial({
+  uniforms: {
+    tNormal: { value: null }, tID: { value: null },
+    lightDir: { value: new THREE.Vector3() },
+  },
+  vertexShader: blitVert,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    varying vec2 vUv;
+    uniform sampler2D tNormal, tID;
+    uniform vec3 lightDir;
+    void main() {
+      vec3 n = texture2D(tNormal, vUv).xyz * 2.0 - 1.0;
+      float bb = texture2D(tID, vUv).b;
+      float org = mod(floor(bb * 255.0 + 0.5) / 4.0, 2.0) >= 1.0 ? 1.0 : 0.0;
+      gl_FragColor = vec4(clamp(dot(n, normalize(lightDir)), 0.0, 1.0), org, 0.0, 1.0);
+    }`,
+  depthTest: false, depthWrite: false,
+});
+// per-class variable blur: the 9-tap gaussian with its step chosen by
+// the CENTER pixel's class — organic radius for plants/terrain, hard
+// radius (default 0 = identity) for machinery. G passes through so the
+// second axis still knows the class.
+const shadeBlurMat = new THREE.ShaderMaterial({
+  uniforms: {
+    tDiffuse: { value: null }, uAxis: { value: new THREE.Vector2() },
+    uOrgStep: { value: 0 }, uHardStep: { value: 0 },
+  },
+  vertexShader: blitVert,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    varying vec2 vUv;
+    uniform sampler2D tDiffuse;
+    uniform vec2 uAxis;
+    uniform float uOrgStep, uHardStep;
+    void main() {
+      vec4 c0 = texture2D(tDiffuse, vUv);
+      vec2 d = uAxis * mix(uHardStep, uOrgStep, step(0.5, c0.g));
+      float r = c0.r * 0.227;
+      r += (texture2D(tDiffuse, vUv + d).r       + texture2D(tDiffuse, vUv - d).r)       * 0.194;
+      r += (texture2D(tDiffuse, vUv + d * 2.0).r + texture2D(tDiffuse, vUv - d * 2.0).r) * 0.121;
+      r += (texture2D(tDiffuse, vUv + d * 3.0).r + texture2D(tDiffuse, vUv - d * 3.0).r) * 0.054;
+      r += (texture2D(tDiffuse, vUv + d * 4.0).r + texture2D(tDiffuse, vUv - d * 4.0).r) * 0.016;
+      gl_FragColor = vec4(r * 1.008, c0.g, 0.0, 1.0);   // tap weights sum ≈ .992
+    }`,
+  depthTest: false, depthWrite: false,
+});
+
+// debug-bar visualizers: shade-class view (organic green / hard orange /
+// sky paper) and a linearized depth view
+const dbgClassMat = new THREE.ShaderMaterial({
+  uniforms: {
+    tID: { value: null }, tDepth: { value: null },
+    cameraNear: { value: 0.1 }, cameraFar: { value: 1000 },
+  },
+  vertexShader: blitVert,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    varying vec2 vUv;
+    uniform sampler2D tID, tDepth;
+    uniform float cameraNear, cameraFar;
+    void main() {
+      float ndc = texture2D(tDepth, vUv).x * 2.0 - 1.0;
+      float d = (2.0 * cameraNear * cameraFar) /
+                (cameraFar + cameraNear - ndc * (cameraFar - cameraNear));
+      if (d > cameraFar * 0.99) { gl_FragColor = vec4(0.93, 0.93, 0.90, 1.0); return; }
+      float bb = texture2D(tID, vUv).b;
+      float org = mod(floor(bb * 255.0 + 0.5) / 4.0, 2.0) >= 1.0 ? 1.0 : 0.0;
+      gl_FragColor = org > 0.5 ? vec4(0.30, 0.72, 0.45, 1.0)    // organic
+                               : vec4(0.87, 0.48, 0.24, 1.0);   // hard surface
+    }`,
+  depthTest: false, depthWrite: false,
+});
+const dbgDepthMat = new THREE.ShaderMaterial({
+  uniforms: {
+    tDepth: { value: null },
+    cameraNear: { value: 0.1 }, cameraFar: { value: 1000 },
+  },
+  vertexShader: blitVert,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    varying vec2 vUv;
+    uniform sampler2D tDepth;
+    uniform float cameraNear, cameraFar;
+    void main() {
+      float ndc = texture2D(tDepth, vUv).x * 2.0 - 1.0;
+      float d = (2.0 * cameraNear * cameraFar) /
+                (cameraFar + cameraNear - ndc * (cameraFar - cameraNear));
+      float g = 1.0 - clamp(d / cameraFar, 0.0, 1.0);
+      gl_FragColor = vec4(vec3(g), 1.0);
+    }`,
+  depthTest: false, depthWrite: false,
+});
+
 const blitScene = new THREE.Scene();
 const blitQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), copyMat);
 blitQuad.frustumCulled = false;
@@ -4889,6 +5163,8 @@ slider('shadowBias', 'shadow bias', 0.0005, 0.01, 0.0005);
 dropdown('shadowRes', 'shadow map', ['1024', '2048', '4096'], makeShadowTarget);
 slider('shadowAmount', 'intensity', 0, 1, 0.01);
 slider('shadowSmoothPx', 'shadow smooth', 0, 3, 0.1);
+slider('organicBlurPx', 'organic smooth px', 0, 8, 0.5);
+slider('hardBlurPx', 'hard smooth px', 0, 8, 0.5);
 slider('shadowLine', 'shadow lines', 0, 1, 0.01);
 slider('shadowLineWidth', 'shadow line w', 0.5, 3, 0.05);
 slider('hatchThreshold', 'shade start', 0, 1, 0.01);
@@ -5029,6 +5305,36 @@ function drawCalls() {
 }
 // fps stays in the always-visible strip; every other meter lives in
 // the collapsed "advanced" expander so the default footprint is tiny
+// ---- debug bar: pass/class visualizers -------------------------
+// 'classes' paints organic green / hard-surface orange so the shade
+// classification is visible at a glance; the rest blit raw passes.
+(() => {
+  const bar = document.getElementById('debugbar');
+  const views = ['off', 'classes', 'ids', 'paint', 'glass', 'normals',
+                 'shade n', 'field', 'melt', 'stencil', 'glow', 'depth'];
+  const btns = new Map();
+  for (const v of views) {
+    const b = document.createElement('button');
+    b.textContent = v;
+    b.title = {
+      off: 'normal render', classes: 'organic = green, hard surface = orange',
+      ids: 'face-ID detection colors', paint: 'watercolor paint attachment',
+      glass: 'translucent layer', normals: 'flat facet normals',
+      'shade n': 'smoothed / PN shade normals', field: 'blurred shade field (R) + class (G)',
+      melt: 'cast-shadow melt mask (when shadow smooth > 0)',
+      stencil: 'stencil shadow mask', glow: 'emissive halo blur', depth: 'linearized depth',
+    }[v];
+    b.onclick = () => {
+      P.debugView = v;
+      for (const [k, e] of btns) e.classList.toggle('on', k === v);
+      markDirty();
+    };
+    bar.appendChild(b);
+    btns.set(v, b);
+  }
+  btns.get('off').classList.add('on');
+})();
+
 const budgetList = document.getElementById('budgetList');
 const budgetAdvList = document.getElementById('budgetAdvList');
 for (const b of BUDGETS) {
@@ -5417,7 +5723,7 @@ function renderFrame(useHi) {
   // translucent layer takes no shading and no contours). Rendered before
   // the shadow melt below, which reads normals for the terminator term.
   if (P.hatchOn || P.contourLine > 0 || (hasSoftRoot && P.softContact > 0) ||
-      P.groundSpeckle > 0) {
+      P.groundSpeckle > 0 || P.debugView !== 'off') {
     renderer.setRenderTarget(T.rtNormal);
     renderer.setClearColor(0x8080ff, 1);
     renderer.clear();
@@ -5506,6 +5812,39 @@ function renderFrame(useHi) {
     blurAtoB(T.rtMaskB, T.rtMaskB, T.rtMaskA);       // round 2: B -> (A) -> B
   }
 
+  // shade-field blur: smooth the CONTINUOUS lighting value, threshold
+  // later in the compose — the terminator's PATH stops staircasing on
+  // coarse Gouraud meshes while its edge stays hard. The radius is
+  // PER-CLASS: organic surfaces melt by organicBlurPx, hard-surface
+  // machinery by hardBlurPx (default 0 = untouched). Skipped while the
+  // melt owns the terminator (it also owns the rtMask pair then).
+  const shadeField = (P.hatchOn && !castSmooth &&
+                      (P.organicBlurPx > 0 || P.hardBlurPx > 0)) ||
+                     P.debugView === 'field';
+  if (shadeField) {
+    shadeFieldMat.uniforms.tNormal.value = T.rtNormal.texture[P.smoothShade ? 1 : 0];
+    shadeFieldMat.uniforms.tID.value = T.rtID.texture[0];
+    shadeFieldMat.uniforms.lightDir.value.copy(lightWorld)
+      .transformDirection(camera.matrixWorldInverse);   // view space, like the normals
+    blitQuad.material = shadeFieldMat;
+    renderer.setRenderTarget(T.rtMaskA);
+    renderer.render(blitScene, postCamera);
+    // separable gaussian; steps in half-res texels so the reach ≈ 2×
+    // the per-class slider px
+    const sb = shadeBlurMat.uniforms;
+    sb.uOrgStep.value = 0.5 * P.organicBlurPx;
+    sb.uHardStep.value = 0.5 * P.hardBlurPx;
+    sb.tDiffuse.value = T.rtMaskA.texture;
+    sb.uAxis.value.set(1 / T.rtMaskA.width, 0);
+    blitQuad.material = shadeBlurMat;
+    renderer.setRenderTarget(T.rtMaskB);
+    renderer.render(blitScene, postCamera);
+    sb.tDiffuse.value = T.rtMaskB.texture;
+    sb.uAxis.value.set(0, 1 / T.rtMaskA.height);
+    renderer.setRenderTarget(T.rtMaskA);
+    renderer.render(blitScene, postCamera);
+  }
+
   // pass 2b: glow halo — extract emissive pixels, blur at quarter res
   if (hasGlow) {
     glowExtractMat.uniforms.tDiffuse.value = T.rtID.texture[1];
@@ -5521,6 +5860,41 @@ function renderFrame(useHi) {
     blurMat.uniforms.uDir.value.set(0, P.haloSize / T.rtGlowA.height);
     renderer.setRenderTarget(T.rtGlowA);
     renderer.render(blitScene, postCamera);
+  }
+
+  // debug bar: blit the selected buffer (or the class view) instead of
+  // composing ink. Runs AFTER every pre-pass so each view is fresh —
+  // 'melt' and 'stencil' show their last contents when that path is off.
+  if (P.debugView !== 'off') {
+    renderer.setRenderTarget(null);
+    if (P.debugView === 'classes') {
+      const du = dbgClassMat.uniforms;
+      du.tID.value = T.rtID.texture[0];
+      du.tDepth.value = T.rtID.depthTexture;
+      du.cameraNear.value = camera.near;
+      du.cameraFar.value = camera.far;
+      blitQuad.material = dbgClassMat;
+    } else if (P.debugView === 'depth') {
+      const du = dbgDepthMat.uniforms;
+      du.tDepth.value = T.rtID.depthTexture;
+      du.cameraNear.value = camera.near;
+      du.cameraFar.value = camera.far;
+      blitQuad.material = dbgDepthMat;
+    } else {
+      const tex = {
+        ids: T.rtID.texture[0], paint: T.rtID.texture[1],
+        glass: T.rtGlass.texture[0],
+        normals: T.rtNormal.texture[0], 'shade n': T.rtNormal.texture[1],
+        field: T.rtMaskA.texture, melt: T.rtMaskB.texture,
+        stencil: rtStencil ? rtStencil.texture : null,
+        glow: T.rtGlowA.texture,
+      }[P.debugView];
+      if (!tex) return;
+      copyMat.uniforms.tDiffuse.value = tex;
+      blitQuad.material = copyMat;
+    }
+    renderer.render(blitScene, postCamera);
+    return;
   }
 
   // pass 3: ink
@@ -5572,6 +5946,8 @@ function renderFrame(useHi) {
   u.stencilWobW.value = 16 * (sceneSphere ? sceneSphere.radius : 100) / 2048;
   u.tCastMask.value = T.rtMaskB.texture;
   u.castSmoothOn.value = castSmooth ? 1 : 0;
+  u.tShadeField.value = T.rtMaskA.texture;
+  u.shadeFieldOn.value = shadeField ? 1 : 0;
   // uMaxR world units -> screen px at unit depth; castMaskAt scales this
   // by the per-pixel G radius for its AA band (band ~ 1.2 / on-screen r)
   u.castPxScale.value = penMaxR * invFovScale() * rtScreen.height;

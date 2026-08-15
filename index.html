@@ -112,7 +112,7 @@ const P = {
   // Scale-invariant plane test, not a raw depth threshold.
   softContact: 1,
   // region grouping: neighbors that share a color draw no line between them
-  regionGroup: true, similarity: 0.1,
+  regionGroup: true, similarity: 0.25,
   // self-overlap contours from the normal buffer: ink where visible
   // surface orientation jumps discontinuously (a fold crossing itself),
   // which the ID detector can't see inside a single region. 0 = off.
@@ -128,13 +128,19 @@ const P = {
   // cloud mass scale + horizon fade-in band, speckle size multiplier
   // (1 = the old hardcoded look) and distance-fade STRENGTH: 0 = never
   // fade (default), 1 = the old ramp, higher pulls the fade closer
-  skyGradHeight: 0.30, cloudScale: 5.5, cloudFade: 0.10,
+  // cloudFade 0 = clouds wrap all the way around/below the horizon;
+  // raise it to fade them out toward the horizon line instead.
+  // cloudStretch elongates cloud shapes along cloudStretchDir (deg).
+  skyGradHeight: 1, cloudScale: 5.5, cloudFade: 0,
+  cloudStretch: 1, cloudStretchDir: 0,
   speckleSize: 1, speckleFade: 0,
-  // emissive sun disc drawn at the LIGHT direction (size in degrees, 0 = off)
-  sunSize: 15, sunColor: '#f7c948', sunGlow: 0.35,
-  // halo extent as a multiple of the disc, and how far the core pushes
-  // from sunColor toward white
-  sunHaloWidth: 3.5, sunCore: 0.4,
+  // emissive sun disc drawn at the LIGHT direction (size in degrees,
+  // 0 = off). Its bloom rides the shared lamp glow pipeline at full
+  // emissive strength — halo/haloSize are the only bloom controls.
+  sunSize: 15, sunColor: '#f7c948',
+  // how far the hot core pushes from sunColor toward white (the halo
+  // itself goes through the emissive glow pipeline, sized by haloSize)
+  sunCore: 0.4,
   // feature LOD: fade a line when the shapes it separates are small on screen.
   // minFeature is a % of screen height; 0 disables the whole feature.
   minFeature: 0.4, lodMetric: 'area', lodUnit: 'region', keepSilhouettes: false,
@@ -147,7 +153,7 @@ const P = {
   lineWidth: 0.5, distanceFalloff: 1.25,
   wobbleAmp: 0, wobbleFreq: 0.08,
   // shading (hatch strokes or flat shadows)
-  hatchOn: true, hatchThreshold: 0.45, crossThreshold: 0.02,
+  hatchOn: true, hatchThreshold: 0.18, crossThreshold: 0.02,
   hatchSpacing: 10.0, hatchWidth: 0.05, hatchAngle: 45,
   // cast shadows: one directional sun. The map re-renders only when the
   // light moves or the camera shifts its fitted light window; a still
@@ -191,13 +197,16 @@ const P = {
   // quadratic shade normals) melt generously; hard-surface machinery
   // defaults to none so mechanical detail stays crisp. Ignored while
   // the melt owns the terminator (shadow smooth > 0).
-  organicBlurPx: 1.5, hardBlurPx: 0,
+  organicBlurPx: 1.5, hardBlurPx: 1,
   // debug bar (top of screen): 'off' = normal render; 'classes' paints
   // organic green / hard orange; the rest blit individual render passes
   debugView: 'off',
   // ink along shadow boundaries (0 = off) and its width as a multiple
   // of the regular line radius
-  shadowLine: 0.46, shadowLineWidth: 1.65,
+  // shadow outlines at FULL ink strength and shared width by default:
+  // every line in the scene is the same pen (lower shadowLine to make
+  // shadow outlines read lighter than geometry lines)
+  shadowLine: 1.0, shadowLineWidth: 1.0,
   // colors
   inkColor: '#1d1a17', paperColor: '#f6f2e6', paperGrain: 0, grainScale: 1,
   // paper material model: pressed-felt fiber strength and granule flecks
@@ -206,17 +215,17 @@ const P = {
   // wash/pooling/tint/fade applied in the compose step. colorOn off
   // must render pixel-identical to the pre-color build.
   colorOn: true, skyColor: '#d8efec',
-  washAmount: 0, washScale: 3.05, poolAmount: 0.01, inkTint: 0, aerialFade: 0.81,
+  washAmount: 0, washScale: 3.05, poolAmount: 0, inkTint: 0, aerialFade: 0.81,
   // edge-pooling band width (× line radius) and the aerial fade ramp
   // endpoints as fractions of the camera far plane
-  poolRadius: 3.5, aerialNear: 0.18, aerialFar: 0.9,
+  poolRadius: 3.5, aerialNear: 0.18, aerialFar: 1.5,
   // per-region value drift baked into aPaint — adjacent panels read as
   // separately mixed brush pools (rebuilds on change)
   regionJitter: 0.07,
   // glass & glow: translucent-layer fill/line strength, emissive
   // brightness lift, and the halo bleeding past lamp silhouettes
-  glassTint: 0.51, glassLine: 1, glassBackLine: 0.4, glowLift: 0.5,
-  haloStrength: 1.9, haloSize: 3.75,
+  glassTint: 0.51, glassLine: 1, glassBackLine: 1, glowLift: 0.5,
+  haloStrength: 0.85, haloSize: 3.75,
   // thin lines & AA
   oneSided: false, coverageAA: true, superSample: 1,
   msaa: 'off', aaMode: 'smaa', vectorMode: false, progressive: false,
@@ -2929,9 +2938,43 @@ function makeTargetSet(scale) {
       samples: msaaSamples(),
     }),
     // two attachments: [0] flat facet normals, [1] smoothed shade
-    // normals (same r160 MRT API caveat as rtID above)
+    // normals (same r160 MRT API caveat as rtID above). Same MSAA as
+    // rtID — otherwise contour/shadow-boundary lines alias while the
+    // ID-derived ink doesn't. Resolved edge normals are averages (can
+    // shorten to near zero), so every decode renormalizes.
     rtNormal: new THREE.WebGLMultipleRenderTargets(w, h, 2, {
       minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+      samples: msaaSamples(),
+    }),
+    // stage A of the line pass: the 1px boundary skeleton
+    // (R = ink strength, G/B = glass, A = speckle fill).
+    // LINEAR filter is load-bearing: the stroke stage samples this at
+    // -0.5-texel offsets so each forward-diff boundary mark (written on
+    // the left/bottom pixel of its texel pair) spreads bilinearly
+    // across BOTH pixels — the two-sided half-intensity line profile,
+    // re-centered on the boundary. Texel-center reads (the alpha
+    // passthrough, the max-downsample) are exact under bilinear.
+    rtSkel: new THREE.WebGLRenderTarget(w, h, {
+      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+    }),
+    // quarter-res MAX-downsample of the skeleton RGB (max, not mip
+    // average — an average would quantize thin lines to zero): the
+    // stroke stage rejects empty neighborhoods with a few cheap taps
+    rtSkelLo: new THREE.WebGLRenderTarget(w >> 2, h >> 2, {
+      minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+    }),
+    // stage B output: the stroked lines the compose reads. Same
+    // channel semantics as the skeleton, at final width.
+    rtLines: new THREE.WebGLRenderTarget(w, h, {
+      minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+    }),
+    // materialized shadow mask (MASK_PASS): R = binary shadow-region
+    // membership, G = the compose's AA'd cast fill — computed once per
+    // frame instead of ~7x per pixel. LINEAR filter is load-bearing:
+    // skelShadow's RGSS sub-offset reads interpolate the binary R into
+    // coverage grays (texel-center reads stay exact under bilinear).
+    rtSMask: new THREE.WebGLRenderTarget(w, h, {
+      minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
     }),
     rtInk: new THREE.WebGLRenderTarget(w, h, {
       minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
@@ -2965,7 +3008,9 @@ function makeTargetSet(scale) {
 function disposeSet(t) {
   if (t) {
     t.rtID.dispose(); t.rtGlass.dispose(); t.rtGlassBack.dispose();
-    t.rtNormal.dispose(); t.rtInk.dispose(); t.rtGlowA.dispose(); t.rtGlowB.dispose();
+    t.rtNormal.dispose(); t.rtSkel.dispose(); t.rtSkelLo.dispose();
+    t.rtLines.dispose(); t.rtSMask.dispose(); t.rtInk.dispose();
+    t.rtGlowA.dispose(); t.rtGlowB.dispose();
     t.rtMaskA.dispose(); t.rtMaskB.dispose();
   }
 }
@@ -3278,10 +3323,11 @@ const post = new THREE.ShaderMaterial({
     horizonColor: { value: new THREE.Color(P.skyHorizon) },
     cloudAmt: { value: 0 }, speckleAmt: { value: 0 },
     skyGradHeight: { value: 0.30 }, cloudScale: { value: 5.5 }, cloudFade: { value: 0.10 },
+    cloudStretch: { value: 1 }, cloudDir: { value: 0 },
     speckleSize: { value: 1 }, speckleFade: { value: 0 },
     sunDir: { value: new THREE.Vector3(0, 1, 0) },
     sunSize: { value: 0 }, sunColor: { value: new THREE.Color(P.sunColor) },
-    sunGlow: { value: 0 }, sunHaloWidth: { value: 3.5 }, sunCore: { value: 0.4 },
+    sunCore: { value: 0.4 },
     minFeature: { value: 0 }, invFovScale: { value: 1 }, keepSil: { value: 0 },
     // watercolor
     tPaint:     { value: null },
@@ -3297,14 +3343,19 @@ const post = new THREE.ShaderMaterial({
     tGlassID: { value: null }, tGlassPaint: { value: null }, tGlassDepth: { value: null },
     tGlassBackID: { value: null }, tGlassBackDepth: { value: null },
     tGlow: { value: null },
+    tLines: { value: null },   // the line pass's output (compose only)
+    tSkel: { value: null },    // stage A skeleton (stroke stage only)
+    tSkelLo: { value: null },  // quarter-res max of tSkel (gate)
     glassTint: { value: 0 }, glassLine: { value: 0 }, glassBackLine: { value: 0 },
     glowLift: { value: 0 }, haloStrength: { value: 0 },
     contourLine: { value: 0 }, contourCos: { value: 0 },
     tShadow: { value: null }, lightVP: { value: new THREE.Matrix4() },
     castOn: { value: 0 }, shadowBias: { value: 0 },
     shadowWobUv: { value: new THREE.Vector2() },
+    shadowTexel: { value: new THREE.Vector2() },   // one shadow-map texel in UV
     tCastMask: { value: null }, castSmoothOn: { value: 0 }, castPxScale: { value: 0 },
     tStencilMask: { value: null }, stencilOn: { value: 0 }, stencilWobW: { value: 0 },
+    tSMask: { value: null },   // MASK_PASS output: R = shadow region, G = cast fill
     tShadeField: { value: null }, shadeFieldOn: { value: 0 },
   },
   vertexShader: /* glsl */`
@@ -3323,9 +3374,10 @@ const post = new THREE.ShaderMaterial({
                   hatchSpacing, hatchWidth, hatchAngle, hatchNoise, hatchNoiseScale,
                   hatchBreak, shadeMode, shadowAmount, shadowLine, shadowLineWidth,
                   paperGrain, grainScale, ssScale, oneSided, coverage, minFeature, invFovScale, keepSil,
-                  edgeToAlpha, softContact, groundY, cloudAmt, speckleAmt, sunSize, sunGlow,
-                  skyGradHeight, cloudScale, cloudFade, speckleSize, speckleFade,
-                  sunHaloWidth, sunCore, paperFiber, paperFleck;
+                  edgeToAlpha, softContact, groundY, cloudAmt, speckleAmt, sunSize,
+                  skyGradHeight, cloudScale, cloudFade, cloudStretch, cloudDir,
+                  speckleSize, speckleFade,
+                  sunCore, paperFiber, paperFleck;
     uniform vec3 horizonColor, sunDir, sunColor;
     uniform sampler2D tPaint;
     uniform vec3 skyColor;
@@ -3333,7 +3385,7 @@ const post = new THREE.ShaderMaterial({
                   poolRadius, aerialNear, aerialFar;
     uniform mat4 invViewProj;
     uniform mat3 viewToWorldN;
-    uniform sampler2D tGlassID, tGlassPaint, tGlassDepth, tGlow;
+    uniform sampler2D tGlassID, tGlassPaint, tGlassDepth, tGlow, tLines, tSkel, tSkelLo;
     uniform sampler2D tGlassBackID, tGlassBackDepth;
     uniform float glassTint, glassLine, glassBackLine, glowLift, haloStrength;
     uniform float contourLine, contourCos;
@@ -3341,10 +3393,12 @@ const post = new THREE.ShaderMaterial({
     uniform mat4 lightVP;
     uniform float castOn, shadowBias;
     uniform vec2 shadowWobUv;   // wobble amplitude: fixed world size -> window UV
+    uniform vec2 shadowTexel;   // one shadow-map texel in UV (diamond PCF)
     uniform sampler2D tCastMask;            // blurred + re-thresholded shadow mask
     uniform float castSmoothOn, castPxScale;
     uniform sampler2D tStencilMask;         // stencil-volume mask, screen space
     uniform float stencilOn, stencilWobW;   // wobble amplitude in world units
+    uniform sampler2D tSMask;               // MASK_PASS: R = shadow region, G = cast fill
     uniform sampler2D tShadeField;          // blurred continuous shade value
     uniform float shadeFieldOn;
 
@@ -3358,6 +3412,18 @@ const post = new THREE.ShaderMaterial({
       return mix(mix(hash(i), hash(i + vec2(1,0)), u.x),
                  mix(hash(i + vec2(0,1)), hash(i + vec2(1,1)), u.x), u.y);
     }
+    // vnoise plus its analytic gradient (same 4 hashes): x = value,
+    // yz = d/dp. Needed where fwidth is unreliable (divergent loops).
+    vec3 vnoiseG(vec2 p) {
+      vec2 i = floor(p), f = fract(p);
+      vec2 u = f * f * (3.0 - 2.0 * f);
+      vec2 du = 6.0 * f * (1.0 - f);
+      float a = hash(i), b = hash(i + vec2(1,0)), c = hash(i + vec2(0,1)), d = hash(i + vec2(1,1));
+      float k = a - b - c + d;
+      return vec3(mix(mix(a, b, u.x), mix(c, d, u.x), u.y),
+                  (b - a + k * u.y) * du.x,
+                  (c - a + k * u.x) * du.y);
+    }
     float hash3(vec3 p) {
       return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453123);
     }
@@ -3369,6 +3435,27 @@ const post = new THREE.ShaderMaterial({
       float b = mix(mix(hash3(i + vec3(0,0,1)), hash3(i + vec3(1,0,1)), u.x),
                     mix(hash3(i + vec3(0,1,1)), hash3(i + vec3(1,1,1)), u.x), u.y);
       return mix(a, b, u.z);
+    }
+    // ---- cloud dome -------------------------------------------------
+    // stereographic mapping shared by EVERY cloud consumer (compose
+    // fill, line-pass rims, region view, glow occlusion) so the shapes
+    // can never disagree. cloudStretch elongates features along
+    // cloudDir; the mapping continues below the horizon so clouds wrap
+    // all the way around, compressing toward the down-pole like a
+    // vanishing point.
+    vec2 cloudP(vec3 rd) {
+      vec2 cp = rd.xz / (1.0 + max(rd.y, -0.98)) * cloudScale;
+      float cA = cos(cloudDir), sA = sin(cloudDir);
+      return vec2((cp.x * cA + cp.y * sA) / max(cloudStretch, 1.0),
+                  -cp.x * sA + cp.y * cA);
+    }
+    float cloudBand(vec3 rd) {
+      // only the stereographic singularity near straight-down is
+      // masked; cloudFade > 0 restores the old horizon fade-in
+      float band = smoothstep(-0.95, -0.75, rd.y);
+      if (cloudFade > 0.001)
+        band *= smoothstep(0.02, max(cloudFade, 0.04), max(rd.y, 0.0));
+      return band;
     }
     // world position from the depth buffer — pigment must live ON the
     // surfaces, not on the picture plane, or it swims when the camera moves
@@ -3389,10 +3476,13 @@ const post = new THREE.ShaderMaterial({
       return (2.0 * cameraNear * cameraFar) /
              (cameraFar + cameraNear - ndc * (cameraFar - cameraNear));
     }
-    vec3 normalAt(vec2 uv) { return texture2D(tNormal, uv).xyz * 2.0 - 1.0; }
+    // decodes renormalize: MSAA resolve averages edge normals, which
+    // shortens them (guard keeps a degenerate opposite-pair finite)
+    vec3 renorm(vec3 n) { return n * inversesqrt(max(dot(n, n), 1e-8)); }
+    vec3 normalAt(vec2 uv) { return renorm(texture2D(tNormal, uv).xyz * 2.0 - 1.0); }
     // shade normal: the smoothed attachment when smooth shading is on,
     // the flat one otherwise (the JS binds whichever applies)
-    vec3 snormalAt(vec2 uv) { return texture2D(tNormalS, uv).xyz * 2.0 - 1.0; }
+    vec3 snormalAt(vec2 uv) { return renorm(texture2D(tNormalS, uv).xyz * 2.0 - 1.0); }
     // the lighting term. When the shade-field path is active it reads a
     // screen-space BLURRED copy of the continuous shade value: Gouraud
     // lighting is piecewise-linear per triangle, so on coarse meshes the
@@ -3415,43 +3505,19 @@ const post = new THREE.ShaderMaterial({
       return (2.0 * cameraNear * cameraFar) /
              (cameraFar + cameraNear - ndc * (cameraFar - cameraNear));
     }
-    // lean detector for the glass layer's own ID buffer: 4-direction
-    // color-step test (no LOD/one-sided/coverage — glass linework is
-    // sparse enough that the full machinery isn't worth its taps)
-    float glassInk(vec2 p, vec2 o) {
-      vec3 c = texture2D(tGlassID, p).rgb;
-      float d =        distance(c, texture2D(tGlassID, p + vec2(o.x, 0.)).rgb);
-      d = max(d, distance(c, texture2D(tGlassID, p - vec2(o.x, 0.)).rgb));
-      d = max(d, distance(c, texture2D(tGlassID, p + vec2(0., o.y)).rgb));
-      d = max(d, distance(c, texture2D(tGlassID, p - vec2(0., o.y)).rgb));
-      return smoothstep(idThreshold, idThreshold * 3.0, d);
-    }
-    float glassInkB(vec2 p, vec2 o) {   // same test on the back-face layer
-      vec3 c = texture2D(tGlassBackID, p).rgb;
-      float d =        distance(c, texture2D(tGlassBackID, p + vec2(o.x, 0.)).rgb);
-      d = max(d, distance(c, texture2D(tGlassBackID, p - vec2(o.x, 0.)).rgb));
-      d = max(d, distance(c, texture2D(tGlassBackID, p + vec2(0., o.y)).rgb));
-      d = max(d, distance(c, texture2D(tGlassBackID, p - vec2(0., o.y)).rgb));
-      return smoothstep(idThreshold, idThreshold * 3.0, d);
-    }
-    // coverage versions: same 4-sub-pixel averaging the main detector
-    // uses — a wobble-induced miss becomes partial ink instead of a gap
-    // RGSS: rotated-grid sub-pixel offsets — resolves the near-horizontal
-    // and near-vertical staircases an axis-aligned quad misses, same 4 taps
+    // RGSS: rotated-grid sub-pixel offsets. Only meaningful against
+    // linearly-FILTERED inputs — in practice the shadow path's mask and
+    // field textures (skelShadow uses the RG1/RG3 diagonal pair).
+    // Against the nearest-filtered ID/depth/normal buffers all four
+    // sub-positions (< 0.5px) snap to the SAME texels as the fixed
+    // ±1-texel skeleton taps, so an RGSS average there returns four
+    // identical values: the geometry and glass skeletons run a single
+    // evaluation, and their coverage AA comes from the stroke stage's
+    // half-texel recentering instead (see STAGE B).
     #define RG1 vec2(-0.375, -0.125)
     #define RG2 vec2( 0.125, -0.375)
     #define RG3 vec2( 0.375,  0.125)
     #define RG4 vec2(-0.125,  0.375)
-    float glassInkC(vec2 p, vec2 o, vec2 px) {
-      if (coverage < 0.5) return glassInk(p, o);
-      return 0.25 * (glassInk(p + px * RG1, o) + glassInk(p + px * RG2, o)
-                   + glassInk(p + px * RG3, o) + glassInk(p + px * RG4, o));
-    }
-    float glassInkBC(vec2 p, vec2 o, vec2 px) {
-      if (coverage < 0.5) return glassInkB(p, o);
-      return 0.25 * (glassInkB(p + px * RG1, o) + glassInkB(p + px * RG2, o)
-                   + glassInkB(p + px * RG3, o) + glassInkB(p + px * RG4, o));
-    }
     float lum(vec3 c) { return c.r + c.g + c.b; }
 
     // ---- paper tooth ------------------------------------------------
@@ -3600,33 +3666,88 @@ const post = new THREE.ShaderMaterial({
 
     // cast-shadow test. Map path: PCF in the sun's orthographic light
     // space. Stencil path: the screen-space stencil-volume mask, sampled
-    // at this pixel — pixel-exact geometry, re-hardened from its bilinear
-    // ramp into a crisp antialiased edge. Both wobble the lookup by the
-    // same surface-anchored noise the strokes use, so cast shadow shapes
-    // read as hand-painted. Returns 1 = blocked.
+    // at this pixel. Both wobble the lookup by the same surface-anchored
+    // noise the strokes use, so cast shadow shapes read as hand-painted.
+    // Returns 1 = blocked. This is the BINARY membership test — it feeds
+    // shadowMaskAt, which steps it anyway, so the shadow-line skeleton
+    // stays pinned to the 50% crossing. The compose FILL must use
+    // castAtAA below instead: a single bilinear tap at a texel center
+    // returns the raw binary mask value (there is no ramp for a
+    // re-hardening smoothstep to re-harden), so building the fill on
+    // this test rendered every cast-shadow edge as a hard per-pixel
+    // stair — the aliasing that survived the line-pass coverage fix.
     float castAt(vec2 p, vec3 w) {
       if (castOn < 0.5) return 0.0;
       if (stencilOn > 0.5) {
         // wobble in screen UV, amplitude anchored to a fixed WORLD size
-        // at this pixel's depth (worldSize * invFov / viewZ = UV along y)
-        float hnfS = 0.35 / hatchNoiseScale;
-        vec2 wob = (vec2(vnoise3(w * hnfS), vnoise3(w * hnfS + 40.0)) - 0.5)
-                 * hatchNoise * stencilWobW * invFovScale / max(linDepth(p), 0.2);
-        wob.x *= resolution.y / resolution.x;
-        return smoothstep(0.3, 0.7, texture2D(tStencilMask, p + wob).r);
+        // at this pixel's depth (worldSize * invFov / viewZ = UV along y).
+        // The vnoise3 pair only runs when the dial is up — at the
+        // default hatchNoise 0 it produced ~16 hash evaluations that
+        // were multiplied by zero and discarded, in the hottest helper.
+        vec2 wob = vec2(0.0);
+        if (hatchNoise > 0.0) {
+          float hnfS = 0.35 / hatchNoiseScale;
+          wob = (vec2(vnoise3(w * hnfS), vnoise3(w * hnfS + 40.0)) - 0.5)
+              * hatchNoise * stencilWobW * invFovScale / max(linDepth(p), 0.2);
+          wob.x *= resolution.y / resolution.x;
+        }
+        return step(0.5, texture2D(tStencilMask, p + wob).r);
       }
       vec4 lp = lightVP * vec4(w, 1.0);
       vec3 sc = lp.xyz * 0.5 + 0.5;      // ortho: no perspective divide
       if (sc.x <= 0.0 || sc.x >= 1.0 || sc.y <= 0.0 || sc.y >= 1.0 || sc.z >= 1.0)
         return 0.0;
-      float hnf = 0.35 / hatchNoiseScale;
-      sc.xy += (vec2(vnoise3(w * hnf), vnoise3(w * hnf + 40.0)) - 0.5)
-               * hatchNoise * shadowWobUv;
-      // hardware-PCF compare gives a one-texel linear ramp across the
-      // boundary; the narrow smoothstep re-hardens it into a crisp
-      // antialiased edge instead of a nearest-tap texel staircase
+      if (hatchNoise > 0.0) {
+        float hnf = 0.35 / hatchNoiseScale;
+        sc.xy += (vec2(vnoise3(w * hnf), vnoise3(w * hnf + 40.0)) - 0.5)
+                 * hatchNoise * shadowWobUv;
+      }
       float lit = texture2D(tShadow, vec3(sc.xy, sc.z - shadowBias));
       return smoothstep(0.3, 0.7, 1.0 - lit);
+    }
+    // compose-fill variant: SUB-PIXEL EDGE COVERAGE. The hard shade
+    // mode deliberately joins the cast term by max OUTSIDE its step so
+    // an antialiased edge fraction survives — this supplies one.
+    // Stencil path: 4 bilinear taps at the pixel's quarter-diagonal
+    // corners average to a 3x3 tent of the binary mask — a ~2px ramp
+    // (0, .25, .75, 1 across a straight edge) that matches the ink
+    // lines' soft profile and grades along diagonal stairs. Map path:
+    // the same 4-tap rotated-diamond PCF the melt extract uses,
+    // positioning the edge sub-texel so near-grid-aligned silhouettes
+    // don't step in long texel-run sawteeth.
+    float castAtAA(vec2 p, vec3 w) {
+      if (castOn < 0.5) return 0.0;
+      if (stencilOn > 0.5) {
+        vec2 wob = vec2(0.0);
+        if (hatchNoise > 0.0) {
+          float hnfS = 0.35 / hatchNoiseScale;
+          wob = (vec2(vnoise3(w * hnfS), vnoise3(w * hnfS + 40.0)) - 0.5)
+              * hatchNoise * stencilWobW * invFovScale / max(linDepth(p), 0.2);
+          wob.x *= resolution.y / resolution.x;
+        }
+        vec2 q = p + wob;
+        vec2 h = 0.5 / resolution;
+        return 0.25 * (texture2D(tStencilMask, q + h).r
+                     + texture2D(tStencilMask, q - h).r
+                     + texture2D(tStencilMask, q + vec2(h.x, -h.y)).r
+                     + texture2D(tStencilMask, q + vec2(-h.x, h.y)).r);
+      }
+      vec4 lp = lightVP * vec4(w, 1.0);
+      vec3 sc = lp.xyz * 0.5 + 0.5;
+      if (sc.x <= 0.0 || sc.x >= 1.0 || sc.y <= 0.0 || sc.y >= 1.0 || sc.z >= 1.0)
+        return 0.0;
+      if (hatchNoise > 0.0) {
+        float hnf = 0.35 / hatchNoiseScale;
+        sc.xy += (vec2(vnoise3(w * hnf), vnoise3(w * hnf + 40.0)) - 0.5)
+                 * hatchNoise * shadowWobUv;
+      }
+      float zb = sc.z - shadowBias;
+      float lit = 0.25 * (
+          texture2D(tShadow, vec3(sc.xy + vec2( 0.6,  0.2) * shadowTexel, zb))
+        + texture2D(tShadow, vec3(sc.xy + vec2(-0.6, -0.2) * shadowTexel, zb))
+        + texture2D(tShadow, vec3(sc.xy + vec2(-0.2,  0.6) * shadowTexel, zb))
+        + texture2D(tShadow, vec3(sc.xy + vec2( 0.2, -0.6) * shadowTexel, zb)));
+      return smoothstep(0.25, 0.75, 1.0 - lit);
     }
 
     // smoothed-silhouette path: the blurred + re-thresholded mask field.
@@ -3662,9 +3783,132 @@ const post = new THREE.ShaderMaterial({
         return step(0.5, castS);
       float shade = shadeAt(p);
       shade = min(shade, 1.0 - castS);
-      float sn = (vnoise3(w * (0.35 / hatchNoiseScale)) - 0.5) * hatchNoise * 0.3;
+      float sn = hatchNoise > 0.0
+        ? (vnoise3(w * (0.35 / hatchNoiseScale)) - 0.5) * hatchNoise * 0.3 : 0.0;
       return step(shade + sn, hatchThreshold);
     }
+
+    // ---- ground speckle membership ------------------------------
+    // which blob (if any) owns a point on the ground sheet. The blob's
+    // lattice cell is its IDENTITY — for the line detector a speckle is
+    // just another region, like a face color in the ID buffer. r is the
+    // normalized radial distance to the nearest blob (r < 1 = inside);
+    // rx and the per-blob rim strength ride along for the fill/rim.
+    struct Blob { float r; vec2 grad; };
+    Blob speckleBlobAt(vec2 scc) {
+      vec2 sCell = floor(scc);
+      Blob b; b.r = 1e5; b.grad = vec2(0.0);
+      for (int cy = -1; cy <= 1; cy++)
+      for (int cx = -1; cx <= 1; cx++) {
+        vec2 c = sCell + vec2(float(cx), float(cy));
+        vec3 h = fract(sin(vec3(dot(c, vec2(127.1, 311.7)),
+                                dot(c, vec2(269.5, 183.3)),
+                                dot(c, vec2(419.2, 371.9)))) * 43758.5453);
+        // patchy scatter: low-freq noise makes some stretches of
+        // sand busy and others bare instead of an even grid
+        float patchy = smoothstep(0.2, 0.8, vnoise(c * 0.37 + 9.1));   // 'patch' is a GLSL reserved word
+        if (h.z > speckleAmt * 1.5 * patchy) continue;
+        vec2 ctr = c + 0.2 + h.xy * 0.6;    // jittered centre
+        // long-tailed sizes: mostly small flecks, the odd big lozenge
+        float u2 = fract(h.z * 9.7);
+        float rx = 0.03 + 0.17 * u2 * u2;
+        float ry = rx * (0.45 + 0.4 * fract(h.x * 5.1));   // aspect
+        // random orientation
+        float sAng = h.x * 6.2832;
+        float ca = cos(sAng), sa = sin(sAng);
+        vec2 dd = scc - ctr;
+        dd = vec2(dd.x * ca - dd.y * sa,
+                  dd.x * sa + dd.y * ca);
+        vec2 d = dd / vec2(rx, ry);
+        // domain-warp the rim so each blob is a lumpy potato,
+        // not a perfect ellipse (gradient version — see below)
+        vec3 w1 = vnoiseG(scc * 6.0 + h.y * 43.0);
+        vec3 w2 = vnoiseG(scc * 6.0 + h.z * 91.0);
+        d += (vec2(w1.x, w2.x) - 0.5) * 0.9;
+        float r = length(d);
+        if (r < b.r) {
+          b.r = r;
+          // EXACT analytic gradient of r in scc units:
+          // d = S^-1 R (scc - ctr) + W(scc), so
+          // grad r = R^T S^-1 d-hat + J_W^T d-hat, with the warp
+          // Jacobian rows = 0.9 * 6 * vnoiseG gradients. Skipping the
+          // warp term made big blobs' rims vary up to ~2x in width
+          // (the warp slope rivals the ellipse slope when rx is large).
+          vec2 dh = d / max(r, 1e-4);
+          vec2 gs = vec2(dh.x / rx, dh.y / ry);
+          b.grad = vec2(gs.x * ca + gs.y * sa, -gs.x * sa + gs.y * ca)
+                 + 5.4 * (w1.yz * dh.x + w2.yz * dh.y);
+        }
+      }
+      return b;
+    }
+
+#ifdef SKEL_PASS
+    // one geometry-skeleton detection at position p: forward +x/+y
+    // taps from BOTH sides' perspectives (union = the old detector's
+    // keep/LOD/soft-contact semantics; the neighbor-perspective eval
+    // keeps skylines alive despite the sky side's meaningless LOD
+    // data), plus the self-overlap contour. Evaluated ONCE per pixel:
+    // every input is nearest-filtered and the taps are fixed at ±1
+    // texel, so RGSS sub-offsets read identical texels — coverage AA
+    // for these boundaries lives in the stroke stage's recentering.
+    float skelGeo(vec2 p, float dCp) {
+      vec2 px2 = 1.0 / resolution;
+      vec4 c = texture2D(tID, p);
+      float gC = lodGain(c.a, dCp);
+      vec3 nC = softContact > 0.0 ? normalAt(p) : vec3(0.0, 0.0, 1.0);
+      bool skyC = dCp > cameraFar * 0.99;
+      float ink = 0.0;
+      for (int i = 0; i < 2; i++) {
+        vec2 su = i == 0 ? p + vec2(px2.x, 0.0) : p + vec2(0.0, px2.y);
+        if (!skyC)
+          ink = max(ink, dirInk(c, p, su, dCp, gC, nC));
+        float dN = linDepth(su);
+        if (dN < cameraFar * 0.99) {
+          vec4 cn = texture2D(tID, su);
+          ink = max(ink, dirInk(cn, su, p, dN, lodGain(cn.a, dN),
+                    softContact > 0.0 ? normalAt(su) : vec3(0.0, 0.0, 1.0)));
+        }
+      }
+      if (!skyC && contourLine > 0.0 && mod(floor(c.g * 255.0 + 0.5), 2.0) > 0.5) {
+        vec3 n = normalAt(p);
+        float dmin = min(dot(n, normalAt(p + vec2(px2.x, 0.0))),
+                         dot(n, normalAt(p + vec2(0.0, px2.y))));
+        ink = max(ink, smoothstep(contourCos, contourCos - 0.15, dmin)
+                     * contourLine * gC);
+      }
+      return ink;
+    }
+    float skelGlassF(vec2 p) {          // glass front-face boundaries
+      vec2 px2 = 1.0 / resolution;
+      vec3 gc = texture2D(tGlassID, p).rgb;
+      float gd = max(distance(gc, texture2D(tGlassID, p + vec2(px2.x, 0.0)).rgb),
+                     distance(gc, texture2D(tGlassID, p + vec2(0.0, px2.y)).rgb));
+      return smoothstep(idThreshold, idThreshold * 3.0, gd);
+    }
+    float skelGlassBk(vec2 p) {         // glass back-face boundaries
+      vec2 px2 = 1.0 / resolution;
+      vec3 gc = texture2D(tGlassBackID, p).rgb;
+      float gd = max(distance(gc, texture2D(tGlassBackID, p + vec2(px2.x, 0.0)).rgb),
+                     distance(gc, texture2D(tGlassBackID, p + vec2(0.0, px2.y)).rgb));
+      return smoothstep(idThreshold, idThreshold * 3.0, gd);
+    }
+    // shadow-boundary skeleton: forward diffs of the MATERIALIZED mask
+    // (tSMask R, computed once per pixel by the MASK_PASS — previously
+    // each probe re-derived shadowMaskAt, the priciest helper in the
+    // shader, ~6x per pixel with coverage on). tSMask is linear-
+    // filtered, so RGSS sub-offset reads interpolate the binary R and
+    // the step re-binarizes at the true 0.5 crossing — sub-sample
+    // diversity survives on plain texture reads. Probes are vUv-based:
+    // the mask pass already applied the wobble, once.
+    float skelShadow(vec2 p) {
+      vec2 px2 = 1.0 / resolution;
+      float m0 = step(0.5, texture2D(tSMask, p).r);
+      vec2 so = px2 * shadowLineWidth;
+      float sl =      abs(step(0.5, texture2D(tSMask, p + vec2(so.x, 0.0)).r) - m0);
+      return max(sl, abs(step(0.5, texture2D(tSMask, p + vec2(0.0, so.y)).r) - m0));
+    }
+#endif
 
     void main() {
       vec2 px = 1.0 / resolution;
@@ -3692,22 +3936,283 @@ const post = new THREE.ShaderMaterial({
       vec3 wp = worldAt(uv);
       float wpx = dC / (invFovScale * resolution.y);
 
-      // ---- FACE-ID EDGES — the whole detector --------------------
-      // every face has a unique random color, so ANY face boundary,
-      // silhouette, or object-vs-object overlap produces a color
-      // step. Coverage AA runs the test at 4 sub-pixel offsets and
-      // averages, approximating analytic edge coverage.
-      float ink;
-      if (coverage > 0.5) {
-        // rotated-grid offsets (see RG1..RG4 by the glass helpers)
-        ink = 0.25 * (inkTest(uv + px * RG1, o, dC)
-                    + inkTest(uv + px * RG2, o, dC)
-                    + inkTest(uv + px * RG3, o, dC)
-                    + inkTest(uv + px * RG4, o, dC));
+#ifdef MASK_PASS
+      // ============== THE SHADOW-MASK PASS =========================
+      // shadowMaskAt and the compose's cast fill are pure functions of
+      // pixel position, but were re-derived up to ~7x per pixel across
+      // the skeleton's probes and the compose branches. Computed ONCE
+      // here instead: R = the binary shadow-region mask (the line
+      // detector and domain view step it at 0.5), G = the compose
+      // fill's cast term (the melt mask when melting, castAtAA's
+      // sub-pixel coverage otherwise). The wobble is applied here,
+      // once — every consumer reads at vUv-based coordinates.
+      // (#else, not a return: the compose branch reads tSMask, and if it
+      // compiled into THIS program the sampler would alias the render
+      // target — a draw-time feedback error that code reachability
+      // does not excuse)
+      gl_FragColor = vec4(shadowMaskAt(uv),
+        castSmoothOn > 0.5 ? castMaskAt(uv) : castAtAA(uv, wp), 0.0, 1.0);
+#else
+#ifdef LINE_PASS
+      // ================= THE LINE PASS =============================
+      // every ink line in the image — geometry edges, glass edges,
+      // shadow boundaries, speckle rims — drawn here by ONE detector
+      // with one width/attenuation/wobble/AA rule, into
+      // R = main ink, G = glass front edge, B = glass back edge.
+      // The compose pass only reads the result: line families cannot
+      // drift apart because there is nowhere else to draw one.
+
+#ifdef DOMAIN_VIEW
+      // ---- REGION DOMAIN VIEW ------------------------------------
+      // the complete "coloring book" the detector runs on, sampled at
+      // the same wobbled uv: every color boundary in this view is
+      // where a line gets drawn. Compiled from the SAME source as the
+      // line pass, so it cannot drift from what the detector sees.
+      vec3 dom;
+      if (sky) {
+        dom = skyColor;
+        if (colorOn > 0.5) {
+          vec2 dndc = uv * 2.0 - 1.0;
+          vec4 dra = invViewProj * vec4(dndc, -1.0, 1.0);
+          vec4 drb = invViewProj * vec4(dndc, 1.0, 1.0);
+          vec3 drd = normalize(drb.xyz / drb.w - dra.xyz / dra.w);
+          if (sunSize > 0.0 && dot(drd, sunDir) > cos(sunSize)) dom = sunColor;
+          if (cloudAmt > 0.0 && cloudBand(drd) > 0.5) {
+            vec2 dcp = cloudP(drd);
+            float dn = vnoise(dcp) * 0.65 + vnoise(dcp * 2.7 + 19.1) * 0.35;
+            if (dn > 1.0 - cloudAmt * 0.42) dom = vec3(0.985);
+          }
+        }
       } else {
-        ink = inkTest(uv, o, dC);
+        dom = texture2D(tID, uv).rgb;
+        // shadow region: same gates as the shadow-boundary ink,
+        // read from the materialized mask (vUv: wobble applied there)
+        if (hatchOn > 0.5 && shadeMode > 0.5 && shadowLine > 0.0 &&
+            texture2D(tSMask, vUv).r > 0.5) dom *= 0.55;
+        // speckle blob region: same gates as the rims
+        if (speckleAmt > 0.0) {
+          vec3 dwn = viewToWorldN * normalAt(uv);
+          if (dwn.y > 0.85 && abs(wp.y - groundY) < 0.6 &&
+              speckleBlobAt(wp.xz / (3.2 * speckleSize)).r < 1.0)
+            dom = mix(dom, vec3(1.0), 0.75);
+        }
       }
-      if (sky) ink = 0.0;
+      // glass layer on top (front-face IDs), where it wins the depth test
+      if (linDepthG(uv) < dC * 0.999)
+        dom = mix(dom, texture2D(tGlassID, uv).rgb, 0.45);
+      gl_FragColor = vec4(dom, 1.0);
+      return;
+#endif
+
+#ifdef SKEL_PASS
+      // ================ STAGE A: THE SKELETON ======================
+      // find every boundary at 1-PIXEL precision and record only its
+      // STRENGTH — no widths here. The stroke stage below dilates this
+      // skeleton with a round nib, so line thickness is exact in every
+      // direction for every family. Boundaries are detected between a
+      // pixel and its +x / +y neighbors from BOTH sides' perspectives
+      // (union = the old detector's keep/LOD/soft-contact semantics,
+      // and skylines survive the sky side's meaningless LOD data).
+      // ---- face-ID boundaries ------------------------------------
+      // ONE evaluation, deliberately no RGSS: tID/tDepth/tNormal are
+      // nearest-filtered and skelGeo's taps are fixed at ±1 texel, so
+      // the four < 0.5px sub-offsets snap to identical texels and the
+      // average was four copies of the same value (measured no-op at
+      // 4x the cost). The partial-coverage grays come from the stroke
+      // stage instead: it recenters this 1px skeleton onto the
+      // boundary and spreads it across the texel pair bilinearly.
+      float ink = skelGeo(uv, dC);
+
+      // ---- shadow boundaries -------------------------------------
+      // shadowLineWidth scales the probe (≈ extra width after
+      // stroking, exact no-op at 1). Probes read the materialized mask
+      // at vUv-based positions — the mask pass already applied the
+      // wobble; probing at the wobbled uv would apply it twice. FULL
+      // 4-sample RGSS: now that each sample is a texture read (the old
+      // 2-sample pair existed because re-deriving shadowMaskAt 4x cost
+      // ~2 ms), diagonal shadow lines get 5-level coverage again.
+      if (hatchOn > 0.5 && !sky && shadeMode > 0.5 && shadowLine > 0.0) {
+        float sl = coverage > 0.5
+          ? 0.25 * (skelShadow(vUv + px * RG1) + skelShadow(vUv + px * RG2)
+                  + skelShadow(vUv + px * RG3) + skelShadow(vUv + px * RG4))
+          : skelShadow(vUv);
+        // lamps have no terminator to outline
+        ink = max(ink, sl * shadowLine * texture2D(tPaint, uv).a);
+      }
+
+      // ---- speckle rims + fill -----------------------------------
+      float sfill = 0.0;   // blob interior coverage -> alpha channel
+      if (speckleAmt > 0.0 && !sky) {
+        vec3 swn = viewToWorldN * normalAt(uv);
+        if (swn.y > 0.85 && abs(wp.y - groundY) < 0.6) {
+          float sCellW = 3.2 * speckleSize;     // base 3.2-unit cells
+          Blob sb = speckleBlobAt(wp.xz / sCellW);
+          // screen-space Jacobian of the ground sheet (two depth taps)
+          // projects the blob's analytic gradient into TRUE pixels —
+          // no aspect/orientation/foreshortening bias, no fwidth seams
+          vec2 sdx = (worldAt(uv + vec2(px.x, 0.0)).xz - wp.xz) / sCellW;
+          vec2 sdy = (worldAt(uv + vec2(0.0, px.y)).xz - wp.xz) / sCellW;
+          float g = max(length(vec2(dot(sb.grad, sdx), dot(sb.grad, sdy))), 1e-5);
+          float rpx = (sb.r - 1.0) / g;         // signed px distance to the rim
+          sfill = 1.0 - smoothstep(-1.0, 1.0, rpx);
+          float srim = 1.0 - smoothstep(0.25, 0.75, abs(rpx));  // ~1px skeleton
+          // fade with distance before the pattern aliases into shimmer
+          float sfade = speckleFade <= 0.0 ? 1.0
+                      : 1.0 - smoothstep(cameraFar * 0.25 / speckleFade,
+                                         cameraFar * 0.7  / speckleFade, dC);
+          // lamps take no pigment effects
+          ink = max(ink, srim * sfade * texture2D(tPaint, uv).a);
+        }
+      }
+
+      // ---- sky boundaries: sun disc rim + cloud rims -------------
+      // 1px bands; the stroke stage widths them from its dW, which is
+      // the far plane out here — the sky sits at the far end of the
+      // distance dial automatically
+      if (sky && colorOn > 0.5) {
+        vec2 sndc = uv * 2.0 - 1.0;
+        vec4 wra = invViewProj * vec4(sndc, -1.0, 1.0);
+        vec4 wrb = invViewProj * vec4(sndc, 1.0, 1.0);
+        vec3 rd = normalize(wrb.xyz / wrb.w - wra.xyz / wra.w);
+        // clouds first: their coverage OCCLUDES the sun's rim (clouds
+        // pass in front of the sun), matching the compose's fill order
+        float el = max(rd.y, 0.0);
+        float ccover = 0.0;
+        if (cloudAmt > 0.0) {
+          float band = cloudBand(rd);
+          if (band > 0.0) {
+            vec2 cp = cloudP(rd);
+            float n = vnoise(cp) * 0.65 + vnoise(cp * 2.7 + 19.1) * 0.35;
+            float t = 1.0 - cloudAmt * 0.42;
+            float aaN = fwidth(n) + 1e-5;
+            ccover = smoothstep(t, t + aaN * 1.5, n) * band;
+            ink = max(ink, (1.0 - smoothstep(0.25, 0.75, abs(n - t) / aaN)) * band);
+          }
+        }
+        if (sunSize > 0.0) {
+          float sunD = dot(rd, sunDir);
+          float aaS = fwidth(sunD) + 1e-6;
+          ink = max(ink, (1.0 - smoothstep(0.25, 0.75, abs(sunD - cos(sunSize)) / aaS))
+                       * (1.0 - ccover));
+        }
+      }
+
+      // ---- glass boundaries (forward taps, raw strengths) --------
+      // single evaluations — the same RGSS no-op argument as the
+      // face-ID skeleton (nearest-filtered inputs, fixed 1-texel taps)
+      float gi = 0.0, gib = 0.0;
+      float gDl = linDepthG(uv);
+      if (gDl < dC * 0.999) {
+        gi = skelGlassF(uv);
+        float gbDl = linDepthGB(uv);
+        if (gbDl > gDl * 1.001 && gbDl < dC * 0.999)
+          gib = skelGlassBk(uv);
+      }
+
+      gl_FragColor = vec4(clamp(ink, 0.0, 1.0), gi, gib, sfill);
+#else
+      // ================ STAGE B: THE ROUND NIB =====================
+      // dilate the skeleton with a disc of per-pixel radius — width is
+      // exact in EVERY direction for EVERY family, with round joins
+      // and caps for free. The radius comes from the neighborhood-min
+      // depth (a line's width belongs to the NEARER surface it
+      // separates; the sky naturally lands at the far end of the
+      // distance dial), and the falloff ink fade uses the same depth.
+      float dW = dC;
+      {
+        vec2 pr = px * max(lineWidth * 1.6, 0.5);
+        dW = min(dW, linDepth(uv + vec2(pr.x, 0.0)));
+        dW = min(dW, linDepth(uv - vec2(pr.x, 0.0)));
+        dW = min(dW, linDepth(uv + vec2(0.0, pr.y)));
+        dW = min(dW, linDepth(uv - vec2(0.0, pr.y)));
+      }
+      w = max(lineWidth * mix(1.0, clamp(14.0 / dW, 0.25, 1.6),
+                              min(distanceFalloff, 1.0)), 0.5);
+      // RECENTER + SOFTEN: the skeleton marks the left/bottom pixel of
+      // each boundary (forward diffs), so every nib tap shifts by -0.5
+      // texels and rtSkel's bilinear filter spreads the mark across the
+      // texel pair — a 1px binary skeleton becomes the two-sided
+      // half-intensity 2px profile CENTERED on the boundary, i.e. the
+      // coverage-gray line the pre-unified detector drew (a 1px-wide
+      // ideal line straddling a texel corner rasterizes as two 50%
+      // pixels). Along diagonal stairs the 2x2 average grades corner
+      // pixels at 0.25/0.75, which is what SMAA needs to reconstruct
+      // shallow runs. The base line is therefore ~2px wide already:
+      // the nib radius is w - 1 (total ≈ 2w, the old convention), and
+      // 'peak' restores full-strength cores once w >= 1 — the halved
+      // intensity IS the old sub-pixel hairline look at the 0.5px
+      // width floor, but must recover as lines widen.
+      float r = min(max(w - 1.0, 0.0), 4.9);
+      float peak = min(w + w, 2.0);
+      vec3 acc = vec3(0.0);
+      if (r <= 0.0) {
+        // hairline widths (the whole frame at the default lineWidth):
+        // the nib reduces to the single recentering tap — byte-identical
+        // to the loop path at r = 0 (only the dist-0 tap has nonzero
+        // fall) without paying the gate reads or the 25-iteration loop
+        acc = min(texture2D(tSkel, vUv - 0.5 * px).rgb * peak, vec3(1.0));
+      } else {
+      // presence gate: quarter-res MAX-downsample texels covering the
+      // nib footprint — most pixels have no boundary in reach and skip
+      // the loop entirely. Block alignment means a 3x3 at ±4px only
+      // GUARANTEES ~4px of reach, so wide nibs (skeleton influence out
+      // to r + 2 px) open the gate to 5x5; taps must stay ≤ 4px apart
+      // or whole 4x4 blocks fall between them.
+      float near = 0.0;
+      for (int gy = -2; gy <= 2; gy++)
+      for (int gx = -2; gx <= 2; gx++) {
+        if (r <= 2.0 && (gx < -1 || gx > 1 || gy < -1 || gy > 1)) continue;
+        near = max(near, dot(texture2D(tSkelLo,
+                     vUv + vec2(float(gx), float(gy)) * px * 4.0).rgb, vec3(1.0)));
+      }
+      if (near > 0.001) {
+        if (r < 1.5) {
+          // compact nib for the common small widths (r = 0 reduces to
+          // the single recentering tap: the pure 2px soft profile)
+          for (int dy = -2; dy <= 2; dy++)
+          for (int dx = -2; dx <= 2; dx++) {
+            float dist = length(vec2(float(dx), float(dy)));
+            float fall = 1.0 - smoothstep(r, r + 1.0, dist);
+            if (fall <= 0.0) continue;
+            acc = max(acc, texture2D(tSkel,
+                  vUv + (vec2(float(dx), float(dy)) - 0.5) * px).rgb * fall);
+          }
+        } else {
+          for (int dy = -5; dy <= 5; dy++)
+          for (int dx = -5; dx <= 5; dx++) {
+            float dist = length(vec2(float(dx), float(dy)));
+            float fall = 1.0 - smoothstep(r, r + 1.0, dist);   // AA'd nib rim
+            if (fall <= 0.0) continue;
+            acc = max(acc, texture2D(tSkel,
+                  vUv + (vec2(float(dx), float(dy)) - 0.5) * px).rgb * fall);
+          }
+        }
+        acc = min(acc * peak, vec3(1.0));
+      }
+      }
+      float ink = acc.r;
+
+      // falloff beyond 1: distance fade of ALL stroked ink (the
+      // compose applies the identical fade to its hatch strokes)
+      float fExtra = max(distanceFalloff - 1.0, 0.0);
+      if (fExtra > 0.0)
+        ink *= clamp(mix(1.0, clamp(14.0 / dW, 0.0, 1.0), fExtra), 0.0, 1.0);
+
+      // speckle fill is a region, not a line — center passthrough
+      gl_FragColor = vec4(clamp(ink, 0.0, 1.0), acc.g, acc.b,
+                          texture2D(tSkel, vUv).a);
+#endif
+#else
+      // ================= COMPOSE ===================================
+      // all linework arrives prebaked from the line pass (R = ink,
+      // G/B = glass edge fields). Only hatch STROKES — shading texture,
+      // not lines — still accumulate here, with their own copy of the
+      // distance fade (max composition commutes with per-term fades).
+      // Read at RAW vUv: the line pass fragment at this screen position
+      // already applied the same wobble to its lookups.
+      vec4 lns = texture2D(tLines, vUv);
+      float ink = lns.r;
+      float hInk = 0.0;
 
       // ---- HATCHING from the normal buffer, laid ON the surface --
       // Strokes get a per-surface frame (tangents from the world
@@ -3728,16 +4233,20 @@ const post = new THREE.ShaderMaterial({
         float shade = shadeAt(uv);
         // cast shadows: a blocked pixel is fully in shadow, and every
         // style downstream (hard step, soft ramp, hatch strokes) treats
-        // it that way automatically
-        float castS = castSmoothOn > 0.5   // "cast" itself is a GLSL reserved word
-                    ? castMaskAt(uv) : castAt(uv, wp);
+        // it that way automatically. G of the materialized mask holds
+        // the AA'd cast fill (melt mask or castAtAA coverage), computed
+        // once by the MASK_PASS at this pixel's wobbled uv — read at
+        // vUv so the wobble applies exactly once.
+        float castS = texture2D(tSMask, vUv).g;   // "cast" is a GLSL reserved word
         shade = min(shade, 1.0 - castS);
         float glowS = 1.0 - texture2D(tPaint, uv).a;   // emissive: no shading
         float hnf = 0.35 / hatchNoiseScale;
         if (shadeMode > 0.5) {
           // shadows in place of strokes, boundary pushed around by the
-          // same surface-anchored noise the strokes use
-          float sn = (vnoise3(wp * hnf) - 0.5) * hatchNoise * 0.3;
+          // same surface-anchored noise the strokes use (skipped
+          // entirely at the default hatchNoise 0)
+          float sn = hatchNoise > 0.0
+            ? (vnoise3(wp * hnf) - 0.5) * hatchNoise * 0.3 : 0.0;
           if (shadeMode > 1.5) {
             // soft: wide ramp, with the cross threshold as a deeper core
             shadow = shadowAmount *
@@ -3745,14 +4254,20 @@ const post = new THREE.ShaderMaterial({
             shadow += shadowAmount * 0.6 *
                      (1.0 - smoothstep(crossThreshold - 0.30, crossThreshold + 0.30, shade + sn));
           } else {
-            // hard: binary — a pixel is shadowed or it is not, one flat
-            // level. The cast term joins by max, outside the step, so its
-            // antialiased edge fraction isn't re-binarized into jaggies.
-            // On the smoothed path the mask was extracted with the
-            // terminator already folded in — use it whole, don't re-step
-            // the jagged per-facet edge back on top
+            // hard: one flat level, but the EDGE carries a ~1px analytic
+            // band (fwidth of the shade value) — the same sub-pixel
+            // treatment every other edge in the frame gets; the
+            // terminator ink line stays pinned at the exact threshold
+            // crossing (the mask R still steps). The cast term joins by
+            // max, OUTSIDE the band, so its antialiased edge fraction
+            // survives. On the smoothed path the mask was extracted with
+            // the terminator already folded in — use it whole, don't
+            // re-derive the per-facet edge on top.
+            float taa = fwidth(shade) * 0.7 + 1e-4;
+            float term = 1.0 - smoothstep(hatchThreshold - taa,
+                                          hatchThreshold + taa, shade + sn);
             shadow = shadowAmount * (castSmoothOn > 0.5 ? castS
-                   : max(step(shade + sn, hatchThreshold), castS));
+                   : max(term, castS));
           }
           // intensity 1 = pitch black, never past it; lamps take none
           shadow = min(shadow, 1.0) * (1.0 - glowS);
@@ -3784,8 +4299,8 @@ const post = new THREE.ShaderMaterial({
         float hnf2 = 1.2 / hatchNoiseScale;
         float k1 = smoothstep(hatchBreak - 0.15, hatchBreak, vnoise3(wp * hnf2 + 91.7));
         float k2 = smoothstep(hatchBreak - 0.15, hatchBreak, vnoise3(wp * hnf2 + 137.3));
-        if (shade < hatchThreshold) ink = max(ink, step(h1, hatchWidth) * hFade * k1);
-        if (shade < crossThreshold) ink = max(ink, step(h2, hatchWidth) * hFade * k2);
+        if (shade < hatchThreshold) hInk = max(hInk, step(h1, hatchWidth) * hFade * k1);
+        if (shade < crossThreshold) hInk = max(hInk, step(h2, hatchWidth) * hFade * k2);
         }
       }
       // unlit surfaces still catch CAST shadows, flat like paper — only
@@ -3793,30 +4308,17 @@ const post = new THREE.ShaderMaterial({
       // grounded root darkens both sides equally, so the seamless
       // contact survives under shadow.
       if (hatchOn > 0.5 && !sky && unlitF > 0.5) {
-        float castS = castSmoothOn > 0.5 ? castMaskAt(uv) : castAt(uv, wp);
+        float castS = texture2D(tSMask, vUv).g;   // materialized cast fill
         float glowS = 1.0 - texture2D(tPaint, uv).a;
         shadow = min(shadowAmount * castS, 1.0) * (1.0 - glowS);
       }
 
-      // ---- SHADOW-BOUNDARY INK -----------------------------------
-      // the shadow mask run through the same neighbor-disagreement test
-      // the face-ID detector uses, so the terminator gets a drawn line.
-      // Works for hard and soft alike (the mask is the ramp's midline).
-      if (hatchOn > 0.5 && !sky && shadeMode > 0.5 && shadowLine > 0.0) {
-        float m0 = shadowMaskAt(uv);
-        vec2 so = o * shadowLineWidth;
-        float sl =         abs(shadowMaskAt(uv + vec2(so.x, 0.0)) - m0);
-        sl = max(sl, abs(shadowMaskAt(uv - vec2(so.x, 0.0)) - m0));
-        sl = max(sl, abs(shadowMaskAt(uv + vec2(0.0, so.y)) - m0));
-        sl = max(sl, abs(shadowMaskAt(uv - vec2(0.0, so.y)) - m0));
-        // lamps have no terminator to outline
-        ink = max(ink, sl * shadowLine * texture2D(tPaint, uv).a);
-      }
-
-      // falloff beyond 1: distance fade of ALL ink (edges + hatching)
+      // falloff beyond 1: distance fade of the hatch strokes (the line
+      // pass already applied the identical fade to its own ink)
       float fExtra = max(distanceFalloff - 1.0, 0.0);
       if (fExtra > 0.0)
-        ink *= clamp(mix(1.0, clamp(14.0 / dC, 0.0, 1.0), fExtra), 0.0, 1.0);
+        hInk *= clamp(mix(1.0, clamp(14.0 / dC, 0.0, 1.0), fExtra), 0.0, 1.0);
+      ink = max(ink, hInk);
 
       // ---- compose on paper --------------------------------------
       // display-pixel anchored so supersampling can't average it away;
@@ -3845,46 +4347,33 @@ const post = new THREE.ShaderMaterial({
         if (sunSize > 0.0) {
           float sunD = dot(rd, sunDir);
           float cosR = cos(sunSize);
-          // wide halo: quadratic falloff outside the disc
-          float haloS = pow(clamp((sunD - cos(sunSize * sunHaloWidth)) /
-                                  max(1.0 - cos(sunSize * sunHaloWidth), 1e-4), 0.0, 1.0), 3.0);
-          col = mix(col, sunColor, haloS * sunGlow);
+          // (no analytic halo here anymore — the sun disc is fed into
+          // the emissive glow pipeline and blooms exactly like a lamp)
           float aaS = fwidth(sunD) + 1e-6;
           float disc = smoothstep(cosR - aaS, cosR + aaS, sunD);
           col = mix(col, mix(sunColor, vec3(1.0), sunCore), disc);
-          // ink rim, tinted like every other line
-          float sws = lineWidth * 0.5;
-          float srimS = (1.0 - smoothstep(sws * aaS, (sws + 1.0) * aaS, abs(sunD - cosR)))
-                      * min(lineWidth, 1.0);
-          vec3 sInk = mix(inkColor, sunColor * vec3(0.32, 0.30, 0.48), inkTint);
-          col = mix(col, sInk, srimS * 0.85);
+          // (the ink rim arrives from the line pass, applied below)
         }
-        if (cloudAmt > 0.0 && rd.y > 0.015) {
-          // clouds on a STEREOGRAPHIC dome mapping: seam-free,
-          // world-anchored, zenith-stable (the old plane projection
-          // degenerated straight overhead), still flattening gently
-          // toward the horizon. Two octaves of the same value noise as
+        if (cloudAmt > 0.0 && cloudBand(rd) > 0.0) {
+          // clouds on the shared stereographic dome (cloudP): seam-free,
+          // world-anchored, zenith-stable, stretchable, and wrapping
+          // below the horizon. Two octaves of the same value noise as
           // everything else — no textures.
-          vec2 cp = rd.xz / (1.0 + rd.y) * cloudScale;
+          float band = cloudBand(rd);
+          vec2 cp = cloudP(rd);
           float n = vnoise(cp) * 0.65 + vnoise(cp * 2.7 + 19.1) * 0.35;
           float t = 1.0 - cloudAmt * 0.42;       // coverage -> threshold
           float aaN = fwidth(n) + 1e-5;          // one pixel worth of n
-          // only the horizon fade-in remains — overhead is covered now
-          float band = smoothstep(0.03, max(cloudFade, 0.04), el);
           float cfill = smoothstep(t, t + aaN * 1.5, n) * band;
-          // ink rim straddling the threshold, matched to the detector's
-          // lines: total width = lineWidth px, and sub-pixel widths
-          // render at partial strength (the hairline-gray look the
-          // geometry lines get from coverage AA)
-          float cw = lineWidth * 0.5;
-          float crim = (1.0 - smoothstep(cw * aaN, (cw + 1.0) * aaN, abs(n - t)))
-                     * band * min(lineWidth, 1.0);
           col = mix(col, vec3(0.985, 0.985, 0.98), cfill);
-          // cloud rims obey the same ink-tint model as every other
-          // line, with the cloud's white fill as their "paint" — at
-          // inkTint 1 no line anywhere shows the raw ink color
-          vec3 cInk = mix(inkColor, vec3(0.985, 0.985, 0.98) * vec3(0.32, 0.30, 0.48), inkTint);
-          col = mix(col, cInk, crim * 0.8);
+        }
+        // sky ink (sun + cloud rims) arrives from the line pass like
+        // every other line, tinted by the LOCAL sky color exactly the
+        // way scene ink tints by its paint — at inkTint 1 no line
+        // anywhere shows the raw ink color
+        if (lns.r > 0.0) {
+          vec3 skyInk = mix(inkColor, col * vec3(0.32, 0.30, 0.48), inkTint);
+          col = mix(col, skyInk, lns.r);
         }
         col *= 1.0 - paperGrain * 0.6 * grain;
       } else {
@@ -3908,68 +4397,25 @@ const post = new THREE.ShaderMaterial({
         // "near an edge"; world-anchored noise breaks the band up so it
         // reads as settled pigment rather than a halo. Inherits the
         // threshold, one-sided and LOD logic for free.
-        if (poolAmount > 0.0) {
+        // gated above ~2%: below that the darkening is sub-byte
+        // (invisible) while the branch costs a full inkTest per pixel
+        if (poolAmount > 0.02) {
           float pool = inkTest(uv, o * poolRadius, dC);
           pool *= 0.55 + 0.45 * vnoise3(wp * 3.0 + 7.3);
           paint *= 1.0 - poolAmount * 0.30 * pool * lit;
         }
-        // ---- ground speckle: scattered ink-rimmed pale ovals -------
-        // one hash per cell (3x3 searched) on the ground plane; pure
-        // value-hash, no textures. Perspective flattens the discs into
-        // the reference's ovals on its own.
-        if (speckleAmt > 0.0) {
-          vec3 wn = viewToWorldN * normalAt(uv);
-          if (wn.y > 0.85 && abs(wp.y - groundY) < 0.6) {
-            float sCellW = 3.2 * speckleSize;     // base 3.2-unit cells
-            vec2 scc = wp.xz / sCellW;
-            vec2 sCell = floor(scc);
-            float sfill = 0.0, srim = 0.0;
-            for (int cy = -1; cy <= 1; cy++)
-            for (int cx = -1; cx <= 1; cx++) {
-              vec2 c = sCell + vec2(float(cx), float(cy));
-              vec3 h = fract(sin(vec3(dot(c, vec2(127.1, 311.7)),
-                                      dot(c, vec2(269.5, 183.3)),
-                                      dot(c, vec2(419.2, 371.9)))) * 43758.5453);
-              // patchy scatter: low-freq noise makes some stretches of
-              // sand busy and others bare instead of an even grid
-              float patchy = smoothstep(0.2, 0.8, vnoise(c * 0.37 + 9.1));   // 'patch' is a GLSL reserved word
-              if (h.z > speckleAmt * 1.5 * patchy) continue;
-              vec2 ctr = c + 0.2 + h.xy * 0.6;    // jittered centre
-              // long-tailed sizes: mostly small flecks, the odd big lozenge
-              float u2 = fract(h.z * 9.7);
-              float rx = 0.03 + 0.17 * u2 * u2;
-              // random orientation and aspect
-              float sAng = h.x * 6.2832;
-              vec2 dd = scc - ctr;
-              dd = vec2(dd.x * cos(sAng) - dd.y * sin(sAng),
-                        dd.x * sin(sAng) + dd.y * cos(sAng));
-              vec2 d = dd / vec2(rx, rx * (0.45 + 0.4 * fract(h.x * 5.1)));
-              // domain-warp the rim so each blob is a lumpy potato,
-              // not a perfect ellipse
-              d += (vec2(vnoise(scc * 6.0 + h.y * 43.0),
-                         vnoise(scc * 6.0 + h.z * 91.0)) - 0.5) * 0.9;
-              float r = length(d);
-              // analytic pixel size — fwidth is undefined inside this
-              // divergent loop (the continue above), which is why rims
-              // vanished with it: wpx is world units per pixel, cells
-              // are 3.2 units, r is normalized by rx
-              float aaR = wpx / (sCellW * rx) * 1.4;
-              float sw = lineWidth * 0.5;   // match the detector's width
-              sfill = max(sfill, 1.0 - smoothstep(1.0 - aaR, 1.0 + aaR, r));
-              // rim strength varies per blob — hand-drawn unevenness
-              float rimA = 0.55 + 0.45 * fract(h.y * 3.3);
-              srim = max(srim, (1.0 - smoothstep(sw * aaR, (sw + 1.0) * aaR, abs(r - 1.0)))
-                              * min(lineWidth, 1.0) * rimA);
-            }
-            // fade with distance before the pattern aliases into shimmer
-            // fade STRENGTH: 0 = never fade, 1 = the classic 25-70%-of-far
-            // ramp, higher divides the distances so speckles die sooner
-            float sfade = speckleFade <= 0.0 ? 1.0
-                        : 1.0 - smoothstep(cameraFar * 0.25 / speckleFade,
-                                           cameraFar * 0.7  / speckleFade, dC);
-            paint = mix(paint, vec3(0.99, 0.985, 0.97), sfill * 0.95 * sfade * lit);
-            ink = max(ink, srim * sfade * lit);
-          }
+        // ---- ground speckle: scattered pale ovals ------------------
+        // the line pass already ran the blob loop for the rims and left
+        // the interior coverage in rtLines ALPHA — just read it. One
+        // blob evaluation per pixel total, and fill/rim always agree.
+        if (speckleAmt > 0.0 && lns.a > 0.0) {
+          // fade with distance before the pattern aliases into shimmer
+          // fade STRENGTH: 0 = never fade, 1 = the classic 25-70%-of-far
+          // ramp, higher divides the distances so speckles die sooner
+          float sfade = speckleFade <= 0.0 ? 1.0
+                      : 1.0 - smoothstep(cameraFar * 0.25 / speckleFade,
+                                         cameraFar * 0.7  / speckleFade, dC);
+          paint = mix(paint, vec3(0.99, 0.985, 0.97), lns.a * 0.95 * sfade * lit);
         }
         paint *= 1.0 - shadow;                    // hard/soft (already glow-gated)
         paint *= 1.0 - paperGrain * grain;        // grain hits fills like paper
@@ -4006,11 +4452,11 @@ const post = new THREE.ShaderMaterial({
         // by opaque geometry sitting inside it
         float gbD = linDepthGB(uv);
         if (gbD > gD * 1.001 && gbD < dC * 0.999) {
-          float gib = glassInkBC(uv, o, px) * glassBackLine;
+          float gib = lns.b * glassBackLine;   // detected in the line pass
           col = mix(col, gInk, gib);
           edgeA = max(edgeA, gib);
         }
-        float gi = glassInkC(uv, o, px) * glassLine;
+        float gi = lns.g * glassLine;          // detected in the line pass
         col = mix(col, gInk, gi);
         edgeA = max(edgeA, gi);
       }
@@ -4031,6 +4477,8 @@ const post = new THREE.ShaderMaterial({
       // canvas composites alpha with the page, so every direct-to-screen
       // path must keep alpha at 1
       gl_FragColor = vec4(col, mix(1.0, edgeA, edgeToAlpha));
+#endif
+#endif
     }
   `,
   depthTest: false, depthWrite: false,
@@ -4040,6 +4488,47 @@ const postQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), post);
 postQuad.frustumCulled = false;
 postScene.add(postQuad);
 const postCamera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+// the LINE PASS material: the SAME fragment source compiled with
+// LINE_PASS defined, sharing post's uniform VALUE OBJECTS — one
+// uniform setup drives both passes, and the line rules physically
+// cannot drift from the compose's expectations
+const lineMat = new THREE.ShaderMaterial({
+  uniforms: post.uniforms,
+  defines: { LINE_PASS: 1 },
+  vertexShader: post.vertexShader,
+  fragmentShader: post.fragmentShader,
+  depthTest: false, depthWrite: false,
+});
+// the skeleton stage: same source with SKEL_PASS — detects all
+// boundaries at 1px precision; lineMat (above) strokes them
+const skelMat = new THREE.ShaderMaterial({
+  uniforms: post.uniforms,
+  defines: { LINE_PASS: 1, SKEL_PASS: 1 },
+  vertexShader: post.vertexShader,
+  fragmentShader: post.fragmentShader,
+  depthTest: false, depthWrite: false,
+});
+// third compile of the same source: the region-domain debug view —
+// outputs the detector's input coloring instead of running it
+const domainMat = new THREE.ShaderMaterial({
+  uniforms: post.uniforms,
+  defines: { LINE_PASS: 1, DOMAIN_VIEW: 1 },
+  vertexShader: post.vertexShader,
+  fragmentShader: post.fragmentShader,
+  depthTest: false, depthWrite: false,
+});
+// fourth compile: the MASK_PASS — materializes shadowMaskAt (R) and
+// the compose's cast fill (G) into rtSMask once per frame, so the
+// skeleton's shadow probes and both compose branches read a texture
+// instead of re-deriving the shader's priciest helper ~7x per pixel
+const maskMat = new THREE.ShaderMaterial({
+  uniforms: post.uniforms,
+  defines: { MASK_PASS: 1 },
+  vertexShader: post.vertexShader,
+  fragmentShader: post.fragmentShader,
+  depthTest: false, depthWrite: false,
+});
 
 /* ---- second fullscreen stage: FXAA or plain filtered blit ---- */
 const blitVert = /* glsl */`
@@ -4053,6 +4542,60 @@ const copyMat = new THREE.ShaderMaterial({
     // alpha passes through: it carries the smaa edge field between the
     // ink target and the screen-res intermediate (opaque canvas ignores it)
     void main() { gl_FragColor = texture2D(tDiffuse, vUv); }`,
+  depthTest: false, depthWrite: false,
+});
+// alpha-forcing variant for debug blits of buffers whose alpha carries
+// data (rtLines: speckle fill) — the canvas composites alpha with the
+// page, so raw alpha would punch holes in the debug view
+const copyOpaqueMat = new THREE.ShaderMaterial({
+  uniforms: { tDiffuse: { value: null } },
+  vertexShader: blitVert,
+  fragmentShader: /* glsl */`
+    varying vec2 vUv; uniform sampler2D tDiffuse;
+    void main() { gl_FragColor = vec4(texture2D(tDiffuse, vUv).rgb, 1.0); }`,
+  depthTest: false, depthWrite: false,
+});
+// gamma-correct supersample resolve: 4 bilinear taps spread across the
+// destination pixel's source footprint (an exact 2x2-texel box average
+// per tap at 2x — 16 texels total; a close approximation at fractional
+// scales), averaged in LINEAR light. A single gamma-space tap both
+// drops samples and biases high-contrast ink edges dark. Alpha carries
+// the smaa edge field (data, not color) so it averages untransformed.
+const resolveMat = new THREE.ShaderMaterial({
+  uniforms: { tDiffuse: { value: null }, uOff: { value: new THREE.Vector2() } },
+  vertexShader: blitVert,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    varying vec2 vUv; uniform sampler2D tDiffuse; uniform vec2 uOff;
+    void main() {
+      vec4 a = texture2D(tDiffuse, vUv + uOff);
+      vec4 b = texture2D(tDiffuse, vUv - uOff);
+      vec4 c = texture2D(tDiffuse, vUv + vec2(uOff.x, -uOff.y));
+      vec4 d = texture2D(tDiffuse, vUv - vec2(uOff.x, -uOff.y));
+      vec3 lin = pow(a.rgb, vec3(2.2)) + pow(b.rgb, vec3(2.2))
+               + pow(c.rgb, vec3(2.2)) + pow(d.rgb, vec3(2.2));
+      gl_FragColor = vec4(pow(lin * 0.25, vec3(1.0 / 2.2)),
+                          (a.a + b.a + c.a + d.a) * 0.25);
+    }`,
+  depthTest: false, depthWrite: false,
+});
+// max-downsample of the skeleton to quarter res: each output texel is
+// the max of its 4x4 source block (max, never average — averaging
+// quantizes 1px lines to zero and the stroke gate would drop them)
+const skelDownMat = new THREE.ShaderMaterial({
+  uniforms: { tDiffuse: { value: null }, uPx: { value: new THREE.Vector2() } },
+  vertexShader: blitVert,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    varying vec2 vUv; uniform sampler2D tDiffuse; uniform vec2 uPx;
+    void main() {
+      vec3 m = vec3(0.0);
+      for (int y = 0; y < 4; y++)
+      for (int x = 0; x < 4; x++)
+        m = max(m, texture2D(tDiffuse,
+              vUv + (vec2(float(x), float(y)) - 1.5) * uPx).rgb);
+      gl_FragColor = vec4(m, 1.0);
+    }`,
   depthTest: false, depthWrite: false,
 });
 const fxaaMat = new THREE.ShaderMaterial({
@@ -4121,7 +4664,7 @@ let smaaAreaTex = null, smaaSearchTex = null, smaaReady = false;
 }
 // NOTE: SMAA's `resolution` uniform is 1/pixels (inverse), unlike fxaaMat's.
 const smaaEdgeMat = new THREE.ShaderMaterial({
-  defines: { SMAA_THRESHOLD: '0.1' },
+  defines: { SMAA_THRESHOLD: '0.05' },
   uniforms: { tDiffuse: { value: null }, resolution: { value: new THREE.Vector2() } },
   vertexShader: /* glsl */`
     uniform vec2 resolution;
@@ -4167,7 +4710,11 @@ const smaaEdgeMat = new THREE.ShaderMaterial({
 });
 const smaaWeightMat = new THREE.ShaderMaterial({
   defines: {
-    SMAA_MAX_SEARCH_STEPS: '8',
+    // 16 = the SMAA "High" preset. 8 searched only ~16px along an edge,
+    // but this renderer is long shallow architectural lines — stair runs
+    // of 20-30px are everywhere, and past the search reach the blend
+    // weights collapse and the run stays jagged (FXAA then looks better)
+    SMAA_MAX_SEARCH_STEPS: '16',
     SMAA_AREATEX_MAX_DISTANCE: '16',
     SMAA_AREATEX_PIXEL_SIZE: '( 1.0 / vec2( 160.0, 560.0 ) )',
     SMAA_AREATEX_SUBTEX_SIZE: '( 1.0 / 7.0 )',
@@ -4350,16 +4897,69 @@ const smaaBlendMat = new THREE.ShaderMaterial({
 });
 
 // glow halo stages: pull emissive pixels out of the paint attachment
-// (A < 1 marks them), then a separable gaussian at quarter res
+// (A < 1 marks them), then a separable gaussian at quarter res.
+// The SUN joins the pool here: an analytic disc added on unoccluded
+// sky pixels, so the same blur + composite that bloom the lamps bloom
+// the sun — and partial occluders clip the source, letting light bleed
+// around silhouettes instead of stopping dead at them.
 const glowExtractMat = new THREE.ShaderMaterial({
-  uniforms: { tDiffuse: { value: null } },
+  uniforms: { tDiffuse: { value: null }, tDepth: { value: null },
+              invViewProj: { value: new THREE.Matrix4() },
+              sunDir: { value: new THREE.Vector3(0, 1, 0) },
+              sunSize: { value: 0 },
+              sunColor: { value: new THREE.Color('#f7c948') },
+              cloudAmt: { value: 0 }, cloudScale: { value: 5.5 },
+              cloudFade: { value: 0.1 }, cloudStretch: { value: 1 },
+              cloudDir: { value: 0 } },
   vertexShader: blitVert,
   fragmentShader: /* glsl */`
     precision highp float;
-    varying vec2 vUv; uniform sampler2D tDiffuse;
+    varying vec2 vUv; uniform sampler2D tDiffuse, tDepth;
+    uniform mat4 invViewProj;
+    uniform vec3 sunDir, sunColor;
+    uniform float sunSize, cloudAmt, cloudScale, cloudFade, cloudStretch, cloudDir;
+    float hash(vec2 p) {
+      return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+    }
+    float vnoise(vec2 p) {              // same value noise as the compose
+      vec2 i = floor(p), f = fract(p);
+      vec2 u = f * f * (3.0 - 2.0 * f);
+      return mix(mix(hash(i), hash(i + vec2(1,0)), u.x),
+                 mix(hash(i + vec2(0,1)), hash(i + vec2(1,1)), u.x), u.y);
+    }
     void main() {
       vec4 p = texture2D(tDiffuse, vUv);
-      gl_FragColor = vec4(p.rgb * (1.0 - p.a), 1.0);
+      vec3 c = p.rgb * (1.0 - p.a);
+      // sky = depth cleared at the far plane; the blur soaks up the
+      // slightly hard disc edge, so a small fixed AA band is plenty.
+      // Full emissive strength — the sun blooms EXACTLY like a lamp
+      // face of its color; halo/haloSize are the only bloom dials.
+      if (sunSize > 0.0 && texture2D(tDepth, vUv).x > 0.9999) {
+        vec2 ndc = vUv * 2.0 - 1.0;
+        vec4 wra = invViewProj * vec4(ndc, -1.0, 1.0);
+        vec4 wrb = invViewProj * vec4(ndc,  1.0, 1.0);
+        vec3 rd = normalize(wrb.xyz / wrb.w - wra.xyz / wra.w);
+        float sunD = dot(rd, sunDir);
+        float cosR = cos(sunSize);
+        float disc = smoothstep(cosR - 0.002, cosR, sunD);
+        // clouds pass in front of the sun: coverage occludes the
+        // bloom source exactly like the compose occludes the disc
+        if (disc > 0.0 && cloudAmt > 0.0) {
+          // SAME dome mapping + band as the compose's cloudP/cloudBand
+          vec2 cp = rd.xz / (1.0 + max(rd.y, -0.98)) * cloudScale;
+          float cA = cos(cloudDir), sA = sin(cloudDir);
+          cp = vec2((cp.x * cA + cp.y * sA) / max(cloudStretch, 1.0),
+                    -cp.x * sA + cp.y * cA);
+          float n = vnoise(cp) * 0.65 + vnoise(cp * 2.7 + 19.1) * 0.35;
+          float t = 1.0 - cloudAmt * 0.42;
+          float band = smoothstep(-0.95, -0.75, rd.y);
+          if (cloudFade > 0.001)
+            band *= smoothstep(0.02, max(cloudFade, 0.04), max(rd.y, 0.0));
+          disc *= 1.0 - smoothstep(t, t + 0.02, n) * band;
+        }
+        c += sunColor * disc;
+      }
+      gl_FragColor = vec4(c, 1.0);
     }`,
   depthTest: false, depthWrite: false,
 });
@@ -4369,13 +4969,17 @@ const blurMat = new THREE.ShaderMaterial({
   fragmentShader: /* glsl */`
     precision highp float;
     varying vec2 vUv; uniform sampler2D tDiffuse; uniform vec2 uDir;
+    // taps decode to LINEAR light and the result re-encodes: a gamma-
+    // space gaussian rings halos with a muddy dark fringe. Storage
+    // stays gamma bytes, so dark falloff keeps its 8-bit resolution.
+    vec3 tapL(vec2 p) { return pow(texture2D(tDiffuse, p).rgb, vec3(2.2)); }
     void main() {
-      vec3 c = texture2D(tDiffuse, vUv).rgb * 0.227;
-      c += (texture2D(tDiffuse, vUv + uDir).rgb       + texture2D(tDiffuse, vUv - uDir).rgb)       * 0.194;
-      c += (texture2D(tDiffuse, vUv + uDir * 2.0).rgb + texture2D(tDiffuse, vUv - uDir * 2.0).rgb) * 0.121;
-      c += (texture2D(tDiffuse, vUv + uDir * 3.0).rgb + texture2D(tDiffuse, vUv - uDir * 3.0).rgb) * 0.054;
-      c += (texture2D(tDiffuse, vUv + uDir * 4.0).rgb + texture2D(tDiffuse, vUv - uDir * 4.0).rgb) * 0.016;
-      gl_FragColor = vec4(c, 1.0);
+      vec3 c = tapL(vUv) * 0.227;
+      c += (tapL(vUv + uDir)       + tapL(vUv - uDir))       * 0.194;
+      c += (tapL(vUv + uDir * 2.0) + tapL(vUv - uDir * 2.0)) * 0.121;
+      c += (tapL(vUv + uDir * 3.0) + tapL(vUv - uDir * 3.0)) * 0.054;
+      c += (tapL(vUv + uDir * 4.0) + tapL(vUv - uDir * 4.0)) * 0.016;
+      gl_FragColor = vec4(pow(c, vec3(1.0 / 2.2)), 1.0);
     }`,
   depthTest: false, depthWrite: false,
 });
@@ -4536,6 +5140,7 @@ const castMaskMat = new THREE.ShaderMaterial({
       if (selfShade > 0.5 &&
           mod(floor(texture2D(tID, vUv).b * 255.0 + 0.5), 2.0) < 0.5) {
         vec3 n = texture2D(tNormal, vUv).xyz * 2.0 - 1.0;
+        n *= inversesqrt(max(dot(n, n), 1e-8));   // msaa-resolved normals arrive shortened
         float shade = clamp(dot(n, normalize(lightDir)), 0.0, 1.0);
         m = max(m, step(shade, hatchThreshold));
         // carry the terminator radius on the dark side AND the adjacent
@@ -4581,6 +5186,7 @@ const shadeFieldMat = new THREE.ShaderMaterial({
     uniform vec3 lightDir;
     void main() {
       vec3 n = texture2D(tNormal, vUv).xyz * 2.0 - 1.0;
+      n *= inversesqrt(max(dot(n, n), 1e-8));   // msaa-resolved normals arrive shortened
       float bb = texture2D(tID, vUv).b;
       float org = mod(floor(bb * 255.0 + 0.5) / 4.0, 2.0) >= 1.0 ? 1.0 : 0.0;
       gl_FragColor = vec4(clamp(dot(n, normalize(lightDir)), 0.0, 1.0), org, 0.0, 1.0);
@@ -4658,6 +5264,43 @@ const dbgDepthMat = new THREE.ShaderMaterial({
                 (cameraFar + cameraNear - ndc * (cameraFar - cameraNear));
       float g = 1.0 - clamp(d / cameraFar, 0.0, 1.0);
       gl_FragColor = vec4(vec3(g), 1.0);
+    }`,
+  depthTest: false, depthWrite: false,
+});
+
+// the COMPLETE ink sheet: rtLines resolved exactly the way the compose
+// consumes it — R plus the glass channels at their slider strengths
+// under the same depth gating — shown as black lines on white paper
+const dbgInkMat = new THREE.ShaderMaterial({
+  uniforms: {
+    tLines: { value: null }, tDepth: { value: null },
+    tGlassDepth: { value: null }, tGlassBackDepth: { value: null },
+    cameraNear: { value: 0.1 }, cameraFar: { value: 1000 },
+    glassLine: { value: 1 }, glassBackLine: { value: 0.4 },
+  },
+  vertexShader: blitVert,
+  fragmentShader: /* glsl */`
+    precision highp float;
+    varying vec2 vUv;
+    uniform sampler2D tLines, tDepth, tGlassDepth, tGlassBackDepth;
+    uniform float cameraNear, cameraFar, glassLine, glassBackLine;
+    float lin(float z) {
+      float ndc = z * 2.0 - 1.0;
+      return (2.0 * cameraNear * cameraFar) /
+             (cameraFar + cameraNear - ndc * (cameraFar - cameraNear));
+    }
+    void main() {
+      vec4 l = texture2D(tLines, vUv);
+      float ink = l.r;
+      float dC = lin(texture2D(tDepth, vUv).x);
+      float gD = lin(texture2D(tGlassDepth, vUv).x);
+      if (gD < dC * 0.999) {
+        float gbD = lin(texture2D(tGlassBackDepth, vUv).x);
+        if (gbD > gD * 1.001 && gbD < dC * 0.999)
+          ink = max(ink, l.b * glassBackLine);
+        ink = max(ink, l.g * glassLine);
+      }
+      gl_FragColor = vec4(vec3(1.0 - clamp(ink, 0.0, 1.0)), 1.0);
     }`,
   depthTest: false, depthWrite: false,
 });
@@ -5124,7 +5767,7 @@ checkbox('regionGroup', 'region grouping', () => buildScene());
 slider('similarity', 'similarity', 0.1, 1, 0.005, () => buildScene());
 // feature LOD — all variants are baked, so these switch with no rebuild
 section('feature lod');
-slider('minFeature', 'min feature %', 0, 3, 0.05);
+slider('minFeature', 'min feature %', 0, 0.75, 0.05);
 dropdown('lodMetric', 'size metric', LOD_METRICS);
 dropdown('lodUnit', 'size of', LOD_UNITS);
 checkbox('keepSilhouettes', 'keep outlines');
@@ -5133,7 +5776,7 @@ slider('nearFactor', 'near plane ×', 0.002, 0.1, 0.002);
 checkbox('cullBuried', 'cull buried faces', () => buildScene());
 section('thin lines & aa');
 checkbox('oneSided', 'one-sided lines');
-checkbox('coverageAA', 'coverage aa');
+checkbox('coverageAA', 'coverage aa (shadow)');
 checkbox('progressive', 'progressive ss');
 dropdown('msaa', 'msaa id buffer', ['off', '4x', '8x'], () => makeTargets());
 dropdown('aaMode', 'post aa', ['off', 'fxaa', 'smaa']);
@@ -5180,7 +5823,7 @@ slider('glassTint', 'glass tint', 0, 1, 0.01);
 slider('glassLine', 'glass lines', 0, 1, 0.01);
 slider('glassBackLine', 'back edges', 0, 1, 0.01);
 slider('glowLift', 'glow lift', 0, 10, 0.05);
-slider('haloStrength', 'halo', 0, 10, 0.05);
+slider('haloStrength', 'halo', 0, 1.5, 0.05);
 slider('haloSize', 'halo size', 0.25, 30, 0.25);
 section('watercolor');
 colorPick('skyColor', 'sky');
@@ -5188,13 +5831,13 @@ colorPick('skyHorizon', 'horizon');
 slider('skyGradHeight', 'sky gradient', 0.05, 1, 0.01);
 slider('clouds', 'clouds', 0, 1, 0.05);
 slider('cloudScale', 'cloud scale', 2, 15, 0.1);
-slider('cloudFade', 'cloud horizon', 0.04, 0.3, 0.01);
+slider('cloudFade', 'cloud horizon', 0, 0.3, 0.01);   // 0 = wrap below horizon
+slider('cloudStretch', 'cloud stretch', 1, 8, 0.1);
+slider('cloudStretchDir', 'stretch dir°', 0, 180, 1);
 slider('groundSpeckle', 'ground speckle', 0, 1, 0.05);
 slider('speckleSize', 'speckle size', 0.3, 3, 0.05);
 slider('speckleFade', 'speckle fade', 0, 2, 0.05);   // strength: 0 = never fade
 slider('sunSize', 'sun size', 0, 25, 0.5);
-slider('sunGlow', 'sun emissive', 0, 1, 0.05);
-slider('sunHaloWidth', 'sun halo width', 1.5, 8, 0.1);
 slider('sunCore', 'sun core', 0, 1, 0.05);
 colorPick('sunColor', 'sun');
 slider('regionJitter', 'region jitter', 0, 0.25, 0.005, () => buildScene());
@@ -5265,24 +5908,27 @@ const BUDGETS = [
   { label: 'rebuild',    comfortable: 2000,  heavy: 5000,   fmt: v => (v / 1000).toFixed(2) + 's' },
 ];
 
-// Megapixels actually shaded per ink pass, times the sub-tests each pixel
-// runs. This is the number that predicts frame time: the ink pass is
-// fullscreen, so supersample (which scales the target area) and coverage AA
-// (4 sub-tests) drive cost far harder than triangle count does.
+// Megapixels actually shaded per ink pass. This is the number that
+// predicts frame time: the ink pass is fullscreen, so supersample
+// (which scales the target area) drives cost far harder than triangle
+// count does. Coverage AA no longer multiplies the load — geometry and
+// glass detection are single evaluations (coverage comes from the
+// stroke stage) and the shadow RGSS samples are plain reads of the
+// materialized mask texture.
 function shaderLoad() {
   const T = targetsHi || targetsLo;
   if (!T) return 0;
-  return (T.rtID.width * T.rtID.height / 1e6) * (P.coverageAA ? 4 : 1);
+  return T.rtID.width * T.rtID.height / 1e6;
 }
 // Attribute bytes for the merged mesh and the line geometry, plus every
 // live render target. Targets scale with supersample squared, so they can
 // quietly outweigh the geometry at high settings.
 function gpuBytes() {
   let b = triCount * 3 * 46 + lineVertCount * 22;   // see mergeBag attributes
-  // three MRTs (ID, glass, glass-back; 2 attachments each, msaa'd) +
-  // 3 depths + normal + ink + the 1/16-area glow pair
+  // four MRTs (ID, glass, glass-back, normal; 2 attachments each,
+  // msaa'd) + 3 depths + lines + smask + ink + the 1/16-area glow pair
   const tgt = t => t ? t.rtID.width * t.rtID.height *
-    (4 * 2 * (msaaSamples() || 1) * 3 + 12 + 8 + 0.5) : 0;
+    (4 * 2 * (msaaSamples() || 1) * 4 + 12 + 8 + 0.5) : 0;
   b += tgt(targetsLo) + tgt(targetsHi);
   if (rtScreen) b += rtScreen.width * rtScreen.height * 4;
   if (rtEdges) b += rtEdges.width * rtEdges.height * 8;   // edges + weights
@@ -5311,7 +5957,7 @@ function drawCalls() {
 (() => {
   const bar = document.getElementById('debugbar');
   const views = ['off', 'classes', 'ids', 'paint', 'glass', 'normals',
-                 'shade n', 'field', 'melt', 'stencil', 'glow', 'depth'];
+                 'shade n', 'field', 'melt', 'stencil', 'smask', 'glow', 'regions', 'skel', 'lines', 'ink', 'depth'];
   const btns = new Map();
   for (const v of views) {
     const b = document.createElement('button');
@@ -5322,7 +5968,14 @@ function drawCalls() {
       glass: 'translucent layer', normals: 'flat facet normals',
       'shade n': 'smoothed / PN shade normals', field: 'blurred shade field (R) + class (G)',
       melt: 'cast-shadow melt mask (when shadow smooth > 0)',
-      stencil: 'stencil shadow mask', glow: 'emissive halo blur', depth: 'linearized depth',
+      stencil: 'stencil shadow mask',
+      smask: 'materialized shadow mask (R = shadow region, G = cast fill)',
+      glow: 'emissive halo blur',
+      regions: 'the region domain the detector inks — every color boundary becomes a line',
+      skel: '1px boundary skeleton before the stroke widens it',
+      lines: 'stroked line pass output (R = ink, G/B = glass edges)',
+      ink: 'the complete ink sheet — every line at its applied strength',
+      depth: 'linearized depth',
     }[v];
     b.onclick = () => {
       P.debugView = v;
@@ -5513,9 +6166,16 @@ function applyPostAA(T) {
   const ssActive = T.scale !== 1;
   const aa = (P.aaMode === 'smaa' && !smaaReady) ? 'fxaa' : P.aaMode;
   let src = T.rtInk;
+  // supersampled: box-filter down in linear light (resolveMat); at 1x
+  // the plain 1-tap copy keeps that path byte-identical to before
+  const armResolve = () => {
+    resolveMat.uniforms.tDiffuse.value = T.rtInk.texture;
+    resolveMat.uniforms.uOff.value.set(0.25 * T.scale / T.rtInk.width,
+                                       0.25 * T.scale / T.rtInk.height);
+    blitQuad.material = resolveMat;
+  };
   if (aa !== 'off' && ssActive) {
-    copyMat.uniforms.tDiffuse.value = T.rtInk.texture;
-    blitQuad.material = copyMat;
+    armResolve();
     renderer.setRenderTarget(rtScreen);
     renderer.render(blitScene, postCamera);
     src = rtScreen;
@@ -5552,8 +6212,11 @@ function applyPostAA(T) {
     renderer.setRenderTarget(null);
     renderer.render(blitScene, postCamera);
   } else {
-    copyMat.uniforms.tDiffuse.value = T.rtInk.texture;
-    blitQuad.material = copyMat;
+    if (ssActive) armResolve();
+    else {
+      copyMat.uniforms.tDiffuse.value = T.rtInk.texture;
+      blitQuad.material = copyMat;
+    }
     renderer.setRenderTarget(null);
     renderer.render(blitScene, postCamera);
   }
@@ -5845,9 +6508,24 @@ function renderFrame(useHi) {
     renderer.render(blitScene, postCamera);
   }
 
-  // pass 2b: glow halo — extract emissive pixels, blur at quarter res
-  if (hasGlow) {
-    glowExtractMat.uniforms.tDiffuse.value = T.rtID.texture[1];
+  // pass 2b: glow halo — extract emissive pixels (plus the sun disc on
+  // unoccluded sky pixels), blur at quarter res. The sun blooms through
+  // the SAME pipeline as the lamps — no separate analytic halo.
+  const glowActive = hasGlow || (P.colorOn && P.sunSize > 0);
+  if (glowActive) {
+    const ge = glowExtractMat.uniforms;
+    ge.tDiffuse.value = T.rtID.texture[1];
+    ge.tDepth.value = T.rtID.depthTexture;
+    ge.invViewProj.value.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).invert();
+    ge.sunDir.value.copy(lightWorld);
+    ge.sunSize.value = THREE.MathUtils.degToRad(P.sunSize);
+    ge.cloudAmt.value = P.clouds;
+    ge.cloudScale.value = P.cloudScale;
+    ge.cloudFade.value = P.cloudFade;
+    ge.cloudStretch.value = P.cloudStretch;
+    ge.cloudDir.value = THREE.MathUtils.degToRad(P.cloudStretchDir);
+    const sgB = hex2u8(P.sunColor);
+    ge.sunColor.value.setRGB(sgB[0] / 255, sgB[1] / 255, sgB[2] / 255);
     blitQuad.material = glowExtractMat;
     renderer.setRenderTarget(T.rtGlowA);
     renderer.render(blitScene, postCamera);
@@ -5860,41 +6538,6 @@ function renderFrame(useHi) {
     blurMat.uniforms.uDir.value.set(0, P.haloSize / T.rtGlowA.height);
     renderer.setRenderTarget(T.rtGlowA);
     renderer.render(blitScene, postCamera);
-  }
-
-  // debug bar: blit the selected buffer (or the class view) instead of
-  // composing ink. Runs AFTER every pre-pass so each view is fresh —
-  // 'melt' and 'stencil' show their last contents when that path is off.
-  if (P.debugView !== 'off') {
-    renderer.setRenderTarget(null);
-    if (P.debugView === 'classes') {
-      const du = dbgClassMat.uniforms;
-      du.tID.value = T.rtID.texture[0];
-      du.tDepth.value = T.rtID.depthTexture;
-      du.cameraNear.value = camera.near;
-      du.cameraFar.value = camera.far;
-      blitQuad.material = dbgClassMat;
-    } else if (P.debugView === 'depth') {
-      const du = dbgDepthMat.uniforms;
-      du.tDepth.value = T.rtID.depthTexture;
-      du.cameraNear.value = camera.near;
-      du.cameraFar.value = camera.far;
-      blitQuad.material = dbgDepthMat;
-    } else {
-      const tex = {
-        ids: T.rtID.texture[0], paint: T.rtID.texture[1],
-        glass: T.rtGlass.texture[0],
-        normals: T.rtNormal.texture[0], 'shade n': T.rtNormal.texture[1],
-        field: T.rtMaskA.texture, melt: T.rtMaskB.texture,
-        stencil: rtStencil ? rtStencil.texture : null,
-        glow: T.rtGlowA.texture,
-      }[P.debugView];
-      if (!tex) return;
-      copyMat.uniforms.tDiffuse.value = tex;
-      blitQuad.material = copyMat;
-    }
-    renderer.render(blitScene, postCamera);
-    return;
   }
 
   // pass 3: ink
@@ -5910,7 +6553,7 @@ function renderFrame(useHi) {
   u.tGlassBackID.value = T.rtGlassBack.texture[0];
   u.tGlassBackDepth.value = T.rtGlassBack.depthTexture;
   u.tGlow.value = T.rtGlowA.texture;
-  u.haloStrength.value = hasGlow ? P.haloStrength : 0;   // exact no-op without lamps
+  u.haloStrength.value = glowActive ? P.haloStrength : 0;   // exact no-op without emitters
   u.resolution.value.set(T.rtID.width, T.rtID.height);
   // grain frequency locks to DISPLAY pixels: supersampled stills keep
   // their tooth instead of averaging it away in the downsample
@@ -5925,7 +6568,7 @@ function renderFrame(useHi) {
     'paperGrain','grainScale','washAmount','washScale','poolAmount','inkTint','aerialFade',
     'glassTint','glassLine','glassBackLine','glowLift','contourLine',
     'shadowBias','skyGradHeight','cloudScale','cloudFade','speckleSize','speckleFade',
-    'sunHaloWidth','sunCore','poolRadius','paperFiber','paperFleck']) u[k].value = P[k];
+    'sunCore','poolRadius','paperFiber','paperFleck']) u[k].value = P[k];
   // smoothstep(a, b) needs a < b — keep the aerial ramp well-ordered
   u.aerialNear.value = P.aerialNear;
   u.aerialFar.value = Math.max(P.aerialFar, P.aerialNear + 0.02);
@@ -5939,6 +6582,7 @@ function renderFrame(useHi) {
   const wobW = 16 * (sceneSphere ? sceneSphere.radius : 100) / +P.shadowRes;
   u.shadowWobUv.value.set(wobW / (lightCam.right - lightCam.left),
                           wobW / (lightCam.top - lightCam.bottom));
+  u.shadowTexel.value.set(1 / +P.shadowRes, 1 / +P.shadowRes);
   u.tStencilMask.value = rtStencil ? rtStencil.texture : null;
   u.stencilOn.value = stencilMode ? 1 : 0;
   // same fixed-world-size wobble as the map path, on a constant 2048
@@ -5959,10 +6603,11 @@ function renderFrame(useHi) {
   const horB = hex2u8(P.skyHorizon);   // raw bytes, same as skyColor
   u.horizonColor.value.setRGB(horB[0] / 255, horB[1] / 255, horB[2] / 255);
   u.cloudAmt.value = P.clouds;
+  u.cloudStretch.value = P.cloudStretch;
+  u.cloudDir.value = THREE.MathUtils.degToRad(P.cloudStretchDir);
   u.speckleAmt.value = P.groundSpeckle;
   u.sunDir.value.copy(lightWorld);     // the sun IS the light source
   u.sunSize.value = THREE.MathUtils.degToRad(P.sunSize);
-  u.sunGlow.value = P.sunGlow;
   const sunB = hex2u8(P.sunColor);
   u.sunColor.value.setRGB(sunB[0] / 255, sunB[1] / 255, sunB[2] / 255);
   u.colorOn.value = P.colorOn ? 1 : 0;
@@ -5981,6 +6626,94 @@ function renderFrame(useHi) {
   u.minFeature.value = P.minFeature / 100;   // slider is a percentage
   u.invFovScale.value = invFovScale();
   u.keepSil.value = P.keepSilhouettes ? 1 : 0;
+
+  // pass 2b2: the SHADOW-MASK PASS — one fullscreen evaluation of
+  // shadowMaskAt (R) plus the AA'd cast fill (G) into rtSMask; the
+  // skeleton's shadow probes, the domain view, and both compose
+  // branches then read the texture. Shares post's uniform value
+  // objects, so it must run after the uniform setup above. Skipped
+  // when nothing consumes it (hatchOn gates every consumer).
+  if (P.hatchOn || P.debugView === 'smask') {
+    blitQuad.material = maskMat;
+    renderer.setRenderTarget(T.rtSMask);
+    renderer.render(blitScene, postCamera);
+  }
+  u.tSMask.value = T.rtSMask.texture;
+
+  // pass 2c: the LINE PASS — stage A detects every boundary (geometry,
+  // glass, shadow, speckle, sky) as a 1px skeleton; stage B strokes it
+  // with a round nib of the shared per-pixel radius. The compose below
+  // only reads the result. Runs after the uniform setup above because
+  // both materials share post's uniform value objects.
+  blitQuad.material = skelMat;
+  renderer.setRenderTarget(T.rtSkel);
+  renderer.render(blitScene, postCamera);
+  u.tSkel.value = T.rtSkel.texture;
+  skelDownMat.uniforms.tDiffuse.value = T.rtSkel.texture;
+  skelDownMat.uniforms.uPx.value.set(1 / T.rtSkel.width, 1 / T.rtSkel.height);
+  blitQuad.material = skelDownMat;
+  renderer.setRenderTarget(T.rtSkelLo);
+  renderer.render(blitScene, postCamera);
+  u.tSkelLo.value = T.rtSkelLo.texture;
+  blitQuad.material = lineMat;
+  renderer.setRenderTarget(T.rtLines);
+  renderer.render(blitScene, postCamera);
+  u.tLines.value = T.rtLines.texture;
+
+  // debug bar: blit the selected buffer (or the class view) instead of
+  // composing ink. Runs AFTER every pre-pass so each view is fresh —
+  // 'melt' and 'stencil' show their last contents when that path is off.
+  if (P.debugView !== 'off') {
+    renderer.setRenderTarget(null);
+    if (P.debugView === 'classes') {
+      const du = dbgClassMat.uniforms;
+      du.tID.value = T.rtID.texture[0];
+      du.tDepth.value = T.rtID.depthTexture;
+      du.cameraNear.value = camera.near;
+      du.cameraFar.value = camera.far;
+      blitQuad.material = dbgClassMat;
+    } else if (P.debugView === 'depth') {
+      const du = dbgDepthMat.uniforms;
+      du.tDepth.value = T.rtID.depthTexture;
+      du.cameraNear.value = camera.near;
+      du.cameraFar.value = camera.far;
+      blitQuad.material = dbgDepthMat;
+    } else if (P.debugView === 'regions') {
+      // shares post's uniforms, which the setup above already filled
+      blitQuad.material = domainMat;
+    } else if (P.debugView === 'ink') {
+      const du = dbgInkMat.uniforms;
+      du.tLines.value = T.rtLines.texture;
+      du.tDepth.value = T.rtID.depthTexture;
+      du.tGlassDepth.value = T.rtGlass.depthTexture;
+      du.tGlassBackDepth.value = T.rtGlassBack.depthTexture;
+      du.cameraNear.value = camera.near;
+      du.cameraFar.value = camera.far;
+      du.glassLine.value = P.glassLine;
+      du.glassBackLine.value = P.glassBackLine;
+      blitQuad.material = dbgInkMat;
+    } else {
+      const tex = {
+        ids: T.rtID.texture[0], paint: T.rtID.texture[1],
+        glass: T.rtGlass.texture[0],
+        normals: T.rtNormal.texture[0], 'shade n': T.rtNormal.texture[1],
+        field: T.rtMaskA.texture, melt: T.rtMaskB.texture,
+        stencil: rtStencil ? rtStencil.texture : null,
+        smask: T.rtSMask.texture,
+        glow: T.rtGlowA.texture,
+        skel: T.rtSkel.texture,
+        lines: T.rtLines.texture,
+      }[P.debugView];
+      if (!tex) return;
+      // rtSkel/rtLines alpha carries speckle fill — force opaque
+      const cm = (P.debugView === 'lines' || P.debugView === 'skel')
+        ? copyOpaqueMat : copyMat;
+      cm.uniforms.tDiffuse.value = tex;
+      blitQuad.material = cm;
+    }
+    renderer.render(blitScene, postCamera);
+    return;
+  }
 
   // route through rtInk when the image needs a filtered resample.
   // smaa falls back to fxaa until its lookup textures finish decoding.

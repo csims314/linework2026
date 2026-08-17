@@ -2643,7 +2643,7 @@ const post = new THREE.ShaderMaterial({
     float skelShadow(vec2 p) {
       vec2 px2 = 1.0 / resolution;
       float m0 = step(0.5, texture2D(tSMask, p).r);
-      vec2 so = px2 * shadowLineWidth;
+      vec2 so = px2 * shadowLineWidth * ssScale;   // display px -> texels
       float sl =      abs(step(0.5, texture2D(tSMask, p + vec2(so.x, 0.0)).r) - m0);
       return max(sl, abs(step(0.5, texture2D(tSMask, p + vec2(0.0, so.y)).r) - m0));
     }
@@ -2655,8 +2655,11 @@ const post = new THREE.ShaderMaterial({
       // hand-drawn wobble: perturb WHERE we look, so every line inherits it
       vec2 uv = vUv;
       if (wobbleAmp > 0.0) {
-        vec2 wp = vUv * resolution * wobbleFreq;
-        uv += (vec2(vnoise(wp), vnoise(wp + 71.3)) - 0.5) * wobbleAmp * 2.0 * px;
+        // both amplitude and frequency are display-pixel anchored, the
+        // same way paperTooth's grain is, so a supersampled still keeps
+        // the hand-drawn character instead of shrinking it
+        vec2 wp = vUv * resolution * wobbleFreq / ssScale;
+        uv += (vec2(vnoise(wp), vnoise(wp + 71.3)) - 0.5) * wobbleAmp * ssScale * 2.0 * px;
       }
 
       float dC = linDepth(uv);
@@ -2666,8 +2669,11 @@ const post = new THREE.ShaderMaterial({
       // collapses into fine lines instead of mush. Falloff 0..1 blends
       // width thinning (original behavior); 1..3 additionally fades
       // distant ink toward paper, past the width floor.
+      // ssScale converts DISPLAY pixels to render-target texels: every
+      // width below is measured in texels, so without it a supersampled
+      // frame would draw every line thinner than the 1x frame it refines
       float atten = mix(1.0, clamp(14.0 / dC, 0.25, 1.6), min(distanceFalloff, 1.0));
-      float w = max(lineWidth * atten, 0.5);
+      float w = ssScale * max(lineWidth * atten, 0.5);
       vec2 o = px * w;
 
       // world anchor shared by the shade noise and the pigment: surface
@@ -2859,14 +2865,16 @@ const post = new THREE.ShaderMaterial({
       // distance dial), and the falloff ink fade uses the same depth.
       float dW = dC;
       {
-        vec2 pr = px * max(lineWidth * 1.6, 0.5);
+        vec2 pr = px * ssScale * max(lineWidth * 1.6, 0.5);
         dW = min(dW, linDepth(uv + vec2(pr.x, 0.0)));
         dW = min(dW, linDepth(uv - vec2(pr.x, 0.0)));
         dW = min(dW, linDepth(uv + vec2(0.0, pr.y)));
         dW = min(dW, linDepth(uv - vec2(0.0, pr.y)));
       }
-      w = max(lineWidth * mix(1.0, clamp(14.0 / dW, 0.25, 1.6),
-                              min(distanceFalloff, 1.0)), 0.5);
+      // ssScale: widths are in TARGET texels but lineWidth is a display
+      // pixel count, so the supersampled refine must widen to match
+      w = ssScale * max(lineWidth * mix(1.0, clamp(14.0 / dW, 0.25, 1.6),
+                                        min(distanceFalloff, 1.0)), 0.5);
       // RECENTER + SOFTEN: the skeleton marks the left/bottom pixel of
       // each boundary (forward diffs), so every nib tap shifts by -0.5
       // texels and rtSkel's bilinear filter spreads the mark across the
@@ -2882,7 +2890,12 @@ const post = new THREE.ShaderMaterial({
       // intensity IS the old sub-pixel hairline look at the 0.5px
       // width floor, but must recover as lines widen.
       float r = min(max(w - 1.0, 0.0), 4.9);
-      float peak = min(w + w, 2.0);
+      // peak restores full-strength cores once a line is at least one
+      // DISPLAY pixel wide, so it reads w in display units — otherwise a
+      // supersampled frame would treat its (scaled-up) texel width as if
+      // the line had got wider on screen and over-darken every hairline
+      float wDisp = w / ssScale;
+      float peak = min(wDisp + wDisp, 2.0);
       vec3 acc = vec3(0.0);
       if (r <= 0.0) {
         // hairline widths (the whole frame at the default lineWidth):

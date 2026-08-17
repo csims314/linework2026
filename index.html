@@ -155,27 +155,6 @@ const P = {
   nearFactor: 0.02,
   // drop loaded-model faces sealed inside another part (assembled models)
   cullBuried: false,
-  // ---- EXPERIMENTAL: forward stroke renderer (A/B toggle) --------
-  // Draws linework as GEOMETRY instead of filtering the ID buffer:
-  // region-boundary edges are baked, silhouette edges are found per
-  // frame in the vertex shader, and each edge rasterizes as a screen-
-  // space quad whose fragment shader computes exact distance to the
-  // segment. Coverage is analytic (smoothstep on that distance), so
-  // the line is correct at 1x and — the reason this exists — moves
-  // CONTINUOUSLY under a moving camera instead of snapping pixel to
-  // pixel the way a discontinuity test on a quantized buffer must.
-  // Everything else in the frame (sky, shading, cast shadows, glow,
-  // paper) still comes from the raster pipeline, so the toggle
-  // isolates the linework and nothing else.
-  strokeLines: false,
-  strokeWidth: 1.3,        // stroke width in DISPLAY pixels
-  // hidden-line removal: strokes are depth-tested against the scene
-  // depth texture in the fragment shader rather than by the hardware,
-  // so the bias is a RELATIVE depth tolerance (a fraction of view
-  // distance) and stays scale-stable from a 16-unit model to the yard
-  strokeBias: 0.004,
-  strokeSilhouette: true,  // debug: view-dependent silhouette edges
-  strokeCrease: true,      // debug: baked region-boundary edges
   // line look
   lineWidth: 0.5, distanceFalloff: 1.25,
   wobbleAmp: 0, wobbleFreq: 0.08,
@@ -346,11 +325,6 @@ function washJitter(i) {
 // in a refined frame when you stop moving, and idles the GPU at rest.
 let dirty = true;
 function markDirty() { dirty = true; }
-// forward-stroke rebuild flag. Declared up here rather than beside the
-// rest of that renderer because finishScene() marks it during module
-// init, long before the stroke block's own statements have run.
-let strokeDirty = true, strokeEdgeCount = 0;
-function markStrokeDirty() { strokeDirty = true; }
 // stencil-shadow-volume geometry mirrors the merged mesh + actors;
 // rebuilt lazily when this is set (scene rebuilds, actor builds).
 // Declared up here because buildScene() runs before the volume
@@ -1535,7 +1509,6 @@ function finishScene() {
   glassRoot.frustumCulled = false;
   scene.add(glassRoot);
   volDirty = true;   // stencil shadow volumes mirror the merged mesh
-  markStrokeDirty();  // ...and so do the forward stroke edge buffers
   markDirty();
 }
 
@@ -1610,7 +1583,6 @@ function buildActor(builderFn, seed) {
   const a = { group, mesh };
   actors.push(a);
   volDirty = true;   // actor casters join the stencil volume scene
-  markStrokeDirty();
   return a;
 }
 
@@ -2107,11 +2079,6 @@ const post = new THREE.ShaderMaterial({
     cameraFar:  { value: camera.far },
     lightDir:   { value: new THREE.Vector3() },
     inkColor:   { value: new THREE.Color(P.inkColor) },
-    // 0 suppresses ONLY the geometry linework in the compose stage, so
-    // the forward stroke path can draw it instead. Cloud outlines, the
-    // sun disc and shadow rim lines are added after this point and are
-    // deliberately unaffected — they aren't geometry edges.
-    inkEnable:  { value: 1 },
     paperColor: { value: new THREE.Color(P.paperColor) },
     idThreshold: { value: 0 },
     lineWidth: { value: 0 }, distanceFalloff: { value: 0 },
@@ -2174,7 +2141,6 @@ const post = new THREE.ShaderMaterial({
                   shadeNoise, shadeNoiseScale,
                   softShade, shadowAmount, shadowLine, shadowLineWidth,
                   paperGrain, grainScale, ssScale, oneSided, coverage, minFeature, invFovScale, keepSil,
-                  inkEnable,
                   edgeToAlpha, softContact, groundY, cloudAmt, speckleAmt, sunSize,
                   skyGradHeight, cloudScale, cloudFade, cloudStretch, cloudDir,
                   speckleSize, speckleFade,
@@ -2981,7 +2947,7 @@ const post = new THREE.ShaderMaterial({
       // vUv: the line pass fragment at this screen position already
       // applied the same wobble to its lookups.
       vec4 lns = texture2D(tLines, vUv);
-      float ink = lns.r * inkEnable;   // 0 when the forward stroke path owns the linework
+      float ink = lns.r;
 
       // ---- SHADING: the lambert term darkens the fill -------------
       float shadow = 0.0;
@@ -4406,7 +4372,6 @@ function buttons(defs) {
 // ---- always visible -------------------------------------------------
 checkbox('showIDs', 'show face colors');
 checkbox('wireframe', 'wireframe');
-checkbox('strokeLines', 'stroke lines (fwd)');
 checkbox('colorOn', 'watercolor');
 slider('superSample', 'supersample ×', 1, 2, 0.25, () => makeTargets());
 
@@ -4437,11 +4402,6 @@ checkbox('oneSided', 'one-sided lines');
 checkbox('coverageAA', 'coverage aa (shadow)');
 checkbox('progressive', 'progressive ss');
 dropdown('aaMode', 'post aa', ['off', 'fxaa', 'smaa']);
-section('stroke lines (fwd)');
-slider('strokeWidth', 'stroke width px', 0.2, 4, 0.05);
-slider('strokeBias', 'stroke depth bias', 0, 0.05, 0.0005);
-checkbox('strokeCrease', 'crease/region edges');
-checkbox('strokeSilhouette', 'silhouette edges');
 section('line quality');
 slider('lineWidth', 'width px', 0.5, 4, 0.1);
 slider('distanceFalloff', 'dist falloff', 0, 3, 0.01);
@@ -4808,421 +4768,6 @@ function applyPostAA(T) {
   }
 }
 
-/* ============================================================
-   FORWARD STROKE RENDERER — the experimental A/B path.
-
-   The raster pipeline derives ink by testing for colour steps in a
-   nearest-filtered ID buffer. That test has no sub-pixel information:
-   the edge's true position inside a pixel is destroyed the moment the
-   ID pass rasterizes, which is why only supersampling cleans it up,
-   and why the ink SNAPS from pixel to pixel under a moving camera
-   instead of sliding. This path computes coverage instead of
-   reconstructing it — each edge is a quad, and its fragment shader
-   knows the exact distance from the pixel centre to the segment.
-
-   Line set = (baked region boundaries) u (per-frame silhouettes).
-   The first comes straight from the face-ID colours already baked
-   into the merged geometry, so the two renderers agree on which
-   edges are structural BY CONSTRUCTION — no second implementation of
-   region grouping to drift out of sync. The second is two dot
-   products in the vertex shader over a static buffer: an edge is a
-   silhouette when its two adjacent faces disagree about whether they
-   face the camera.
-
-   Not ported (deliberate, v1): the glass layer, distance falloff,
-   and wobble — the last of which is being removed anyway.
-   ============================================================ */
-const strokeScene = new THREE.Scene();
-strokeScene.matrixAutoUpdate = false;
-const strokeUnits = [];          // { src: Mesh, mesh: Mesh }
-const _strokeSize = new THREE.Vector2(), _strokeClear = new THREE.Color();
-// strokeDirty / strokeEdgeCount / markStrokeDirty are declared near
-// markDirty at the top — finishScene() needs them before this point.
-
-// 4-vertex template, instanced once per edge. aCorner.x picks the
-// endpoint (0 or 1), aCorner.y the side (-1 or +1).
-const STROKE_TEMPLATE = (() => {
-  const g = new THREE.InstancedBufferGeometry();
-  g.setAttribute('aCorner', new THREE.BufferAttribute(
-    new Float32Array([0, -1, 0, 1, 1, -1, 1, 1]), 2));
-  // three's default vertex prefix declares `position`; give it one even
-  // though the shader never reads it, so nothing downstream trips over
-  // a geometry without the attribute it assumes every mesh has
-  g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(12), 3));
-  g.setIndex([0, 1, 2, 2, 1, 3]);
-  return g;
-})();
-
-/* Build the per-edge buffer for one geometry.
-
-   Works at TRIANGLE granularity on purpose: a quad's two triangles
-   carry the same face-ID colour, so the diagonal fails the boundary
-   test for free and there is no need to know each source object's
-   quad stride after merging.
-
-   Interior edges are kept (a smooth region's silhouette runs along
-   them) EXCEPT where the two faces are all but coplanar, which can
-   never produce a silhouette worth drawing and which is most of the
-   edges in a panelled scene. */
-function buildStrokeEdges(geom) {
-  const pos = geom.attributes.position;
-  if (!pos || pos.count < 3) return null;
-  const p = pos.array;
-  const col = geom.attributes.color ? geom.attributes.color.array : null;
-  const szR = geom.attributes.aSizeRegion ? geom.attributes.aSizeRegion.array : null;
-  const szO = geom.attributes.aSizeObject ? geom.attributes.aSizeObject.array : null;
-  const nVert = pos.count, nTri = Math.floor(nVert / 3);
-  if (!nTri) return null;
-
-  // weld by quantized position — the merged mesh is unindexed, so
-  // adjacency has to be recovered the same way computeRegions does
-  const Q = 1e4, weld = new Map(), vid = new Int32Array(nVert);
-  for (let i = 0; i < nVert; i++) {
-    const b = i * 3;
-    const k = Math.round(p[b] * Q) + '_' + Math.round(p[b + 1] * Q) + '_' + Math.round(p[b + 2] * Q);
-    let id = weld.get(k);
-    if (id === undefined) { id = weld.size; weld.set(k, id); }
-    vid[i] = id;
-  }
-
-  const fn = new Float32Array(nTri * 3);
-  for (let t = 0; t < nTri; t++) {
-    const b0 = t * 9, b1 = b0 + 3, b2 = b0 + 6;
-    const ux = p[b1] - p[b0], uy = p[b1 + 1] - p[b0 + 1], uz = p[b1 + 2] - p[b0 + 2];
-    const wx = p[b2] - p[b0], wy = p[b2 + 1] - p[b0 + 1], wz = p[b2 + 2] - p[b0 + 2];
-    let nx = uy * wz - uz * wy, ny = uz * wx - ux * wz, nz = ux * wy - uy * wx;
-    const l = Math.hypot(nx, ny, nz) || 1;
-    fn[t * 3] = nx / l; fn[t * 3 + 1] = ny / l; fn[t * 3 + 2] = nz / l;
-  }
-
-  // edge -> the (at most two) triangles across it. A third face on the
-  // same edge is dropped, matching the raster path's owner/-1 rule:
-  // arbitrary but DETERMINISTIC, so non-manifold junk yields a
-  // consistently wrong line rather than one that flickers in motion.
-  const emap = new Map();
-  for (let t = 0; t < nTri; t++) {
-    for (let e = 0; e < 3; e++) {
-      const s = t * 3 + e, d = t * 3 + (e + 1) % 3;
-      const a = vid[s], c = vid[d];
-      const key = a < c ? a + '_' + c : c + '_' + a;
-      const rec = emap.get(key);
-      if (rec === undefined) emap.set(key, { t0: t, t1: -1, i: s, j: d });
-      else if (rec.t1 < 0) rec.t1 = t;
-    }
-  }
-
-  const sameColor = (a, b) => {
-    if (!col) return true;             // no ID colours: normals decide
-    const ba = a * 9, bb = b * 9;
-    return Math.abs(col[ba] - col[bb]) < 0.002 &&
-           Math.abs(col[ba + 1] - col[bb + 1]) < 0.002 &&
-           Math.abs(col[ba + 2] - col[bb + 2]) < 0.002;
-  };
-
-  const P0 = [], P1 = [], NA = [], NB = [], FL = [], SZR = [], SZO = [];
-  const pushEdge = (rec, boundary, open) => {
-    const bi = rec.i * 3, bj = rec.j * 3;
-    P0.push(p[bi], p[bi + 1], p[bi + 2]);
-    P1.push(p[bj], p[bj + 1], p[bj + 2]);
-    const a = rec.t0, b = rec.t1 < 0 ? rec.t0 : rec.t1;
-    NA.push(fn[a * 3], fn[a * 3 + 1], fn[a * 3 + 2]);
-    NB.push(fn[b * 3], fn[b * 3 + 1], fn[b * 3 + 2]);
-    FL.push(boundary ? 1 : 0, open ? 1 : 0);
-    // gate each edge by the SMALLER of the two shapes it separates, so
-    // a shrinking detail vanishes rather than leaving an outline around
-    // nothing — same rule the raster LOD uses
-    const va = a * 3, vb = b * 3;
-    for (let k = 0; k < 3; k++)
-      SZR.push(szR ? Math.min(szR[va * 3 + k], szR[vb * 3 + k]) : 255);
-    for (let k = 0; k < 3; k++)
-      SZO.push(szO ? szO[va * 3 + k] : 255);
-  };
-
-  for (const rec of emap.values()) {
-    if (rec.t1 < 0) { pushEdge(rec, true, true); continue; }   // open edge: always drawn
-    const boundary = !sameColor(rec.t0, rec.t1);
-    if (boundary) { pushEdge(rec, true, false); continue; }
-    const a = rec.t0 * 3, b = rec.t1 * 3;
-    const dp = fn[a] * fn[b] + fn[a + 1] * fn[b + 1] + fn[a + 2] * fn[b + 2];
-    if (dp > 0.9995) continue;      // flat pair: never a silhouette worth keeping
-    pushEdge(rec, false, false);
-  }
-
-  const n = FL.length / 2;
-  if (!n) return null;
-  const g = STROKE_TEMPLATE.clone();
-  g.instanceCount = n;
-  const inst = (arr, Type, size, norm) =>
-    new THREE.InstancedBufferAttribute(new Type(arr), size, norm);
-  g.setAttribute('aP0', inst(P0, Float32Array, 3, false));
-  g.setAttribute('aP1', inst(P1, Float32Array, 3, false));
-  g.setAttribute('aNA', inst(NA, Float32Array, 3, false));
-  g.setAttribute('aNB', inst(NB, Float32Array, 3, false));
-  g.setAttribute('aFlags', inst(FL, Float32Array, 2, false));
-  // two vec3s, not one vec6: a vertex attribute tops out at 4 components
-  g.setAttribute('aSizeR', inst(SZR, Uint8Array, 3, true));
-  g.setAttribute('aSizeO', inst(SZO, Uint8Array, 3, true));
-  g.boundingSphere = new THREE.Sphere(new THREE.Vector3(), Infinity);
-  return { geom: g, count: n };
-}
-
-const strokeMaterialProto = {
-  glslVersion: THREE.GLSL3,
-  transparent: true,
-  depthTest: false,     // occlusion is resolved against the depth TEXTURE
-  depthWrite: false,
-  side: THREE.DoubleSide,
-  // MAX-blend coverage into an offscreen buffer rather than compositing
-  // ink straight onto the canvas. Two overlapping strokes are still one
-  // line, not a darker one — alpha compositing would double-darken every
-  // crossing and every join, which turns dense greeble into a black mass.
-  blending: THREE.CustomBlending,
-  blendEquation: THREE.MaxEquation,
-  blendSrc: THREE.OneFactor,
-  blendDst: THREE.OneFactor,
-  blendEquationAlpha: THREE.MaxEquation,
-  blendSrcAlpha: THREE.OneFactor,
-  blendDstAlpha: THREE.OneFactor,
-  vertexShader: /* glsl */`
-    in vec2 aCorner;
-    in vec3 aP0, aP1, aNA, aNB;
-    in vec2 aFlags;
-    in vec3 aSizeR, aSizeO;   // baked feature sizes, region and object unit
-    uniform vec2 uRes;
-    uniform vec3 uCamPos;
-    uniform float uHalf, uMinFeature, uInvFov, uKeepSil, uSil, uCrease;
-    uniform float uMetric, uUnit;
-    flat out vec2 vS0, vS1;
-    flat out vec2 vZ;       // window-space depth at each endpoint
-    flat out float vHalf, vAlpha;
-    void main() {
-      vec4 w0 = modelMatrix * vec4(aP0, 1.0);
-      vec4 w1 = modelMatrix * vec4(aP1, 1.0);
-      // --- is this edge drawn at all? -----------------------------
-      vec3 mid = (w0.xyz + w1.xyz) * 0.5;
-      vec3 V = uCamPos - mid;
-      vec3 nA = normalize(mat3(modelMatrix) * aNA);
-      vec3 nB = normalize(mat3(modelMatrix) * aNB);
-      bool open = aFlags.y > 0.5;
-      // a silhouette is where the two adjacent faces disagree about
-      // facing the camera; an open edge has only one face, so it has
-      // no second opinion and always draws
-      bool sil = open || (dot(nA, V) * dot(nB, V) < 0.0);
-      bool crease = aFlags.x > 0.5 && !open;
-      bool draw = (crease && uCrease > 0.5) || (sil && uSil > 0.5);
-      if (!draw) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vAlpha = 0.0; return; }
-
-      vec4 c0 = projectionMatrix * viewMatrix * w0;
-      vec4 c1 = projectionMatrix * viewMatrix * w1;
-      // near-plane clip in homogeneous space: a player controller WILL
-      // walk into geometry, and an unclipped endpoint behind the eye
-      // projects to a wild screen position and smears a stroke across
-      // the whole frame
-      const float EPS = 1e-4;
-      if (c0.w < EPS && c1.w < EPS) { gl_Position = vec4(2.0, 2.0, 2.0, 1.0); vAlpha = 0.0; return; }
-      if (c0.w < EPS) c0 = mix(c0, c1, (EPS - c0.w) / (c1.w - c0.w));
-      else if (c1.w < EPS) c1 = mix(c1, c0, (EPS - c1.w) / (c0.w - c1.w));
-
-      vec2 s0 = (c0.xy / c0.w * 0.5 + 0.5) * uRes;
-      vec2 s1 = (c1.xy / c1.w * 0.5 + 0.5) * uRes;
-      vZ = vec2(c0.z / c0.w, c1.z / c1.w) * 0.5 + 0.5;
-      vS0 = s0; vS1 = s1;
-
-      // --- feature LOD: fade by apparent size ---------------------
-      float alpha = 1.0;
-      if (uMinFeature > 0.0 && !(uKeepSil > 0.5 && sil)) {
-        vec3 s = uUnit < 0.5 ? aSizeR : aSizeO;
-        float t = uMetric < 0.5 ? s.x : (uMetric < 1.5 ? s.y : s.z);
-        float world = exp2(t * 15.0 - 7.0);      // decode: byte -> world units
-        float dist = max(length(V), 1e-3);
-        // GRAZING-AWARE, matching the raster detector: a grate slat seen
-        // at a glancing angle goes sub-pixel long before its radial
-        // distance says so. Without this term the dense greeble keeps
-        // full-strength ink and collapses into a solid black mass.
-        // a thin plate's two faces are exactly opposite, so guard the sum
-        vec3 ns = nA + nB;
-        vec3 nAvg = dot(ns, ns) > 1e-8 ? normalize(ns) : nA;
-        vec3 nV = normalize(mat3(viewMatrix) * nAvg);
-        float graze = max(abs(nV.z), 0.05);
-        float frac = world * uInvFov * graze / dist;
-        alpha = smoothstep(uMinFeature, uMinFeature * 2.0, frac);
-      }
-      // sub-pixel widths FADE rather than thin: below a pixel a line
-      // can only get sparser, which is what strobes when you move
-      float hw = max(uHalf, 0.5);
-      vHalf = hw;
-      vAlpha = alpha * (uHalf / hw);
-
-      vec2 e = s1 - s0;
-      float len = length(e);
-      vec2 dir = len > 1e-6 ? e / len : vec2(1.0, 0.0);
-      vec2 nrm = vec2(-dir.y, dir.x);
-      float ext = hw + 1.0;
-      vec2 sp = mix(s0, s1, aCorner.x)
-              + nrm * aCorner.y * ext
-              + dir * (aCorner.x * 2.0 - 1.0) * ext;
-      gl_Position = vec4(sp / uRes * 2.0 - 1.0, 0.0, 1.0);
-    }`,
-  fragmentShader: /* glsl */`
-    precision highp float;
-    flat in vec2 vS0, vS1, vZ;
-    flat in float vHalf, vAlpha;
-    uniform sampler2D tDepth;
-    uniform vec2 uRes;
-    uniform float uNear, uFar, uBias;
-    out vec4 outColor;
-    float lin(float z) {          // window depth -> view distance
-      float n = z * 2.0 - 1.0;
-      return (2.0 * uNear * uFar) / (uFar + uNear - n * (uFar - uNear));
-    }
-    void main() {
-      if (vAlpha <= 0.0) discard;
-      vec2 fc = gl_FragCoord.xy;
-      vec2 e = vS1 - vS0;
-      float L2 = dot(e, e);
-      // capsule SDF: distance to the SEGMENT, not the infinite line, so
-      // joins and caps come out round with no extra geometry
-      float t = L2 > 1e-12 ? clamp(dot(fc - vS0, e) / L2, 0.0, 1.0) : 0.0;
-      float d = distance(fc, vS0 + e * t);
-      float cov = smoothstep(vHalf + 0.5, vHalf - 0.5, d);
-      if (cov <= 0.0) discard;
-
-      // --- hidden-line removal ------------------------------------
-      // z is linear in SCREEN space along a projected segment, so the
-      // lerp is exact. Compare in view distance with a RELATIVE
-      // tolerance: window depth is wildly non-linear, and a constant
-      // bias that works up close detonates at the far plane.
-      float zw = mix(vZ.x, vZ.y, t);
-      float sceneZ = texture(tDepth, fc / uRes).r;
-      if (lin(zw) > lin(sceneZ) * (1.0 + uBias)) discard;
-
-      // coverage only — the composite pass below turns it into ink
-      float a = cov * vAlpha;
-      outColor = vec4(a, a, a, a);
-    }`,
-};
-
-// coverage buffer -> ink on the canvas, one flat blend. Sized to the
-// drawing buffer and rebuilt only when that changes.
-let rtStroke = null;
-const strokeComposeMat = new THREE.ShaderMaterial({
-  uniforms: { tCov: { value: null }, uInk: { value: new THREE.Color() } },
-  transparent: true,
-  depthTest: false, depthWrite: false,
-  vertexShader: /* glsl */`
-    varying vec2 vUv;
-    void main() { vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }`,
-  fragmentShader: /* glsl */`
-    precision highp float;
-    varying vec2 vUv;
-    uniform sampler2D tCov;
-    uniform vec3 uInk;
-    void main() {
-      float a = texture2D(tCov, vUv).r;
-      if (a <= 0.0) discard;
-      gl_FragColor = vec4(uInk, a);
-    }`,
-});
-
-function makeStrokeMaterial() {
-  return new THREE.ShaderMaterial(Object.assign({}, strokeMaterialProto, {
-    uniforms: {
-      tDepth: { value: null },
-      uRes: { value: new THREE.Vector2() },
-      uCamPos: { value: new THREE.Vector3() },
-      uHalf: { value: 0.65 },
-      uNear: { value: 0.1 }, uFar: { value: 300 },
-      uBias: { value: 0.004 },
-      uMinFeature: { value: 0 }, uInvFov: { value: 1 }, uKeepSil: { value: 0 },
-      uSil: { value: 1 }, uCrease: { value: 1 },
-      uMetric: { value: 0 }, uUnit: { value: 0 },
-    },
-  }));
-}
-
-function disposeStrokes() {
-  for (const u of strokeUnits) {
-    strokeScene.remove(u.mesh);
-    u.mesh.geometry.dispose();
-    u.mesh.material.dispose();
-  }
-  strokeUnits.length = 0;
-  strokeEdgeCount = 0;
-}
-
-// Rebuild the edge buffers from whatever the raster path is drawing.
-// Cheap enough to be lazy: only runs when the toggle is on and the
-// scene changed, so having it enabled costs nothing while it is off.
-function rebuildStrokes() {
-  disposeStrokes();
-  const sources = [];
-  if (sceneRoot) sources.push(sceneRoot);
-  for (const a of actors) if (a.mesh) sources.push(a.mesh);
-  for (const src of sources) {
-    const built = buildStrokeEdges(src.geometry);
-    if (!built) continue;
-    const mesh = new THREE.Mesh(built.geom, makeStrokeMaterial());
-    mesh.frustumCulled = false;
-    mesh.matrixAutoUpdate = false;
-    strokeScene.add(mesh);
-    strokeUnits.push({ src, mesh });
-    strokeEdgeCount += built.count;
-  }
-  strokeDirty = false;
-}
-
-// Drawn straight onto the canvas after the raster path has composed
-// and post-AA'd its image. No depth attachment is needed because the
-// occlusion test samples the scene depth TEXTURE instead.
-function drawStrokes(T) {
-  if (strokeDirty) rebuildStrokes();
-  if (!strokeUnits.length) return;
-  const size = renderer.getDrawingBufferSize(_strokeSize);
-  const [smi, sui] = lodIndices();
-  if (!rtStroke || rtStroke.width !== size.x || rtStroke.height !== size.y) {
-    if (rtStroke) rtStroke.dispose();
-    rtStroke = new THREE.WebGLRenderTarget(size.x, size.y, {
-      minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
-      depthBuffer: false, stencilBuffer: false,
-    });
-  }
-  for (const u of strokeUnits) {
-    u.src.updateWorldMatrix(true, false);
-    u.mesh.matrix.copy(u.src.matrixWorld);
-    u.mesh.matrixWorld.copy(u.src.matrixWorld);
-    const uf = u.mesh.material.uniforms;
-    uf.tDepth.value = T.rtID.depthTexture;
-    uf.uRes.value.copy(size);
-    uf.uCamPos.value.setFromMatrixPosition(camera.matrixWorld);
-    uf.uHalf.value = P.strokeWidth * 0.5 * renderer.getPixelRatio();
-    uf.uNear.value = camera.near; uf.uFar.value = camera.far;
-    uf.uBias.value = P.strokeBias;
-    uf.uMinFeature.value = P.minFeature / 100;
-    uf.uInvFov.value = invFovScale();
-    uf.uKeepSil.value = P.keepSilhouettes ? 1 : 0;
-    uf.uSil.value = P.strokeSilhouette ? 1 : 0;
-    uf.uCrease.value = P.strokeCrease ? 1 : 0;
-    uf.uMetric.value = smi; uf.uUnit.value = sui;
-  }
-  // pass A: max-blend every stroke's coverage into the offscreen buffer
-  const prevAuto = renderer.autoClear;
-  const prevClear = renderer.getClearColor(_strokeClear);
-  const prevAlpha = renderer.getClearAlpha();
-  renderer.setRenderTarget(rtStroke);
-  renderer.setClearColor(0x000000, 0);
-  renderer.clear(true, false, false);
-  renderer.autoClear = false;
-  renderer.render(strokeScene, camera);
-  // pass B: one flat blend of that coverage onto the finished canvas
-  strokeComposeMat.uniforms.tCov.value = rtStroke.texture;
-  strokeComposeMat.uniforms.uInk.value.set(P.inkColor);
-  blitQuad.material = strokeComposeMat;
-  renderer.setRenderTarget(null);
-  renderer.render(blitScene, postCamera);
-  renderer.autoClear = prevAuto;
-  renderer.setClearColor(prevClear, prevAlpha);
-}
-
 function renderFrame(useHi) {
   updateCamera();
   updateLightDir();
@@ -5551,7 +5096,6 @@ function renderFrame(useHi) {
   u.minFeature.value = P.minFeature / 100;   // slider is a percentage
   u.invFovScale.value = invFovScale();
   u.keepSil.value = P.keepSilhouettes ? 1 : 0;
-  u.inkEnable.value = P.strokeLines ? 0 : 1;
 
   // pass 2b2: the SHADOW-MASK PASS — one fullscreen evaluation of
   // shadowMaskAt (R) plus the AA'd cast fill (G) into rtSMask; the
@@ -5650,10 +5194,6 @@ function renderFrame(useHi) {
   renderer.setRenderTarget(needsBlit ? T.rtInk : null);
   renderer.render(postScene, postCamera);
   if (needsBlit) applyPostAA(T);
-  // the forward stroke path draws last, straight onto the finished
-  // canvas — the compose stage above already suppressed the raster
-  // linework via inkEnable, so exactly one of the two is ever visible
-  if (P.strokeLines) drawStrokes(T);
 }
 
 function tick() {
@@ -5939,8 +5479,6 @@ window.__smaa = () => ({ ready: smaaReady, rtEdges, rtWeights });
 window.__player = player; window.__bike = bike; window.__chase = chase;
 window.__P = P;   // live param access from the console
 window.__markDirty = markDirty;
-window.__strokeUnits = strokeUnits;
-window.__strokes = () => ({ edges: strokeEdgeCount, units: strokeUnits.length, dirty: strokeDirty });
 window.__setPlayerMode = setPlayerMode; window.__mount = tryMountToggle;
 window.__updatePlayer = updatePlayer; window.__actors = actors;
 window.__scene = scene; window.__renderer = renderer;

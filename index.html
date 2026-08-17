@@ -745,15 +745,33 @@ const idMaterial = new THREE.ShaderMaterial({
     in vec3 aSizeRegion;
     in vec3 aSizeObject;
     in vec4 aPaint;
+    // shade normals, folded in from what used to be a second full-scene
+    // pass: flat view normals plus the PN-quadratic control net the
+    // organic classes interpolate across the triangle
+    in vec3 aSNormal;
+    in vec4 aSNA; in vec4 aSNB; in vec4 aSNC;
+    in vec4 aSM0; in vec4 aSM1; in vec4 aSM2;
     uniform float uMetric, uUnit;
     out vec3 vCol;
     out vec4 vPaint;
     out float vSize;
+    out vec3 vN; out vec3 vSN;
+    out vec3 vNA; out vec3 vNB; out vec3 vNC;
+    out vec3 vM0; out vec3 vM1; out vec3 vM2;
+    out vec3 vBary;
+    out float vOrg;
     void main() {
       vCol = color;
       vPaint = aPaint;
       vec3 s = uUnit < 0.5 ? aSizeRegion : aSizeObject;
       vSize = uMetric < 0.5 ? s.x : (uMetric < 1.5 ? s.y : s.z);
+      vN = normalMatrix * normal;
+      vSN = normalMatrix * aSNormal;
+      vNA = normalMatrix * aSNA.xyz; vNB = normalMatrix * aSNB.xyz; vNC = normalMatrix * aSNC.xyz;
+      vM0 = normalMatrix * aSM0.xyz; vM1 = normalMatrix * aSM1.xyz; vM2 = normalMatrix * aSM2.xyz;
+      int c = gl_VertexID % 3;
+      vBary = vec3(c == 0 ? 1.0 : 0.0, c == 1 ? 1.0 : 0.0, c == 2 ? 1.0 : 0.0);
+      vOrg = mod(floor(color.b * 255.0 + 0.5) / 4.0, 2.0) >= 1.0 ? 1.0 : 0.0;
       gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
     }`,
   fragmentShader: /* glsl */`
@@ -761,11 +779,27 @@ const idMaterial = new THREE.ShaderMaterial({
     in vec3 vCol;
     in vec4 vPaint;
     in float vSize;
-    layout(location = 0) out vec4 outID;     // ID color + encoded feature size
-    layout(location = 1) out vec4 outPaint;  // color + alpha/glow byte
+    in vec3 vN; in vec3 vSN;
+    in vec3 vNA; in vec3 vNB; in vec3 vNC;
+    in vec3 vM0; in vec3 vM1; in vec3 vM2;
+    in vec3 vBary;
+    in float vOrg;
+    layout(location = 0) out vec4 outID;      // ID color + encoded feature size
+    layout(location = 1) out vec4 outPaint;   // color + alpha/glow byte
+    layout(location = 2) out vec4 outNFlat;   // view-space flat normal
+    layout(location = 3) out vec4 outNSmooth; // shade normal (PN when organic)
     void main() {
       outID = vec4(vCol, vSize);
       outPaint = vPaint;
+      float sgn = gl_FrontFacing ? 1.0 : -1.0;   // DoubleSide flip
+      outNFlat = vec4(normalize(vN) * sgn * 0.5 + 0.5, 1.0);
+      vec3 sn = vSN;
+      if (vOrg > 0.5) {
+        vec3 b = vBary;
+        sn = b.x * b.x * vNA + b.y * b.y * vNB + b.z * b.z * vNC
+           + 2.0 * (b.x * b.y * vM0 + b.y * b.z * vM1 + b.z * b.x * vM2);
+      }
+      outNSmooth = vec4(normalize(sn) * sgn * 0.5 + 0.5, 1.0);
     }`,
 });
 // normal pass, two attachments: [0] flat facet normals (ink / contour /
@@ -778,50 +812,6 @@ const idMaterial = new THREE.ShaderMaterial({
 // flat triangle every PN coefficient equals the face normal and the
 // quadratic collapses to a constant, so misflagged flat geometry is
 // mathematically unaffected. All view-space, *0.5+0.5.
-const normalMaterial = new THREE.ShaderMaterial({
-  side: THREE.DoubleSide,
-  vertexColors: true,                   // for the organic flag bit
-  glslVersion: THREE.GLSL3,
-  vertexShader: /* glsl */`
-    in vec3 aSNormal;
-    in vec4 aSNA; in vec4 aSNB; in vec4 aSNC;
-    in vec4 aSM0; in vec4 aSM1; in vec4 aSM2;
-    out vec3 vN; out vec3 vSN;
-    out vec3 vNA; out vec3 vNB; out vec3 vNC;
-    out vec3 vM0; out vec3 vM1; out vec3 vM2;
-    out vec3 vBary;
-    out float vOrg;
-    void main() {
-      vN = normalMatrix * normal;
-      vSN = normalMatrix * aSNormal;
-      vNA = normalMatrix * aSNA.xyz; vNB = normalMatrix * aSNB.xyz; vNC = normalMatrix * aSNC.xyz;
-      vM0 = normalMatrix * aSM0.xyz; vM1 = normalMatrix * aSM1.xyz; vM2 = normalMatrix * aSM2.xyz;
-      int c = gl_VertexID % 3;
-      vBary = vec3(c == 0 ? 1.0 : 0.0, c == 1 ? 1.0 : 0.0, c == 2 ? 1.0 : 0.0);
-      vOrg = mod(floor(color.b * 255.0 + 0.5) / 4.0, 2.0) >= 1.0 ? 1.0 : 0.0;
-      gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-    }`,
-  fragmentShader: /* glsl */`
-    precision highp float;
-    in vec3 vN; in vec3 vSN;
-    in vec3 vNA; in vec3 vNB; in vec3 vNC;
-    in vec3 vM0; in vec3 vM1; in vec3 vM2;
-    in vec3 vBary;
-    in float vOrg;
-    layout(location = 0) out vec4 oFlat;
-    layout(location = 1) out vec4 oSmooth;
-    void main() {
-      float s = gl_FrontFacing ? 1.0 : -1.0;   // DoubleSide flip, like MeshNormalMaterial
-      oFlat = vec4(normalize(vN) * s * 0.5 + 0.5, 1.0);
-      vec3 sn = vSN;
-      if (vOrg > 0.5) {
-        vec3 b = vBary;
-        sn = b.x * b.x * vNA + b.y * b.y * vNB + b.z * b.z * vNC
-           + 2.0 * (b.x * b.y * vM0 + b.y * b.z * vM1 + b.z * b.x * vM2);
-      }
-      oSmooth = vec4(normalize(sn) * s * 0.5 + 0.5, 1.0);
-    }`,
-});
 // debug wireframe view: every raw triangle edge, ink on paper
 const wireMat = new THREE.MeshBasicMaterial({ color: 0x1d1a17, wireframe: true });
 
@@ -1765,7 +1755,12 @@ function makeTargetSet(scale) {
     // WebGLMultipleRenderTargets is the r160 API (pinned by the importmap);
     // WebGLRenderTarget({count: 2}) is the newer form and silently yields
     // zero textures on r160 — do not switch until three is upgraded.
-    rtID: new THREE.WebGLMultipleRenderTargets(w, h, 2, {
+    // 4 attachments: ID colour + feature size, paint, flat view normal,
+    // shade normal. The last two used to be a SECOND full-scene render
+    // into rtNormal; folding them in here removes that pass entirely.
+    // WebGL2 guarantees at least 4 colour attachments, so this is the
+    // most that can be relied on without a capability check.
+    rtID: new THREE.WebGLMultipleRenderTargets(w, h, 4, {
       minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
       depthTexture, depthBuffer: true,
     }),
@@ -1781,16 +1776,6 @@ function makeTargetSet(scale) {
       minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
       depthTexture: (() => { const d = new THREE.DepthTexture(w, h); d.type = THREE.UnsignedIntType; return d; })(),
       depthBuffer: true,
-    }),
-    // two attachments: [0] flat facet normals, [1] smoothed shade
-    // normals (same r160 MRT API caveat as rtID above). Every geometry
-    // buffer is single-sampled: the ink is detected from the ID buffer
-    // and antialiased by the stroke stage + SMAA, so hardware MSAA on
-    // these attachments bought nothing but memory.
-    rtNormal: new THREE.WebGLMultipleRenderTargets(w, h, 2, {
-      minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
-      // keeps its depth buffer: unlike every other target below, real
-      // geometry is rasterized into this one and must depth-sort
     }),
     // stage A of the line pass: the 1px boundary skeleton
     // (R = ink strength, G/B = glass, A = speckle fill).
@@ -1858,10 +1843,15 @@ function makeTargetSet(scale) {
     }),
   };
 }
+// What the old dedicated normal pass cleared to, in the linear working
+// space THREE.Color converts into (0x8080ff -> byte 55, not 128).
+const srgbToLinear = c => c < 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+const ZERO_NORMAL_CLEAR = new Float32Array(
+  [srgbToLinear(128 / 255), srgbToLinear(128 / 255), 1, 1]);
 function disposeSet(t) {
   if (t) {
     t.rtID.dispose(); t.rtGlass.dispose(); t.rtGlassBack.dispose();
-    t.rtNormal.dispose(); t.rtSkel.dispose(); t.rtSkelLo.dispose();
+    t.rtSkel.dispose(); t.rtSkelLo.dispose();
     t.rtLines.dispose(); t.rtSMask.dispose(); t.rtInk.dispose();
     t.rtGlowA.dispose(); t.rtGlowB.dispose();
     t.rtMaskA.dispose(); t.rtMaskB.dispose();
@@ -3849,14 +3839,14 @@ const maskThreshMat = new THREE.ShaderMaterial({
 // bit (ID blue bit 2) so the blur picks its radius per pixel.
 const shadeFieldMat = new THREE.ShaderMaterial({
   uniforms: {
-    tNormal: { value: null }, tID: { value: null },
+    tNormal: { value: null }, tID: { value: null }, tDepth: { value: null },
     lightDir: { value: new THREE.Vector3() },
   },
   vertexShader: blitVert,
   fragmentShader: /* glsl */`
     precision highp float;
     varying vec2 vUv;
-    uniform sampler2D tNormal, tID;
+    uniform sampler2D tNormal, tID, tDepth;
     uniform vec3 lightDir;
     void main() {
       vec3 n = texture2D(tNormal, vUv).xyz * 2.0 - 1.0;
@@ -4883,12 +4873,35 @@ function renderFrame(useHi) {
   glassRoot.visible = false;   // opaque passes never see the glass mesh
   for (const a of actors) a.mesh.material = idMaterial;
 
-  // pass 1a: face-ID colors + depth (opaque layer)
+  // pass 1a: face-ID colors + normals + depth (opaque layer)
   renderer.setRenderTarget(T.rtID);
   renderer.setClearColor(0xffffff, 1);
   renderer.clear();
+  // renderer.clear() puts the SAME colour in every attachment, but the two
+  // normal attachments need what the old rtNormal pass cleared to, not
+  // white -- sky normals reach the image through the shade field's blur
+  // bleeding across silhouettes, and through the detector at silhouette
+  // pixels. clearBufferfv targets a DRAW BUFFER index, so the full set has
+  // to be bound first or the clears silently do nothing.
+  // The value is not 128/255: setClearColor(0x8080ff) ran the hex through
+  // THREE.Color, which converts sRGB -> linear, so the byte actually stored
+  // was 55. Reproduced exactly here so the merge changes no pixels. (That
+  // conversion means the "zero normal" decodes to about -0.57, not 0 -- a
+  // real oddity, but one to change deliberately rather than in passing.)
+  // autoClear off across this: renderer.render() would otherwise clear the
+  // target a second time and wipe the per-attachment values just written.
+  {
+    const gl = renderer.getContext();
+    gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1,
+                    gl.COLOR_ATTACHMENT2, gl.COLOR_ATTACHMENT3]);
+    gl.clearBufferfv(gl.COLOR, 2, ZERO_NORMAL_CLEAR);
+    gl.clearBufferfv(gl.COLOR, 3, ZERO_NORMAL_CLEAR);
+  }
   scene.overrideMaterial = null;
+  const prevAutoID = renderer.autoClear;
+  renderer.autoClear = false;
   renderer.render(scene, camera);
+  renderer.autoClear = prevAutoID;
 
   // pass 1b/1c: the translucent layer into its own MRT — once as-is
   // (nearest surface) and once with front faces culled (nearest BACK
@@ -4971,19 +4984,10 @@ function renderFrame(useHi) {
     _invVPFresh = false;            // the patched matrix must not be cached
   }
 
-  // pass 2: view-space normals — needed by shading and by the
-  // self-overlap contour detector (glass is invisible here: the
-  // translucent layer takes no shading and no contours). Rendered before
-  // the shadow melt below, which reads normals for the terminator term.
-  if (P.shadeOn || P.contourLine > 0 || (hasSoftRoot && P.softContact > 0) ||
-      P.groundSpeckle > 0 || P.minFeature > 0 || P.debugView !== 'off') {
-    renderer.setRenderTarget(T.rtNormal);
-    renderer.setClearColor(0x8080ff, 1);
-    renderer.clear();
-    scene.overrideMaterial = normalMaterial;
-    renderer.render(scene, camera);
-    scene.overrideMaterial = null;
-  }
+  // (what used to be pass 2 — a second full-scene render of view-space
+  // normals into rtNormal — is now attachments 2/3 of the ID pass. It was
+  // also conditional, so anything reading normals with the gate false was
+  // sampling the previous frame's buffer; they are now always current.)
 
   // shadow silhouette smoothing: extract the shadow mask at half
   // res, then blur -> re-threshold -> blur. Blur+threshold is
@@ -5007,7 +5011,7 @@ function renderFrame(useHi) {
     cm.tDepth.value = T.rtID.depthTexture;
     // terminator melt uses the shade normal too, so its rounded edge
     // agrees with the compose step's boundary
-    cm.tNormal.value = T.rtNormal.texture[P.smoothShade ? 1 : 0];
+    cm.tNormal.value = T.rtID.texture[P.smoothShade ? 3 : 2];
     cm.tID.value = T.rtID.texture[0];
     cm.lightDir.value.copy(lightWorld).transformDirection(camera.matrixWorldInverse);
     cm.shadeThreshold.value = P.shadeThreshold;
@@ -5058,8 +5062,9 @@ function renderFrame(useHi) {
                       (P.organicBlurPx > 0 || P.hardBlurPx > 0)) ||
                      P.debugView === 'field';
   if (shadeField) {
-    shadeFieldMat.uniforms.tNormal.value = T.rtNormal.texture[P.smoothShade ? 1 : 0];
+    shadeFieldMat.uniforms.tNormal.value = T.rtID.texture[P.smoothShade ? 3 : 2];
     shadeFieldMat.uniforms.tID.value = T.rtID.texture[0];
+    shadeFieldMat.uniforms.tDepth.value = T.rtID.depthTexture;
     shadeFieldMat.uniforms.lightDir.value.copy(lightWorld)
       .transformDirection(camera.matrixWorldInverse);   // view space, like the normals
     blitQuad.material = shadeFieldMat;
@@ -5117,8 +5122,8 @@ function renderFrame(useHi) {
   const u = post.uniforms;
   u.tID.value = T.rtID.texture[0];
   u.tPaint.value = T.rtID.texture[1];
-  u.tNormal.value = T.rtNormal.texture[0];
-  u.tNormalS.value = T.rtNormal.texture[P.smoothShade ? 1 : 0];
+  u.tNormal.value = T.rtID.texture[2];
+  u.tNormalS.value = T.rtID.texture[P.smoothShade ? 3 : 2];
   u.tDepth.value = T.rtID.depthTexture;
   u.tGlassID.value = T.rtGlass.texture[0];
   u.tGlassPaint.value = T.rtGlass.texture[1];
@@ -5259,7 +5264,7 @@ function renderFrame(useHi) {
       const tex = {
         ids: T.rtID.texture[0], paint: T.rtID.texture[1],
         glass: T.rtGlass.texture[0],
-        normals: T.rtNormal.texture[0], 'shade n': T.rtNormal.texture[1],
+        normals: T.rtID.texture[2], 'shade n': T.rtID.texture[3],
         field: T.rtMaskA.texture, melt: T.rtMaskB.texture,
         stencil: rtStencil ? rtStencil.texture : null,
         smask: T.rtSMask.texture,

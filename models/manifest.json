@@ -1,0 +1,23 @@
+{
+  "_comment": "Every model the app loads. Drop a .obj in this folder and add an entry here. 'organic' picks the shade class (PN-quadratic shade normals + the organic blur) — plants, terrain and rocks true, machinery false. 'scale' multiplies the showcase's normalized size for a piece that should read bigger or smaller than its neighbours.",
+  "models": [
+    { "file": "mushroom_tower.obj", "name": "mushroom tower", "organic": true },
+    { "file": "woven_barrel.obj",   "name": "woven barrel",   "organic": true },
+    { "file": "moss_arch_mound.obj","name": "moss arch mound","organic": true },
+    { "file": "leaf_fan.obj",       "name": "leaf fan",       "organic": true },
+    { "file": "bulb_lamp.obj",      "name": "bulb lamp",      "organic": true },
+    { "file": "cairn_stack.obj",    "name": "cairn stack",    "organic": true },
+    { "file": "root_arc.obj",       "name": "root arc",       "organic": true },
+    { "file": "bead_reed.obj",      "name": "bead reed",      "organic": true },
+    { "file": "lily_pad.obj",       "name": "lily pad",       "organic": true },
+    { "file": "tube_cluster.obj",   "name": "tube cluster",   "organic": true },
+    { "file": "puff_shrub.obj",     "name": "puff shrub",     "organic": true },
+    { "file": "rock_slab.obj",      "name": "rock slab",      "organic": true },
+    { "file": "coral_column.obj",   "name": "coral column",   "organic": true },
+    { "file": "speeder.obj",        "name": "speeder",        "organic": false },
+    { "file": "hoverbike.obj",      "name": "hoverbike",      "organic": false },
+    { "file": "android-bust.obj",   "name": "android bust",   "organic": false },
+    { "file": "android-merged2.obj","name": "android merged", "organic": false },
+    { "file": "robot-attempt2.obj", "name": "robot",          "organic": false }
+  ]
+}

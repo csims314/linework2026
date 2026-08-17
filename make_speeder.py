@@ -171,9 +171,10 @@ for (name, comment, start), (_, _, end) in zip(part_bounds, part_bounds[1:]):
         lines.append('f ' + ' '.join(str(i) for i in f))
     lines.append('')
 
-# written next to this script, with LF endings on every platform so
-# regenerating on Windows doesn't rewrite the whole file as CRLF
-out = Path(__file__).with_name('speeder.obj')
+# written into the model library beside this script, with LF endings on
+# every platform so regenerating on Windows doesn't rewrite the whole
+# file as CRLF. models/manifest.json already lists it.
+out = Path(__file__).with_name('models') / 'speeder.obj'
 with open(out, 'w', newline='\n') as fh:
     fh.write('\n'.join(lines))
 print(f'wrote {out}: {len(verts)} verts, {qcount} quads, {tcount} tris')

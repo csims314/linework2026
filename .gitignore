@@ -6,8 +6,8 @@ tmp_obj_*
 # large model variants kept locally but out of the repo. Listed by name
 # rather than by pattern, so a future model isn't excluded by accident —
 # android-merged2.obj is the one that ships.
-Models/Android/android-merged.obj
-Models/Android/android-solid.obj
+models/android-merged.obj
+models/android-solid.obj
 
 # python (make_speeder.py)
 __pycache__/

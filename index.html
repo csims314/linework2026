@@ -266,6 +266,13 @@ const hex2u8 = h => {
   const n = parseInt(h.slice(1), 16);
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 };
+// same raw-byte semantics as hex2u8 (deliberately bypassing the linear
+// conversion .set(hex) would do) but writes straight into an existing
+// THREE.Color, so the per-frame uniform updates allocate nothing
+const setRawHex = (c, h) => {
+  const n = parseInt(h.slice(1), 16);
+  return c.setRGB(((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255);
+};
 const PAL = {
   sky:       hex2u8('#D8EFEC'),  // pale ice — aerial fade target
   sand:      hex2u8('#EDE6D4'),  // cream — ground, plates, dishes
@@ -324,7 +331,8 @@ function washJitter(i) {
 // (camera, sliders, rebuilds). Lets progressive supersampling slot
 // in a refined frame when you stop moving, and idles the GPU at rest.
 let dirty = true;
-function markDirty() { dirty = true; }
+let idleRefreshes = 0;            // bounded idle safety refreshes, reset on change
+function markDirty() { dirty = true; idleRefreshes = 0; }
 // stencil-shadow-volume geometry mirrors the merged mesh + actors;
 // rebuilt lazily when this is set (scene rebuilds, actor builds).
 // Declared up here because buildScene() runs before the volume
@@ -710,7 +718,11 @@ function faceIdColors(geometry, perQuad, variation = 1.0, paintCol = null,
    ============================================================ */
 const app = document.getElementById('app');
 const renderer = new THREE.WebGLRenderer({
-  antialias: true, preserveDrawingBuffer: true,
+  // no antialias: nothing but fullscreen quads ever reaches the default
+  // framebuffer, so an MSAA backbuffer costs memory and a resolve blit per
+  // present for zero benefit -- all the AA happens in the passes above it.
+  // no preserveDrawingBuffer: it forces a copy instead of a swap on every
+  // present; 'export png' re-renders and reads back in one task instead.
   powerPreference: 'high-performance',   // request the discrete GPU on dual-GPU laptops
 });
 renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -1777,6 +1789,8 @@ function makeTargetSet(scale) {
     // these attachments bought nothing but memory.
     rtNormal: new THREE.WebGLMultipleRenderTargets(w, h, 2, {
       minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+      // keeps its depth buffer: unlike every other target below, real
+      // geometry is rasterized into this one and must depth-sort
     }),
     // stage A of the line pass: the 1px boundary skeleton
     // (R = ink strength, G/B = glass, A = speckle fill).
@@ -1788,17 +1802,20 @@ function makeTargetSet(scale) {
     // passthrough, the max-downsample) are exact under bilinear.
     rtSkel: new THREE.WebGLRenderTarget(w, h, {
       minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+      depthBuffer: false,   // never depth-tested; the default RB is pure cost
     }),
     // quarter-res MAX-downsample of the skeleton RGB (max, not mip
     // average — an average would quantize thin lines to zero): the
     // stroke stage rejects empty neighborhoods with a few cheap taps
     rtSkelLo: new THREE.WebGLRenderTarget(w >> 2, h >> 2, {
       minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+      depthBuffer: false,   // never depth-tested; the default RB is pure cost
     }),
     // stage B output: the stroked lines the compose reads. Same
     // channel semantics as the skeleton, at final width.
     rtLines: new THREE.WebGLRenderTarget(w, h, {
       minFilter: THREE.NearestFilter, magFilter: THREE.NearestFilter,
+      depthBuffer: false,   // never depth-tested; the default RB is pure cost
     }),
     // materialized shadow mask (MASK_PASS): R = binary shadow-region
     // membership, G = the compose's AA'd cast fill — computed once per
@@ -1807,18 +1824,22 @@ function makeTargetSet(scale) {
     // coverage grays (texel-center reads stay exact under bilinear).
     rtSMask: new THREE.WebGLRenderTarget(w, h, {
       minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+      depthBuffer: false,   // never depth-tested; the default RB is pure cost
     }),
     // the composed image, when it needs a filtered resample before it
     // reaches the canvas (supersampling and/or post AA)
     rtInk: new THREE.WebGLRenderTarget(w, h, {
       minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+      depthBuffer: false,   // never depth-tested; the default RB is pure cost
     }),
     // quarter-res ping-pong pair for the emissive halo blur
     rtGlowA: new THREE.WebGLRenderTarget(w >> 2, h >> 2, {
       minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+      depthBuffer: false,   // never depth-tested; the default RB is pure cost
     }),
     rtGlowB: new THREE.WebGLRenderTarget(w >> 2, h >> 2, {
       minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+      depthBuffer: false,   // never depth-tested; the default RB is pure cost
     }),
     // half-res ping-pong pair for the cast-shadow silhouette smoothing
     // (mask -> blur -> re-threshold) and for the shade-field blur.
@@ -1828,10 +1849,12 @@ function makeTargetSet(scale) {
     rtMaskA: new THREE.WebGLRenderTarget(w >> 1, h >> 1, {
       minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
       type: THREE.HalfFloatType,
+      depthBuffer: false,   // never depth-tested; the default RB is pure cost
     }),
     rtMaskB: new THREE.WebGLRenderTarget(w >> 1, h >> 1, {
       minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
       type: THREE.HalfFloatType,
+      depthBuffer: false,   // never depth-tested; the default RB is pure cost
     }),
   };
 }
@@ -1856,6 +1879,7 @@ function makeTargets() {
   // screen-res intermediate so post AA can run AFTER the downsample
   rtScreen = new THREE.WebGLRenderTarget(sw, sh, {
     minFilter: THREE.LinearFilter, magFilter: THREE.LinearFilter,
+    depthBuffer: false,   // fullscreen blits only
   });
   // smaa's two intermediates, also screen res (edge flags, blend weights)
   const smaaOpts = {
@@ -4497,6 +4521,11 @@ buttons([
   // reroll repaints the same models rather than rearranging them
   ['recolor', () => { P.seed = (Math.random() * 1e6) | 0; buildScene(); }],
   ['export png', () => {
+    // re-render into the drawing buffer and read it back in the SAME task:
+    // the context is created without preserveDrawingBuffer (which forces a
+    // copy rather than a swap on every present), so the pixels are only
+    // guaranteed to be there until the browser next composites
+    renderFrame(true);
     const a = document.createElement('a');
     a.download = 'moebius-lines.png';
     a.href = renderer.domElement.toDataURL('image/png');
@@ -4712,9 +4741,11 @@ let refinePending = false, lastChange = 0, lastRender = 0;
 function invFovScale() {
   return 1.0 / (2.0 * Math.tan(THREE.MathUtils.degToRad(camera.fov) * 0.5));
 }
+const _lodIdx = [0, 0];   // reused: this runs once per frame
 function lodIndices() {
-  return [Math.max(0, LOD_METRICS.indexOf(P.lodMetric)),
-          Math.max(0, LOD_UNITS.indexOf(P.lodUnit))];
+  _lodIdx[0] = Math.max(0, LOD_METRICS.indexOf(P.lodMetric));
+  _lodIdx[1] = Math.max(0, LOD_UNITS.indexOf(P.lodUnit));
+  return _lodIdx;
 }
 
 // shared post-AA tail for both raster and vector paths: callers leave the
@@ -4781,9 +4812,35 @@ function applyPostAA(T) {
   }
 }
 
+// inverse view-projection, computed at most once per frame and shared by
+// every pass that reconstructs world position from depth (the glow extract
+// and the compose both used to derive it independently, from identical
+// inputs). Invalidated by renderFrame before the passes run.
+const _invVP = new THREE.Matrix4();
+let _invVPFresh = false;
+function currentInvViewProj() {
+  if (!_invVPFresh) {
+    _invVP.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).invert();
+    _invVPFresh = true;
+  }
+  return _invVP;
+}
+
+// params that ride straight through to a like-named uniform. Hoisted out
+// of renderFrame so the array literal isn't rebuilt every frame.
+const PASSTHRU_UNIFORMS = ['idThreshold','lineWidth','distanceFalloff',
+  'wobbleAmp','wobbleFreq','shadeThreshold','coreThreshold',
+  'shadeNoise','shadeNoiseScale',
+  'shadowAmount','shadowLine','shadowLineWidth',
+  'paperGrain','grainScale','washAmount','washScale','poolAmount','inkTint','aerialFade',
+  'glassTint','glassLine','glassBackLine','glowLift','contourLine',
+  'skyGradHeight','cloudScale','cloudFade','speckleSize','speckleFade',
+  'sunCore','poolRadius','paperFiber','paperFleck'];
+
 function renderFrame(useHi) {
   updateCamera();
   updateLightDir();
+  _invVPFresh = false;              // camera may have moved since last frame
   const [mi, ui] = lodIndices();
   const T = (useHi && targetsHi) ? targetsHi : targetsLo;
 
@@ -4819,11 +4876,17 @@ function renderFrame(useHi) {
   // pass 1b/1c: the translucent layer into its own MRT — once as-is
   // (nearest surface) and once with front faces culled (nearest BACK
   // face), so interior edges can draw through the glass. Empty scenes
-  // just clear, which keeps the compose branches exact no-ops.
-  renderer.setRenderTarget(T.rtGlass);
-  renderer.clear();
-  renderer.setRenderTarget(T.rtGlassBack);
-  renderer.clear();
+  // just clear, which keeps the compose branches exact no-ops — but a
+  // scene with no glass at all would re-clear two full-res MRTs plus
+  // their depth every frame forever, so once they are known-empty the
+  // clears are skipped until something actually draws into them again.
+  if (glassVertCount || !T.glassClean) {
+    renderer.setRenderTarget(T.rtGlass);
+    renderer.clear();
+    renderer.setRenderTarget(T.rtGlassBack);
+    renderer.clear();
+    T.glassClean = !glassVertCount;
+  }
   if (glassVertCount) {
     sceneRoot.visible = false;
     glassRoot.visible = true;
@@ -4888,6 +4951,7 @@ function renderFrame(useHi) {
     // restore the finite projection — everything downstream (normal
     // pass, invViewProj reconstruction) uses the standard matrix
     camera.updateProjectionMatrix();
+    _invVPFresh = false;            // the patched matrix must not be cached
   }
 
   // pass 2: view-space normals — needed by shading and by the
@@ -5008,7 +5072,7 @@ function renderFrame(useHi) {
     const ge = glowExtractMat.uniforms;
     ge.tDiffuse.value = T.rtID.texture[1];
     ge.tDepth.value = T.rtID.depthTexture;
-    ge.invViewProj.value.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).invert();
+    ge.invViewProj.value.copy(currentInvViewProj());
     ge.sunDir.value.copy(lightWorld);
     ge.sunSize.value = THREE.MathUtils.degToRad(P.sunSize);
     ge.cloudAmt.value = P.clouds;
@@ -5053,14 +5117,7 @@ function renderFrame(useHi) {
   u.lightDir.value.copy(_lv.copy(lightWorld).transformDirection(camera.matrixWorldInverse));
   u.inkColor.value.set(P.inkColor);
   u.paperColor.value.set(P.paperColor);
-  for (const k of ['idThreshold','lineWidth','distanceFalloff',
-    'wobbleAmp','wobbleFreq','shadeThreshold','coreThreshold',
-    'shadeNoise','shadeNoiseScale',
-    'shadowAmount','shadowLine','shadowLineWidth',
-    'paperGrain','grainScale','washAmount','washScale','poolAmount','inkTint','aerialFade',
-    'glassTint','glassLine','glassBackLine','glowLift','contourLine',
-    'skyGradHeight','cloudScale','cloudFade','speckleSize','speckleFade',
-    'sunCore','poolRadius','paperFiber','paperFleck']) u[k].value = P[k];
+  for (const k of PASSTHRU_UNIFORMS) u[k].value = P[k];
   // smoothstep(a, b) needs a < b — keep the aerial ramp well-ordered
   u.aerialNear.value = P.aerialNear;
   u.aerialFar.value = Math.max(P.aerialFar, P.aerialNear + 0.02);
@@ -5081,22 +5138,19 @@ function renderFrame(useHi) {
   u.softShade.value = P.shadeStyle === 'soft' ? 1 : 0;
   // setRGB with raw bytes skips the linear conversion .set(hex) would do,
   // keeping the uniform in the same raw display space as the aPaint bytes
-  const skyB = hex2u8(P.skyColor);
-  u.skyColor.value.setRGB(skyB[0] / 255, skyB[1] / 255, skyB[2] / 255);
-  const horB = hex2u8(P.skyHorizon);   // raw bytes, same as skyColor
-  u.horizonColor.value.setRGB(horB[0] / 255, horB[1] / 255, horB[2] / 255);
+  setRawHex(u.skyColor.value, P.skyColor);
+  setRawHex(u.horizonColor.value, P.skyHorizon);
   u.cloudAmt.value = P.clouds;
   u.cloudStretch.value = P.cloudStretch;
   u.cloudDir.value = THREE.MathUtils.degToRad(P.cloudStretchDir);
   u.speckleAmt.value = P.groundSpeckle;
   u.sunDir.value.copy(lightWorld);     // the sun IS the light source
   u.sunSize.value = THREE.MathUtils.degToRad(P.sunSize);
-  const sunB = hex2u8(P.sunColor);
-  u.sunColor.value.setRGB(sunB[0] / 255, sunB[1] / 255, sunB[2] / 255);
+  setRawHex(u.sunColor.value, P.sunColor);
   u.colorOn.value = P.colorOn ? 1 : 0;
   // world reconstruction for pigment noise (pass 1 already refreshed
   // camera.matrixWorldInverse via renderer.render)
-  u.invViewProj.value.multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).invert();
+  u.invViewProj.value.copy(currentInvViewProj());
   u.viewToWorldN.value.setFromMatrix4(camera.matrixWorld);   // view-space normals -> world
   u.shadeOn.value = P.shadeOn ? 1 : 0;
   u.oneSided.value = P.oneSided ? 1 : 0;
@@ -5132,11 +5186,20 @@ function renderFrame(useHi) {
   renderer.setRenderTarget(T.rtSkel);
   renderer.render(blitScene, postCamera);
   u.tSkel.value = T.rtSkel.texture;
-  skelDownMat.uniforms.tDiffuse.value = T.rtSkel.texture;
-  skelDownMat.uniforms.uPx.value.set(1 / T.rtSkel.width, 1 / T.rtSkel.height);
-  blitQuad.material = skelDownMat;
-  renderer.setRenderTarget(T.rtSkelLo);
-  renderer.render(blitScene, postCamera);
+  // the quarter-res max-downsample only exists to let wide nibs skip
+  // their dilation loop. Stage B's radius is w - 1 and w never exceeds
+  // the value below, so whenever that is <= 1 texel EVERY pixel takes
+  // the single-tap hairline path and rtSkelLo is never sampled — which
+  // is the case for the whole default line-width range. Skip the pass.
+  const wMax = T.scale * Math.max(
+    P.lineWidth * (1 + 0.6 * Math.min(P.distanceFalloff, 1)), 0.5);
+  if (wMax > 1) {
+    skelDownMat.uniforms.tDiffuse.value = T.rtSkel.texture;
+    skelDownMat.uniforms.uPx.value.set(1 / T.rtSkel.width, 1 / T.rtSkel.height);
+    blitQuad.material = skelDownMat;
+    renderer.setRenderTarget(T.rtSkelLo);
+    renderer.render(blitScene, postCamera);
+  }
   u.tSkelLo.value = T.rtSkelLo.texture;
   blitQuad.material = lineMat;
   renderer.setRenderTarget(T.rtLines);
@@ -5230,9 +5293,13 @@ function tick() {
     renderFrame(true);             // the supersampled still
     refinePending = false;
     lastRender = now; counted = true;
-  } else if (now - lastRender > 2000) {
-    renderFrame(true);             // idle safety refresh (not counted in fps)
-    lastRender = now;
+  } else if (now - lastRender > 2000 && idleRefreshes < 2) {
+    // safety refresh: catches anything that finished settling without
+    // marking dirty (async texture decodes, font/layout driven resizes).
+    // Bounded, because an unbounded version re-runs the WHOLE pass chain
+    // every 2s forever on a page where nothing is changing.
+    renderFrame(true);
+    lastRender = now; idleRefreshes++;
   }
   if (counted) frames++;
   if (now - lastStats > 500) {

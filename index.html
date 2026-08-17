@@ -2223,6 +2223,23 @@ const post = new THREE.ShaderMaterial({
                     mix(hash3(i + vec3(0,1,1)), hash3(i + vec3(1,1,1)), u.x), u.y);
       return mix(a, b, u.z);
     }
+    // ---- ink compositing --------------------------------------------
+    // Blending ink over paint is the one place in this shader where a
+    // HARD, coverage-graded edge meets a large contrast step, so it is
+    // the one place gamma-space blending is visibly wrong: a 50%-covered
+    // pixel of near-black ink on white paper lands at 0.53 displayed
+    // where it should be 0.73, making every partially covered pixel read
+    // nearly as dark as a fully covered one -- exactly the "the AA isn't
+    // doing anything" look. Everything else composited here (aerial
+    // fade, glass tint, glow halo, the shadow and grain multiplies) is a
+    // soft gradient where the same error is a few tenths of a percent,
+    // so it is deliberately left alone.
+    // resolveMat and smaaBlendMat downstream already blend in linear.
+    vec3 inkOver(vec3 base, vec3 ink, float cov) {
+      if (cov <= 0.0) return base;
+      return pow(mix(pow(base, vec3(2.2)), pow(ink, vec3(2.2)), cov), vec3(1.0 / 2.2));
+    }
+
     // ---- cloud dome -------------------------------------------------
     // stereographic mapping shared by EVERY cloud consumer (compose
     // fill, line-pass rims, region view, glow occlusion) so the shapes
@@ -3053,7 +3070,7 @@ const post = new THREE.ShaderMaterial({
         // shading is off (shadow stays 0.0, so the multiply is exact)
         vec3 paper = paperColor * (1.0 - paperGrain * grain);
         paper *= 1.0 - shadow;
-        col = mix(paper, inkColor, clamp(ink, 0.0, 1.0));
+        col = inkOver(paper, inkColor, clamp(ink, 0.0, 1.0));
       } else if (sky) {
         // ---- PROCEDURAL SKYBOX: gradient + ink-outlined clouds ----
         // world view ray via two unprojects (sky pixels only)
@@ -3096,7 +3113,7 @@ const post = new THREE.ShaderMaterial({
         // anywhere shows the raw ink color
         if (lns.r > 0.0) {
           vec3 skyInk = mix(inkColor, col * vec3(0.32, 0.30, 0.48), inkTint);
-          col = mix(col, skyInk, lns.r);
+          col = inkOver(col, skyInk, lns.r);
         }
         col *= 1.0 - paperGrain * 0.6 * grain;
       } else {
@@ -3147,7 +3164,7 @@ const post = new THREE.ShaderMaterial({
         paint = mix(paint, min(paint * (1.0 + glowLift), vec3(1.0)), glow);
         // ink as a dark version of the local hue (blue-violet biased)
         vec3 inkT = mix(inkColor, paint * vec3(0.32, 0.30, 0.48), inkTint);
-        col = mix(paint, inkT, clamp(ink, 0.0, 1.0));
+        col = inkOver(paint, inkT, clamp(ink, 0.0, 1.0));
         // aerial perspective: distance dissolves everything toward the
         // HORIZON color (that's what distant ground meets now that the
         // sky is a gradient) — except lamps, which glow through.
@@ -3176,11 +3193,11 @@ const post = new THREE.ShaderMaterial({
         float gbD = linDepthGB(uv);
         if (gbD > gD * 1.001 && gbD < dC * 0.999) {
           float gib = lns.b * glassBackLine;   // detected in the line pass
-          col = mix(col, gInk, gib);
+          col = inkOver(col, gInk, gib);
           edgeA = max(edgeA, gib);
         }
         float gi = lns.g * glassLine;          // detected in the line pass
-        col = mix(col, gInk, gi);
+        col = inkOver(col, gInk, gi);
         edgeA = max(edgeA, gi);
       }
       // ---- GLOW HALO — emission bleeds past the geometry ---------
